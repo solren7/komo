@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, inspect, service};
+use super::{chat, gateway, inspect, model, service};
 
 #[derive(Parser)]
-#[command(name = "shion", about = "Personal agent framework")]
+#[command(name = "shion", version, about = "Personal agent framework")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -31,6 +31,24 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Show or switch the active LLM provider and model
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Show the current provider/model and list available providers
+    List,
+    /// Switch provider (and optionally model); persists to config.toml
+    Set {
+        /// Provider: deepseek | openai | anthropic | openrouter
+        provider: String,
+        /// Model id (defaults to the provider's default model)
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -43,6 +61,8 @@ enum CronAction {
 enum SessionAction {
     /// List stored sessions with creation time and message counts
     List,
+    /// Delete sessions that contain no messages
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +101,11 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
+            SessionAction::Clean => inspect::session_clean(&db).await,
+        },
+        Commands::Model { action } => match action {
+            ModelAction::List => model::list(),
+            ModelAction::Set { provider, model } => model::set(&provider, model),
         },
     }
 }

@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::{llm::LlmClient, run::RunStatus, session::Session, tool::Tool},
-        infra::db::Db,
+        infra::persistence::db::Db,
         services::tool_registry::execute_isolated,
         tools::time::TimeTool,
     };

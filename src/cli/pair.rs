@@ -8,7 +8,7 @@
 
 use crate::{
     domain::pairing::{ApproveOutcome, PairingRepository, PairingStatus},
-    infra::db::Db,
+    infra::persistence::db::Db,
 };
 
 fn local_time(unix: i64) -> String {

@@ -21,10 +21,9 @@ use crate::{
         workspace::Workspace,
     },
     infra::{
-        db::Db,
-        kanban::KanbanDb,
         llm::{PreambleFn, build_llm},
-        memory_db::MemoryDb,
+        memory::memory_db::MemoryDb,
+        persistence::{db::Db, kanban::KanbanDb},
     },
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{

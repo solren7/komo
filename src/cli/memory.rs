@@ -5,7 +5,7 @@
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
 
 use crate::domain::memory::{Memory, MemoryConfidence, MemoryRepository, MemoryStatus};
-use crate::infra::memory_db::MemoryDb;
+use crate::infra::memory::memory_db::MemoryDb;
 
 async fn store(url: &str) -> anyhow::Result<MemoryDb> {
     MemoryDb::connect(url).await

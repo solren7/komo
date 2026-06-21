@@ -111,6 +111,50 @@ docker compose pull && docker compose up -d
 
 State on the dataset is untouched by redeploys.
 
+## 5. WeChat (微信) channel — QR login in a headless container
+
+The WeChat channel logs in over the iLink protocol by **scanning a QR code**,
+which the always-on gateway can't render. So provisioning is a one-time
+interactive step; after it, the gateway reuses the stored credentials.
+
+1. **Enable it** in the dataset's `config.toml`:
+
+   ```toml
+   [channels.wechat]
+   enabled = true
+   allow_from = ["o9cq...@im.wechat"]   # your iLink user id (skip pairing); optional
+   home_chat = "o9cq...@im.wechat"       # optional: send reminders/briefing here
+   ```
+
+   Deploy/restart once. The channel starts **inert** and logs `no stored
+   credentials` — that's expected; the rest of the gateway runs normally.
+
+2. **Provision credentials.** The cleanest way needs **no shell on the NAS** —
+   drive it from an existing chat channel:
+
+   - **From Telegram (recommended).** With the `telegram` channel already
+     working, send the bot **`/wechat login`**. The gateway replies with the
+     login QR **as a photo**; scan it with the WeChat app and confirm. Creds are
+     written to `/data/wechat/credentials.json`, and the WeChat channel **comes
+     online immediately — no restart**. (The channel waits for credentials, so
+     it's fine that it booted without them.)
+   - **Scan inside the container.** `docker exec -it` gives a TTY, so the QR
+     renders in your shell:
+     ```bash
+     docker exec -it shion shion wechat login
+     ```
+   - **Or reuse a desktop login**: run `shion wechat login` on a machine with a
+     screen, then copy its `~/.shion/wechat/credentials.json` to
+     `/mnt/<pool>/apps/shion/wechat/credentials.json` on the NAS and restart.
+
+   `docker logs shion` (or `shion logs`) should show `wechat channel connected`.
+
+> **Run the gateway in exactly one place.** WeChat (and Telegram) authenticate
+> as a single identity; if both your Mac and the NAS run the channel against the
+> same account/token, their long-polls fight (`Conflict: terminated by other
+> getUpdates request`). Pick the always-on host (the NAS) and disable the
+> channel elsewhere.
+
 ## Gotchas recap
 
 - **Build arch** — cross-build for the NAS (`--platform`), don't ship your
@@ -125,3 +169,7 @@ State on the dataset is untouched by redeploys.
   host, use the host's LAN IP (not `localhost`).
 - **No launchd** — don't use `shion gateway start/stop` in the container; the
   compose `restart: unless-stopped` policy is the supervisor.
+- **One gateway per identity** — WeChat/Telegram poll as a single account; don't
+  run the same channel on the NAS *and* your Mac, or their long-polls conflict.
+- **WeChat QR** — login is interactive; provision creds once with
+  `docker exec -it shion shion wechat login`, then restart (see §5).

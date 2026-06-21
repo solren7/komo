@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, inspect, memory, model, pair, service};
+use super::{chat, gateway, inspect, logs, memory, model, pair, service, wechat};
 
 #[derive(Parser)]
 #[command(name = "shion", version, about = "Personal agent framework")]
@@ -57,8 +57,31 @@ enum Commands {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// WeChat (微信) channel operator commands
+    Wechat {
+        #[command(subcommand)]
+        action: WechatAction,
+    },
+    /// Print the gateway log (the launchd-captured tracing output)
+    Logs {
+        /// Number of trailing lines to print
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: usize,
+        /// Follow the log, streaming new lines until Ctrl-C
+        #[arg(short, long)]
+        follow: bool,
+        /// Show the stdout log (`gateway.log`) instead of the tracing log
+        #[arg(long)]
+        stdout: bool,
+    },
     /// Print the shion version
     Version,
+}
+
+#[derive(Subcommand)]
+enum WechatAction {
+    /// Provision iLink credentials by scanning a login QR (run on the host)
+    Login,
 }
 
 #[derive(Subcommand)]
@@ -222,6 +245,14 @@ pub async fn run() -> anyhow::Result<()> {
             ModelAction::List => model::list(),
             ModelAction::Set { provider, model } => model::set(&provider, model),
         },
+        Commands::Wechat { action } => match action {
+            WechatAction::Login => wechat::login().await,
+        },
+        Commands::Logs {
+            lines,
+            follow,
+            stdout,
+        } => logs::run(lines, follow, stdout),
         Commands::Version => {
             println!("shion {}", env!("CARGO_PKG_VERSION"));
             Ok(())

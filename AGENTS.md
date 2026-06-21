@@ -9,7 +9,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 cargo check                        # fast compile check
 cargo build                        # build
 cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
-cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram)
+cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram, wechat)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
@@ -18,6 +18,7 @@ shion gateway start                # install + start under launchd (auto-restart
 shion gateway stop                 # stop and remove from launchd
 shion gateway restart              # regenerate plist + restart (picks up a reinstalled binary)
 shion gateway status               # launchd state (state/pid/last exit code)
+shion logs [-n N] [-f] [--stdout]  # tail the gateway tracing log (-f follows; --stdout shows gateway.log)
 
 shion memory list [--status S]     # list/triage memories (candidate/active/archived/rejected)
 shion memory search <query>        # substring search across all memories
@@ -27,6 +28,8 @@ shion memory pin <id>              # pin into the L1 per-turn profile (manual-on
 
 shion run list [--limit N]         # recent runs (one per turn), newest first
 shion run inspect <id>             # one run in full: input, plan, outcome, every tool step
+
+shion wechat login                 # provision WeChat iLink creds by scanning a QR (run on the host)
 ```
 
 Logs: a `tracing` subscriber is installed in `main.rs` (`init_tracing`) — without
@@ -47,8 +50,8 @@ todos, skills, reminders, pairings, settings, **run ledger**) — delete it free
 to reset.
 Two kinds of **durable personal data live in their own files** so resetting
 `shion.db` never wipes them: cross-session **tasks in `~/.shion/kanban.db`**
-(`infra/kanban.rs`) and long-term **memories in `~/.shion/memory.db`**
-(`infra/memory_db.rs`). After a schema change, delete the affected file —
+(`infra/persistence/kanban.rs`) and long-term **memories in `~/.shion/memory.db`**
+(`infra/memory/memory_db.rs`). After a schema change, delete the affected file —
 `push_schema` only runs for newly created database files: a `TaskRecord` change
 means deleting `kanban.db`, a `MemoryRecord` change means `memory.db`, any other
 model means `shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run
@@ -115,7 +118,22 @@ allow_from = ["123456789"]  # pre-trusted sender user-ids (skip pairing)
 allowed_chats = ["-100123"]  # group chat-id allowlist (empty = any group; DMs always pass)
 require_mention = true       # group messages must @mention the bot (DMs bypass)
 home_chat = "123456789"     # optional: reminders go here instead of macOS notifications
+
+[channels.wechat]
+enabled = true
+allow_from = ["wxid_xxx"]   # pre-trusted iLink user-ids (skip pairing)
+home_chat = "wxid_xxx"      # optional: reminders go here instead of macOS notifications
 ```
+
+WeChat (微信) has no credentials in config.toml or `.env`: login is QR-based and
+the iLink token is stored in `~/.shion/wechat/credentials.json`. Provision it
+once on the host with `shion wechat login` (scan the QR with the WeChat app); the
+gateway can't render a QR, so its `[channels.wechat]` is **inert until those
+credentials exist**. WeChat is DM-only (an iLink bot identity can't join ordinary
+groups), so there is no `require_mention`/`allowed_chats` — pairing is the only
+admission control. Proactive output (reminders/briefing) reaches a WeChat user
+only after they've messaged the bot since the gateway started — see the channel
+note below.
 
 When multiple channels set `home_chat`, feishu takes reminder delivery. The
 config `home_chat` is only a fallback: the `/sethome` chat command sets the home
@@ -154,10 +172,16 @@ run-ledger entry, and returns the reply. There is no separate planner.
 - `tool.rs` — `Tool` trait (name / description / execute / optional `redact_args`)
 - `message.rs`, `session.rs` — core value types
 
-`infra/db.rs` + `infra/kanban.rs` + `infra/memory_db.rs` — the only places toasty (SQLite ORM) appears
-- `Db` (`infra/db.rs`) wraps `Arc<Mutex<toasty::Db>>` over `shion.db`; implements every repository trait *except* `TaskRepository`/`MemoryRepository` (sessions, messages, skills, reminders, session todos, pairings, settings, the **run ledger** `RunRepository`)
-- `KanbanDb` (`infra/kanban.rs`) is a second, independent connection over `kanban.db`; it holds only `TaskRecord` and implements `TaskRepository`. Separate file = durable tasks survive a `shion.db` reset
-- `MemoryDb` (`infra/memory_db.rs`) is a third, independent connection over `memory.db`; it holds only `MemoryRecord` and implements `MemoryRepository`. On first run it seeds itself from legacy `~/.shion/memory/*.md` via `import_legacy_markdown` (no-op once populated)
+`infra/` is layered by concern: `infra/messaging/` (ingress channels, outbound
+senders, proactive notifiers), `infra/memory/` (the memory.db connection +
+legacy markdown store), `infra/persistence/` (the toasty-backed shion.db /
+kanban.db connections), and two cross-cutting files at the top level —
+`infra/llm.rs` (LLM backend) and `infra/rig_tool.rs` (the Tool→rig adapter).
+
+`infra/persistence/db.rs` + `infra/persistence/kanban.rs` + `infra/memory/memory_db.rs` — the only places toasty (SQLite ORM) appears
+- `Db` (`infra/persistence/db.rs`) wraps `Arc<Mutex<toasty::Db>>` over `shion.db`; implements every repository trait *except* `TaskRepository`/`MemoryRepository` (sessions, messages, skills, reminders, session todos, pairings, settings, the **run ledger** `RunRepository`)
+- `KanbanDb` (`infra/persistence/kanban.rs`) is a second, independent connection over `kanban.db`; it holds only `TaskRecord` and implements `TaskRepository`. Separate file = durable tasks survive a `shion.db` reset
+- `MemoryDb` (`infra/memory/memory_db.rs`) is a third, independent connection over `memory.db`; it holds only `MemoryRecord` and implements `MemoryRepository`. On first run it seeds itself from legacy `~/.shion/memory/*.md` via `import_legacy_markdown` (no-op once populated)
 - all: `connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent — no `IF NOT EXISTS`; toasty 0.7 has a migration engine internally but `Db` exposes no public "migrate" entry point, so adding a table to an existing file means deleting it to rebuild)
 - the `Arc<Mutex<toasty::Db>>` is required, not incidental: toasty's `exec` takes `&mut self` (no internal concurrency for statement exec), so every repository call serializes through this one lock. Concurrency would need per-op `Connection` checkout from toasty's pool — a larger refactor, not done
 - toasty model structs are private to their file
@@ -183,7 +207,7 @@ run-ledger entry, and returns the reply. There is no separate planner.
 
 `tools/homeassistant.rs` — `HomeAssistantTool`, the Home Assistant integration (reaches a smart-home instance over its REST API, 15s timeout). Four actions: `list_entities` (read; optional `domain` prefix + `area` filter), `get_state` (read one entity), and `list_services` (discover callable services per domain) are read-only; `call_service` (turn devices on/off, etc.) is side-effecting → gated through the shared `Approver` as `Risk::Normal` with a `homeassistant:{domain}.{service}` scope key (approve-for-session). Two safety floors *below* approval (HA has no service-level access control of its own): `domain`/`service`/`entity_id` are shape-validated (`valid_name` / `valid_entity_id`) to block path-traversal/SSRF in the request path, and a `BLOCKED_DOMAINS` list (`shell_command`, `command_line`, `python_script`, `pyscript`, `hassio`, `rest_command`) is refused outright — no approval unlocks it, like shell's hardline list. Registered only when `HASS_TOKEN` is set (`HASS_URL` optional, defaults to homeassistant.local:8123; resolved by `config::homeassistant_config`, wired in `cli/wiring.rs`)
 
-`infra/homeassistant.rs` — `HomeAssistantChannel`, HA as an event-ingress channel (`Channel`, like telegram/feishu but event-driven, not conversational). Opens HA's WebSocket API (`/api/websocket`), authenticates with `HASS_TOKEN`, subscribes to `state_changed`; each qualifying event is formatted into a human-readable line (domain-aware: climate/sensor/binary_sensor/light/switch/fan/lock/alarm) and dispatched as one turn under session `homeassistant:events`, with the reply delivered back as an HA persistent notification (`HomeAssistantSender`, also a `TextSender`). Event forwarding is **closed by default** (`Filters`): no `watch_domains`/`watch_entities` + `watch_all=false` ⇒ everything dropped; an `ignore_entities` list and a per-entity `cooldown_seconds` (default 30) cap the rate so a busy home doesn't fire an LLM call per sensor tick. Auto-reconnects with `[5,10,30,60]`s backoff. **No pairing** — it's a trusted local integration keyed by `HASS_TOKEN`, not a chat with arbitrary senders. Declared in `[channels.homeassistant]` (behavior only; URL/token shared with the tool), resolved by `config::homeassistant_channel_config`, wired in `cli/gateway.rs`. Approval-requiring tool calls during an HA-triggered turn are denied (no human at the keyboard), so HA events can read/notify but not perform `Risk::Normal` actions unattended.
+`infra/messaging/homeassistant.rs` — `HomeAssistantChannel`, HA as an event-ingress channel (`Channel`, like telegram/feishu but event-driven, not conversational). Opens HA's WebSocket API (`/api/websocket`), authenticates with `HASS_TOKEN`, subscribes to `state_changed`; each qualifying event is formatted into a human-readable line (domain-aware: climate/sensor/binary_sensor/light/switch/fan/lock/alarm) and dispatched as one turn under session `homeassistant:events`, with the reply delivered back as an HA persistent notification (`HomeAssistantSender`, also a `TextSender`). Event forwarding is **closed by default** (`Filters`): no `watch_domains`/`watch_entities` + `watch_all=false` ⇒ everything dropped; an `ignore_entities` list and a per-entity `cooldown_seconds` (default 30) cap the rate so a busy home doesn't fire an LLM call per sensor tick. Auto-reconnects with `[5,10,30,60]`s backoff. **No pairing** — it's a trusted local integration keyed by `HASS_TOKEN`, not a chat with arbitrary senders. Declared in `[channels.homeassistant]` (behavior only; URL/token shared with the tool), resolved by `config::homeassistant_channel_config`, wired in `cli/gateway.rs`. Approval-requiring tool calls during an HA-triggered turn are denied (no human at the keyboard), so HA events can read/notify but not perform `Risk::Normal` actions unattended.
 
 `domain/task.rs` + `tools/task.rs` — durable cross-session tasks (roadmap §2's "kanban layer", shaped after hermes-agent), persisted by `KanbanDb` in its own `kanban.db`
 - single `Task` model: `status` (`inbox`→`todo`→`done`, plus `waiting`/`cancelled`), `waiting_on` (set = a commitment), optional `due_at`, `source`/`source_message_id` (origin session + dedup key for reviewer commitment extraction, see `ReviewSweep`), `board` (optional project/grouping label — a plain string, not a Project entity; the §2 escape hatch, as hermes does)
@@ -197,14 +221,14 @@ run-ledger entry, and returns the reply. There is no separate planner.
 - `todo` tool: call with no args to read; pass `todos` to replace the whole list (full-list replace, no merge). Reads the current session from the ambient turn context (`current_session`); inert (no session) for aux sub-agents and sweeps
 - the turn's session context is established for BOTH paths: the gateway dispatcher sets it (with a real `ReplySink`), and `AgentRuntime::handle_input` sets a *detached* context (no-op sink) when none exists, so the REPL gets `todo` too — see `SessionContext::detached`
 
-`domain/memory.rs` + `tools/memory.rs` + `infra/memory_db.rs` — long-term memory as three surfaces (roadmap §6/§1; design in `docs/memory-injection-plan.md`)
+`domain/memory.rs` + `tools/memory.rs` + `infra/memory/memory_db.rs` — long-term memory as three surfaces (roadmap §6/§1; design in `docs/memory-injection-plan.md`)
 - `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`. `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat)
 - **L1 pinned** (done): `MemoryRepository::pinned(ctx)` filters `is_pinnable` (pinned + active + confirmed/user_written + identity-kind + in-scope); `system_prompt::render_pinned_memory_block` renders an ≤800-char block injected in `infra/llm.rs::complete` **after** the volatile tier (cache-stable), marked `<!-- shion:memory:pinned -->`, flagged as untrusted data. Main agent only (`build_llm(..., Some(repo))`); aux/delegate get `None`
 - **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `shion memory list/search/promote/reject/pin`. `pin` is the manual-only path into L1 — automated extraction never pins
 - reviewer writes extractions as `candidate + extracted`, scoped to the origin channel, deduped via `find_by_source_message_id` (same governance as task inbox — user triages candidates up to active/pinned)
 - **L3 active recall** (done): `MemoryRepository::recall(ctx, text, limit)` scores active, in-scope memories against the turn's user message by **token overlap** (`recall_terms` = ASCII words + CJK bigrams + stopword filter; `recall_score`), distinct from L2 `search`'s whole-query substring match. Top `RECALL_LIMIT`=5 rendered by `system_prompt::render_recalled_memory_block` into an ≤2000-char block (each line `source:`-tagged, untrusted caveat, `<!-- shion:memory:recall -->`), injected in `infra/llm.rs::complete` **after** pinned (fixed `volatile | pinned | recall` order; pinned hits deduped out of recall). Recall failure is non-fatal but `warn!`-logged. Surfaced memories get `last_used_at` stamped via `MemoryRepository::mark_used` (only touches `last_used_at`, not `updated_at`) on a spawned best-effort task off the reply path — a Phase 4 usage signal
 
-`domain/run.rs` + `RunRepository` (impl in `infra/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
+`domain/run.rs` + `RunRepository` (impl in `infra/persistence/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
 - one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `shion.db` — execution state bound to a session, disposable like messages, **not** durable personal data
 - steps are captured at `execute_isolated` (see `services/tool_registry.rs`), so the ledger covers LLM-driven and keyword-routed tool calls alike. `RunContext` carries a shared `seq` counter so steps order stably even across the tool's spawned task
 - every write is best-effort (warn-logged, never fails a turn or a tool) — same contract as memory `mark_used`
@@ -228,24 +252,30 @@ run-ledger entry, and returns the reply. There is no separate planner.
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder + task sweeps every minute, optional daily briefing), all sharing one `watch` shutdown signal
-- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu`, `telegram`, and `homeassistant` (event ingress) are the wired channels
+- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu`, `telegram`, `wechat`, and `homeassistant` (event ingress) are the wired channels
 - sender admission is two-layered: each channel's `admit` filters message shape (non-text, bot senders, group mention gate), then the shared `PairingGuard` (`agent/pairing.rs`, store in `domain/pairing.rs`) decides identity — config `allow_from` is pre-trusted, approved pairings pass, anyone else gets a pairing code (`shion pair approve <code>` on the host admits them; `cli/pair.rs`)
 - `GatewayDispatcher` (`agent/interaction.rs`) is the front door between a channel and the agent: a channel builds a `ReplySink` (`domain/gateway.rs`) for the chat and hands it each inbound message; the dispatcher classifies chat control commands and otherwise runs a turn. Channels no longer await turns or send agent replies themselves — the dispatcher owns that, and runs each turn on a spawned task so the receive loop keeps polling (which is what lets an `/approve` reply arrive mid-turn). One turn at a time per session.
-- chat control commands (any channel): `/new` (also `/clear`, `/reset`) rotates the session hermes-style (`SessionRepository::rotate` archives the old transcript under a fresh id, leaving the chat's session empty — the reviewer can still see it), clears approval state, and clears the session's working todo list; `/approve` (+ `/approve session`) and `/deny` resolve a pending approval; `/sethome` (also `/home`) makes the current chat the home channel for proactive output (persisted via `HomeRepository`, `domain/home.rs`)
-- home channel + shutdown notice (hermes-borrowed): a single `HomeNotifier` (`infra/home_notifier.rs`) delivers all proactive output — reminders, task due notices, and the gateway's shutdown notice. It resolves the home at notify-time: the `/sethome` override (db, a `{platform}:{chat_id}` session id) wins over the config `home_chat` fallback (feishu first), degrading to the macOS notifier when no chat home resolves. On shutdown the gateway sends an "offline" notice through it (bounded by `SHUTDOWN_NOTICE_TIMEOUT`) before tearing down — only wired when a chat channel exists, so a foreground Ctrl-C with no channels stays quiet
+- chat control commands (any channel): `/new` (also `/clear`, `/reset`) rotates the session hermes-style (`SessionRepository::rotate` archives the old transcript under a fresh id, leaving the chat's session empty — the reviewer can still see it), clears approval state, and clears the session's working todo list; `/approve` (+ `/approve session`) and `/deny` resolve a pending approval; `/sethome` (also `/home`) makes the current chat the home channel for proactive output (persisted via `HomeRepository`, `domain/home.rs`); `/wechat login` (also `/weixin`) provisions the WeChat channel by sending its login QR **into the current chat** as a photo — so an already-working channel (e.g. Telegram) sets up WeChat with no host shell. It drives the `WeChatLogin` trait (`domain/gateway.rs`, impl `WeChatQrLogin` in `infra/messaging/wechat.rs`), which writes creds and pulses a `Notify` the WeChat channel's `serve` loop is waiting on, so it comes online without a restart
+- home channel + shutdown notice (hermes-borrowed): a single `HomeNotifier` (`infra/messaging/home_notifier.rs`) delivers all proactive output — reminders, task due notices, and the gateway's shutdown notice. It resolves the home at notify-time: the `/sethome` override (db, a `{platform}:{chat_id}` session id) wins over the config `home_chat` fallback (feishu first), degrading to the macOS notifier when no chat home resolves. On shutdown the gateway sends an "offline" notice through it (bounded by `SHUTDOWN_NOTICE_TIMEOUT`) before tearing down — only wired when a chat channel exists, so a foreground Ctrl-C with no channels stays quiet
 - interactive tool approval over chat (ported from hermes' gateway approval): the gateway wires `ChatApprover` (`agent/interaction.rs`), not a deny-everything approver. When a side-effecting tool requests approval (`Risk::Normal`/`Dangerous`), the agent sends a prompt to the chat and the turn suspends on a `oneshot` registered in the shared `ApprovalState` (keyed by session, 5-min timeout); the user's `/approve`/`/deny` resolves it. `Risk::Safe` actions run without asking. With no chat session in context (maintenance sweeps, aux sub-agents) approval is denied. The turn's session context (id + `ReplySink`) reaches the approver via a task-local in `services::tool_registry` that `execute_isolated` re-establishes across its `tokio::spawn`.
 - background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
 
-`infra/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send; also a `TextSender` for the shared `HomeNotifier`)
+`infra/messaging/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send; also a `TextSender` for the shared `HomeNotifier`)
 - receives `im.message.receive_v1` over Feishu's WebSocket long connection (open-lark, no public callback URL needed); replies via the IM REST API with plain reqwest
 - the ws connection runs on a dedicated thread with a current-thread runtime because open-lark's event dispatcher is not `Send`; events cross back over an mpsc channel
 - `admit` filters message shape: `require_mention` for group chats, non-text and bot-sent messages dropped; sender identity goes through the shared `PairingGuard`
 - session id is `feishu:{chat_id}`, so each chat is one continuous session; group @mention placeholders are stripped
 
-`infra/telegram.rs` — the telegram integration: `TelegramChannel` (ingress), `TelegramSender` (outbound send; also a `TextSender` for the shared `HomeNotifier`)
+`infra/messaging/telegram.rs` — the telegram integration: `TelegramChannel` (ingress), `TelegramSender` (outbound send; also a `TextSender` for the shared `HomeNotifier`)
 - receives messages via `getUpdates` long polling (no public callback URL needed); plain reqwest against the Bot API, no SDK dependency
 - `admit` mirrors the feishu policy: `require_mention` (group text must contain `@bot_username`, resolved via `getMe` at startup), non-text and bot-sent messages dropped; sender identity goes through the shared `PairingGuard`
 - session id is `telegram:{chat_id}`; replies are sent with `parse_mode=Markdown` (rich formatting), falling back to plain chunked text when the API rejects the Markdown or the reply exceeds 4096 UTF-16 units
+
+`infra/messaging/wechat.rs` — the WeChat (微信) integration over the **iLink** personal-bot protocol, built on the `wechatbot` crate (HTTP/JSON long-polling against `ilinkai.weixin.qq.com`, no public callback URL). `WeChatChannel` (ingress) + `WeChatSender` (outbound, also a `TextSender`) **share one `WeChatBot` instance** (built by `build_bot`, wired in `cli/gateway.rs`) — required because the crate keeps each user's reply `context_token` in memory, populated by the poll loop, and `send` needs it.
+- the crate owns its own poll loop (`WeChatBot::run`) and fires a **synchronous** `on_message` callback, so the channel adapts rather than drives: the handler clones the message and `tokio::spawn`s the async pairing + `dispatcher.handle`, then `serve` hands the thread to `run()` under a shutdown `select!` (dropping the `run()` future cancels the poll)
+- login is **QR-based**; creds → `~/.shion/wechat/credentials.json`. Provision either on the host with `shion wechat login` (`cli/wechat.rs`, renders the QR in-terminal via the `qrcode` crate) or from chat with `/wechat login` (the QR is sent into the chat as a photo — see the chat-commands list). `WeChatChannel::serve` **waits** for the cred file on an `Arc<Notify>` shared with `WeChatQrLogin` (it doesn't die without creds), so a chat-provisioned login brings the channel online with no restart. QR→PNG is `render_qr_png` (qrcode matrix → `image` crate, png feature only); photo delivery is `ReplySink::send_photo` (default errors; Telegram overrides it via `sendPhoto`)
+- **DM-only**: an iLink bot identity can't join ordinary WeChat groups, so there's no group/mention gate — `PairingGuard` (`platform = "wechat"`) is the only admission control. Session id is `wechat:{user_id}`
+- known limitation: proactive output (reminders/briefing via `HomeNotifier`) reaches a user only after they've messaged the bot since process start (the `context_token` map is in-memory, not persisted). The `wechatbot` crate also forces `reqwest`'s default TLS (native-tls/openssl) rather than shion's rustls — accepted tech-debt; switching needs a vendored patch
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
 
@@ -256,7 +286,7 @@ run-ledger entry, and returns the reply. There is no separate planner.
 - **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
 - **Add agent-loop control** (clarify / retry / budget — roadmap §8): build it as a layer in `AgentRuntime::turn_body` *above* `LlmClient`, or drive the tool-call loop in-house instead of delegating it to rig's `agent.prompt().max_turns()`. There is no planner to subclass — the loop currently lives inside rig
 - **Change the scheduled action**: implement `Maintenance` (`agent/daemon.rs`) and construct it in `cli/gateway.rs`
-- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration — `infra/feishu.rs` is the reference implementation
+- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration — `infra/messaging/feishu.rs` is the reference implementation
 
 ## Testing
 

@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     domain::{home::HomeRepository, notify::Notifier},
-    infra::{feishu::FeishuSender, telegram::TelegramSender},
+    infra::messaging::{feishu::FeishuSender, telegram::TelegramSender},
 };
 
 /// Outbound text to one chat, abstracted over the concrete channel senders so

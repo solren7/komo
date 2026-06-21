@@ -10,7 +10,7 @@ use crate::{
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
-    infra::{db::Db, kanban::KanbanDb},
+    infra::persistence::{db::Db, kanban::KanbanDb},
 };
 
 fn local_time(unix: i64) -> String {

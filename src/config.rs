@@ -257,6 +257,7 @@ pub struct FileConfig {
 pub struct ChannelsFileConfig {
     pub feishu: Option<FeishuFileConfig>,
     pub telegram: Option<TelegramFileConfig>,
+    pub wechat: Option<WeChatFileConfig>,
     pub homeassistant: Option<HomeAssistantChannelFileConfig>,
 }
 
@@ -444,6 +445,54 @@ pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
         allowed_chats: telegram.allowed_chats,
         require_mention: telegram.require_mention.unwrap_or(true),
         home_chat: telegram.home_chat,
+    }))
+}
+
+/// `[channels.wechat]` table: WeChat (微信) over the iLink personal-bot
+/// protocol. There are no credentials here or in `.env` — login is QR-based and
+/// the resulting token is stored in `~/.shion/wechat/credentials.json`
+/// (provisioned once with `shion wechat login`). DM-only, so no group/mention
+/// keys.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct WeChatFileConfig {
+    pub enabled: bool,
+    /// Sender iLink user-id allowlist. Empty = anyone who can reach the bot
+    /// (still gated by pairing).
+    pub allow_from: Vec<String>,
+    /// iLink user id that receives proactive output (reminders). Unset = keep
+    /// the local macOS notifier. Note: delivery still requires that user to
+    /// have messaged the bot since the gateway started (see `infra/messaging/wechat.rs`).
+    pub home_chat: Option<String>,
+}
+
+/// Resolved WeChat channel settings.
+pub struct WeChatConfig {
+    pub allow_from: Vec<String>,
+    pub home_chat: Option<String>,
+}
+
+/// Where the QR-login credentials are stored. Shared by the gateway channel and
+/// the `shion wechat login` provisioning command.
+pub fn wechat_cred_path() -> PathBuf {
+    shion_home().join("wechat").join("credentials.json")
+}
+
+/// Resolve the WeChat channel config. `None` means the channel is not enabled.
+/// Unlike the other channels there is no fail-fast credential check here —
+/// credentials are provisioned interactively (`shion wechat login`), and the
+/// channel reports its own missing-creds state at serve time.
+pub fn wechat_config() -> anyhow::Result<Option<WeChatConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(wechat) = file.channels.and_then(|c| c.wechat) else {
+        return Ok(None);
+    };
+    if !wechat.enabled {
+        return Ok(None);
+    }
+    Ok(Some(WeChatConfig {
+        allow_from: wechat.allow_from,
+        home_chat: wechat.home_chat,
     }))
 }
 

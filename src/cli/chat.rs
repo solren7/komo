@@ -6,7 +6,7 @@ use rustyline::error::ReadlineError;
 use crate::{
     cli::{approver::CliApprover, wiring},
     domain::{approval::Approver, repository::SessionRepository, session::Session},
-    infra::{db::Db, kanban::KanbanDb},
+    infra::persistence::{db::Db, kanban::KanbanDb},
 };
 
 pub async fn run(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {

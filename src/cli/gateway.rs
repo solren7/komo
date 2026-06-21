@@ -9,18 +9,26 @@ use crate::{
     },
     cli::wiring,
     domain::{
-        approval::Approver, gateway::MessageHandler, home::HomeRepository, notify::Notifier,
-        pairing::PairingRepository, reminder::ReminderRepository, repository::SessionRepository,
-        task::TaskRepository, todo::SessionTodoRepository,
+        approval::Approver,
+        gateway::{MessageHandler, WeChatLogin},
+        home::HomeRepository,
+        notify::Notifier,
+        pairing::PairingRepository,
+        reminder::ReminderRepository,
+        repository::SessionRepository,
+        task::TaskRepository,
+        todo::SessionTodoRepository,
     },
     infra::{
-        db::Db,
-        feishu::{FeishuChannel, FeishuSender},
-        home_notifier::{HomeNotifier, TextSender},
-        homeassistant::HomeAssistantChannel,
-        kanban::KanbanDb,
-        macos_notifier::MacosNotifier,
-        telegram::{TelegramChannel, TelegramSender},
+        messaging::{
+            feishu::{FeishuChannel, FeishuSender},
+            home_notifier::{HomeNotifier, TextSender},
+            homeassistant::HomeAssistantChannel,
+            macos_notifier::MacosNotifier,
+            telegram::{TelegramChannel, TelegramSender},
+            wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
+        },
+        persistence::{db::Db, kanban::KanbanDb},
     },
 };
 
@@ -65,6 +73,24 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     let telegram_sender = telegram
         .as_ref()
         .map(|cfg| Arc::new(TelegramSender::new(cfg.bot_token.clone())));
+    // WeChat shares one bot instance between its sender and channel so the
+    // channel's poll loop populates the context-token map the sender reads.
+    let wechat = crate::config::wechat_config()?;
+    let wechat_cred_path = crate::config::wechat_cred_path();
+    let wechat_bot = wechat.as_ref().map(|_| build_bot(&wechat_cred_path));
+    let wechat_sender = wechat_bot
+        .as_ref()
+        .map(|bot| Arc::new(WeChatSender::new(bot.clone())));
+    // Shared between the login coordinator (`/wechat login`) and the channel:
+    // a successful login pulses this so the channel starts polling without a
+    // restart.
+    let wechat_ready = Arc::new(tokio::sync::Notify::new());
+    let wechat_login: Option<Arc<dyn WeChatLogin>> = wechat_bot.as_ref().map(|_| {
+        Arc::new(WeChatQrLogin::new(
+            wechat_cred_path.clone(),
+            wechat_ready.clone(),
+        )) as Arc<dyn WeChatLogin>
+    });
 
     // A single home notifier delivers all proactive output (reminders, task
     // due notices, the shutdown notice). It resolves the home chat at
@@ -78,6 +104,9 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     if let Some(sender) = &telegram_sender {
         senders.insert("telegram".to_string(), sender.clone());
     }
+    if let Some(sender) = &wechat_sender {
+        senders.insert("wechat".to_string(), sender.clone());
+    }
     let config_home = feishu
         .as_ref()
         .and_then(|cfg| cfg.home_chat.clone())
@@ -87,6 +116,12 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
                 .as_ref()
                 .and_then(|cfg| cfg.home_chat.clone())
                 .map(|chat| format!("telegram:{chat}"))
+        })
+        .or_else(|| {
+            wechat
+                .as_ref()
+                .and_then(|cfg| cfg.home_chat.clone())
+                .map(|chat| format!("wechat:{chat}"))
         });
     let home_repo: Arc<dyn HomeRepository> = db.clone();
     let notifier: Arc<dyn Notifier> = Arc::new(HomeNotifier::new(
@@ -111,7 +146,12 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
     let dispatcher = Arc::new(GatewayDispatcher::new(
-        handler, approvals, sessions, home_repo, todos,
+        handler,
+        approvals,
+        sessions,
+        home_repo,
+        todos,
+        wechat_login,
     ));
     let mut gateway = Gateway::new(dispatcher)
         .with_maintenance(MaintenanceService {
@@ -162,6 +202,16 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
             pairings.clone(),
         )));
         channels.push("telegram");
+    }
+    if let (Some(cfg), Some(bot)) = (&wechat, &wechat_bot) {
+        gateway = gateway.add_channel(Box::new(WeChatChannel::new(
+            bot.clone(),
+            cfg,
+            wechat_cred_path.clone(),
+            wechat_ready.clone(),
+            pairings.clone(),
+        )));
+        channels.push("wechat");
     }
     // Whether an interactive chat channel exists — gates the shutdown notice
     // (HA is event-only, so an HA-only gateway must not pop a macOS notice).

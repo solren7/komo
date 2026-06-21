@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use crate::{
     agent::{gateway::Channel, interaction::GatewayDispatcher},
     config::HomeAssistantChannelConfig,
-    infra::home_notifier::TextSender,
+    infra::messaging::home_notifier::TextSender,
 };
 
 /// One continuous session for all HA events (mirrors hermes' `ha_events`).

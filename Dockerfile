@@ -3,9 +3,11 @@
 # Multi-stage build for the shion gateway.
 #   builder : rust toolchain + protoc (feishu's protobuf is compiled at build
 #             time), produces the release binary
-#   runtime : debian-slim + CA certs (rustls needs a trust store for TLS to
-#             Telegram / Home Assistant / the LLM API) + tzdata (reminders and
-#             the briefing run on local time — set TZ at runtime)
+#   runtime : debian-slim + CA certs (TLS to Telegram / Home Assistant / the
+#             LLM API needs a trust store) + libssl3 (the wechat channel's
+#             `wechatbot` crate pulls reqwest's native-tls, which dynamically
+#             links libssl on Linux — without it the binary won't even load) +
+#             tzdata (reminders and the briefing run on local time — set TZ)
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
 #   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/shion:latest --push .
@@ -37,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/shion /usr/local/bin/shion

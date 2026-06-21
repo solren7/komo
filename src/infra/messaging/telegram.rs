@@ -120,6 +120,34 @@ impl TelegramSender {
         Ok(())
     }
 
+    /// Send a PNG photo (e.g. the wechat login QR) via `sendPhoto` multipart.
+    pub async fn send_photo(
+        &self,
+        chat_id: &str,
+        png: Vec<u8>,
+        caption: &str,
+    ) -> anyhow::Result<()> {
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("qr.png")
+            .mime_str("image/png")?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", caption.to_string())
+            .part("photo", part);
+        let response: ApiResponse<serde_json::Value> = self
+            .http
+            .post(self.url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !response.ok {
+            anyhow::bail!("telegram sendPhoto failed: {}", response.description);
+        }
+        Ok(())
+    }
+
     /// The bot's own username, needed for the group @mention gate.
     async fn bot_username(&self) -> anyhow::Result<String> {
         #[derive(Deserialize)]
@@ -176,6 +204,10 @@ struct TelegramReplySink {
 impl ReplySink for TelegramReplySink {
     async fn send(&self, text: &str) -> anyhow::Result<()> {
         self.sender.send_text(&self.chat_id, text).await
+    }
+
+    async fn send_photo(&self, png: Vec<u8>, caption: &str) -> anyhow::Result<()> {
+        self.sender.send_photo(&self.chat_id, png, caption).await
     }
 }
 

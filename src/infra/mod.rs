@@ -1,11 +1,8 @@
-pub mod db;
-pub mod feishu;
-pub mod home_notifier;
-pub mod homeassistant;
-pub mod kanban;
+// Cross-cutting infra (LLM backend, tool adapter)
 pub mod llm;
-pub mod macos_notifier;
-pub mod md_memory;
-pub mod memory_db;
 pub mod rig_tool;
-pub mod telegram;
+
+// Layered infra by concern
+pub mod memory;
+pub mod messaging;
+pub mod persistence;

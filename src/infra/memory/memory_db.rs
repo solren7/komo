@@ -22,7 +22,7 @@ use crate::domain::memory::{
     Memory, MemoryRepository, MemoryScope, parse_memory_confidence, parse_memory_kind,
     parse_memory_status,
 };
-use crate::infra::md_memory::MdMemoryStore;
+use crate::infra::memory::md_memory::MdMemoryStore;
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
 #[derive(Debug, toasty::Model)]

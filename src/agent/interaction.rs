@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use crate::{
     domain::{
         approval::{ApprovalRequest, Approver, Risk},
-        gateway::{MessageHandler, ReplySink},
+        gateway::{MessageHandler, ReplySink, WeChatLogin},
         home::HomeRepository,
         repository::SessionRepository,
         todo::SessionTodoRepository,
@@ -208,6 +208,8 @@ pub enum Command {
     Deny,
     /// Make this chat the home channel for proactive output.
     SetHome,
+    /// Provision the WeChat channel by QR (delivered to this chat).
+    WechatLogin,
     /// Ordinary message — run a turn.
     Plain(String),
 }
@@ -221,6 +223,7 @@ pub fn classify(text: &str) -> Command {
         "/approve session" | "/approve all" => Command::Approve(Decision::Session),
         "/deny" | "/no" | "/n" => Command::Deny,
         "/sethome" | "/home" => Command::SetHome,
+        "/wechat" | "/wechat login" | "/weixin" => Command::WechatLogin,
         _ => Command::Plain(text.to_string()),
     }
 }
@@ -238,6 +241,8 @@ pub struct GatewayDispatcher {
     sessions: Arc<dyn SessionRepository>,
     home: Arc<dyn HomeRepository>,
     todos: Arc<dyn SessionTodoRepository>,
+    /// Set when the WeChat channel is enabled — drives `/wechat login`.
+    wechat_login: Option<Arc<dyn WeChatLogin>>,
     inflight: Mutex<HashSet<String>>,
 }
 
@@ -248,6 +253,7 @@ impl GatewayDispatcher {
         sessions: Arc<dyn SessionRepository>,
         home: Arc<dyn HomeRepository>,
         todos: Arc<dyn SessionTodoRepository>,
+        wechat_login: Option<Arc<dyn WeChatLogin>>,
     ) -> Self {
         Self {
             handler,
@@ -255,6 +261,7 @@ impl GatewayDispatcher {
             sessions,
             home,
             todos,
+            wechat_login,
             inflight: Mutex::new(HashSet::new()),
         }
     }
@@ -316,8 +323,35 @@ impl GatewayDispatcher {
                 };
                 let _ = sink.send(reply).await;
             }
+            Command::WechatLogin => self.spawn_wechat_login(sink),
             Command::Plain(input) => self.spawn_turn(session_id, input, sink),
         }
+    }
+
+    /// Run the WeChat QR login off the receive loop: it blocks while the user
+    /// scans, and the QR is delivered to this chat as a photo. On success the
+    /// login pulses the channel's `ready` signal, bringing it online.
+    fn spawn_wechat_login(self: &Arc<Self>, sink: Arc<dyn ReplySink>) {
+        let Some(login) = self.wechat_login.clone() else {
+            tokio::spawn(async move {
+                let _ = sink
+                    .send("微信通道未启用：先在 ~/.shion/config.toml 配置 [channels.wechat]。")
+                    .await;
+            });
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = sink.send("正在生成微信登录二维码，请稍候…").await;
+            match login.run(sink.clone()).await {
+                Ok(user_id) => {
+                    let _ = sink.send(&format!("✅ 微信已连接（{user_id}），现在可以直接对话了。")).await;
+                }
+                Err(error) => {
+                    warn!(%error, "wechat login via chat failed");
+                    let _ = sink.send(&format!("微信登录失败：{error}")).await;
+                }
+            }
+        });
     }
 
     fn spawn_turn(self: &Arc<Self>, session_id: &str, input: String, sink: Arc<dyn ReplySink>) {
@@ -373,6 +407,8 @@ mod tests {
         assert_eq!(classify("/deny"), Command::Deny);
         assert_eq!(classify("/sethome"), Command::SetHome);
         assert_eq!(classify(" /SetHome "), Command::SetHome);
+        assert_eq!(classify("/wechat login"), Command::WechatLogin);
+        assert_eq!(classify(" /WeChat "), Command::WechatLogin);
         assert_eq!(classify("hello"), Command::Plain("hello".to_string()));
         // A leading slash inside a longer message is plain text.
         assert_eq!(

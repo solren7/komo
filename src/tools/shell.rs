@@ -67,6 +67,67 @@ struct ShellArgs {
     command: String,
 }
 
+/// Markers that introduce a secret value as `marker=<secret>` (case-insensitive).
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "api_key=",
+    "apikey=",
+    "api-key=",
+    "token=",
+    "secret=",
+    "password=",
+    "passwd=",
+    "pwd=",
+    "access_key=",
+    "auth=",
+];
+
+/// Flags whose *following* token is a secret (`--password hunter2`).
+const SECRET_FLAGS: &[&str] = &["--password", "--token", "--api-key", "--secret", "-p"];
+
+/// A token that "looks like" an opaque credential: long and a single run of
+/// url-safe-ish characters with no shell punctuation.
+fn looks_like_secret(token: &str) -> bool {
+    token.len() >= 24
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='))
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Best-effort scrub of secret-looking substrings from a shell command before it
+/// is written to the run ledger. Heuristic, dependency-free, whitespace-tokenized:
+/// covers `key=value`, `Bearer <tok>`, `--password <tok>`, and high-entropy
+/// tokens. The command structure stays readable; only the secret is replaced.
+fn redact_secrets(command: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut scrub_next = false;
+    for raw in command.split_whitespace() {
+        if scrub_next {
+            out.push("***".to_string());
+            scrub_next = false;
+            continue;
+        }
+        let lower = raw.to_lowercase();
+        if lower == "bearer" || SECRET_FLAGS.contains(&lower.as_str()) {
+            out.push(raw.to_string());
+            scrub_next = true;
+            continue;
+        }
+        if let Some(marker) = SECRET_KEY_MARKERS.iter().find(|m| lower.starts_with(**m)) {
+            // Preserve the original-case key prefix, drop the value.
+            out.push(format!("{}***", &raw[..marker.len()]));
+            continue;
+        }
+        if looks_like_secret(raw) {
+            out.push("***".to_string());
+            continue;
+        }
+        out.push(raw.to_string());
+    }
+    out.join(" ")
+}
+
 /// Runs a shell command via `sh -c`, gated behind an [`Approver`]. Dangerous
 /// commands (deletes, `git push`, `sudo`, ...) are flagged prominently. Runs
 /// with the working directory set to the workspace root.
@@ -108,6 +169,20 @@ impl Tool for ShellTool {
             },
             "required": ["command"]
         })
+    }
+
+    /// Scrub secret-looking substrings from the command before it lands in the
+    /// run ledger (the command itself is kept for audit; only secrets go).
+    fn redact_args(&self, args: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(args) {
+            Ok(mut v) => {
+                if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                    v["command"] = serde_json::json!(redact_secrets(cmd));
+                }
+                v.to_string()
+            }
+            Err(_) => "<shell args redacted>".to_string(),
+        }
     }
 
     async fn execute(&self, input: String) -> anyhow::Result<String> {
@@ -261,6 +336,36 @@ mod tests {
                 "cmd: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn redact_secrets_scrubs_common_shapes() {
+        let cmd = "curl -H 'Authorization: Bearer sk-abc123def456ghi789' https://api.example.com";
+        let r = redact_secrets(cmd);
+        assert!(!r.contains("sk-abc123def456ghi789"));
+        assert!(r.contains("Bearer"));
+
+        let kv = redact_secrets("deploy --env api_key=AKIA1234567890SECRET token=zzz");
+        assert!(!kv.contains("AKIA1234567890SECRET"));
+        assert!(kv.contains("api_key=***"));
+
+        let flag = redact_secrets("login --password hunter2longenoughxx");
+        assert!(!flag.contains("hunter2longenoughxx"));
+        assert!(flag.contains("--password ***"));
+
+        let entropy = redact_secrets("echo ABCD1234efgh5678ijkl9012mnop");
+        assert!(entropy.contains("***"));
+
+        // Ordinary commands pass through untouched.
+        assert_eq!(redact_secrets("ls -la /tmp"), "ls -la /tmp");
+    }
+
+    #[test]
+    fn redact_args_scrubs_command_value() {
+        let tool = ShellTool::new(workspace(), Arc::new(AlwaysApprove));
+        let args = json!({ "command": "x token=supersecretvalue123456" }).to_string();
+        let redacted = tool.redact_args(&args);
+        assert!(!redacted.contains("supersecretvalue123456"));
     }
 
     #[tokio::test]

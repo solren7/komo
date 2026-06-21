@@ -11,7 +11,7 @@ use rig::{
 };
 
 use crate::{
-    agent::system_prompt::render_pinned_memory_block,
+    agent::system_prompt::{render_pinned_memory_block, render_recalled_memory_block},
     config::{ModelConfig, Provider},
     domain::{
         llm::LlmClient,
@@ -30,6 +30,10 @@ use crate::{
 /// stays byte-identical across turns within a day (upstream prompt cache stays
 /// warm) and self-heals across midnight.
 pub type PreambleFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// Max facts pulled per turn by L3 active recall. Small on purpose: recall is
+/// background context, top-ranked relevance only. See `docs/memory-injection-plan.md`.
+const RECALL_LIMIT: usize = 5;
 
 /// Generic [`LlmClient`] over any `rig` completion model. The concrete provider
 /// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
@@ -78,14 +82,49 @@ where
         // but it is logged, or "why doesn't it know me today" is unanswerable.
         if let Some(memories) = &self.memories {
             let ctx = MemoryContext::from_session(&session.id);
+
+            // L1 pinned profile. Capture the ids so the same memory is not also
+            // echoed by L3 recall below (a pinned memory is active + in-scope, so
+            // it would otherwise surface twice).
+            let mut pinned_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             match memories.pinned(&ctx).await {
                 Ok(pinned) => {
+                    pinned_ids = pinned.iter().map(|m| m.id.clone()).collect();
                     if let Some(block) = render_pinned_memory_block(&pinned) {
                         preamble.push_str("\n\n");
                         preamble.push_str(&block);
                     }
                 }
                 Err(error) => tracing::warn!(%error, "failed to load pinned memories"),
+            }
+
+            // L3 active recall: facts relevant to this turn's message, appended
+            // after pinned so the volatile|pinned|recall order holds (pinned is
+            // cross-turn stable, recall is per-query cold — stable goes first to
+            // keep the prefix cacheable). Same non-fatal-but-logged contract.
+            match memories.recall(&ctx, &prompt, RECALL_LIMIT).await {
+                Ok(mut hits) => {
+                    hits.retain(|h| !pinned_ids.contains(&h.memory.id));
+                    if let Some(block) = render_recalled_memory_block(&hits) {
+                        preamble.push_str("\n\n");
+                        preamble.push_str(&block);
+                    }
+                    // Record the recall usage signal off the reply path: it only
+                    // touches `last_used_at`, so it must not add latency or fail
+                    // the answer. Spawned best-effort, warn on error.
+                    let ids: Vec<String> = hits.iter().map(|h| h.memory.id.clone()).collect();
+                    if !ids.is_empty() {
+                        let repo = memories.clone();
+                        tokio::spawn(async move {
+                            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                            if let Err(error) = repo.mark_used(&ids, now).await {
+                                tracing::warn!(%error, "failed to record recall usage");
+                            }
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to recall memories"),
             }
         }
 
@@ -127,70 +166,51 @@ pub fn build_llm(
     // Seed the agent with an initial preamble; `complete` overrides it per turn.
     let initial = preamble();
 
+    // Each provider's client/agent type differs (erased to `Arc<dyn LlmClient>`
+    // at the end), so the four arms can't share a value — but the agent-build
+    // and `RigLlm` wrapping are identical. This macro factors that tail out;
+    // only one arm runs, so moving `adapters`/`preamble`/`memories` per arm is
+    // fine. `client` is the only thing that varies.
+    macro_rules! rig_llm {
+        ($client:expr) => {{
+            let agent = $client
+                .agent(model.clone())
+                .preamble(&initial)
+                .tools(adapters)
+                .build();
+            Arc::new(RigLlm {
+                agent,
+                max_turns,
+                preamble,
+                memories,
+            }) as Arc<dyn LlmClient>
+        }};
+    }
+
     let llm: Arc<dyn LlmClient> = match config.provider {
         Provider::DeepSeek => {
             let client = with_base_url(deepseek::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build DeepSeek client")?;
-            let agent = client
-                .agent(model)
-                .preamble(&initial)
-                .tools(adapters)
-                .build();
-            Arc::new(RigLlm {
-                agent,
-                max_turns,
-                preamble,
-                memories: memories.clone(),
-            }) as Arc<dyn LlmClient>
+            rig_llm!(client)
         }
         Provider::OpenAi => {
             let client = with_base_url(openai::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build OpenAI client")?;
-            let agent = client
-                .agent(model)
-                .preamble(&initial)
-                .tools(adapters)
-                .build();
-            Arc::new(RigLlm {
-                agent,
-                max_turns,
-                preamble,
-                memories: memories.clone(),
-            }) as Arc<dyn LlmClient>
+            rig_llm!(client)
         }
         Provider::Anthropic => {
             let client = with_base_url(anthropic::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build Anthropic client")?;
-            let agent = client
-                .agent(model)
-                .preamble(&initial)
-                .tools(adapters)
-                .build();
-            Arc::new(RigLlm {
-                agent,
-                max_turns,
-                preamble,
-                memories: memories.clone(),
-            }) as Arc<dyn LlmClient>
+            rig_llm!(client)
         }
         Provider::OpenRouter => {
             let client = with_base_url(openrouter::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build OpenRouter client")?;
-            let agent = client
-                .agent(model)
-                .preamble(&initial)
-                .tools(adapters)
-                .build();
-            Arc::new(RigLlm {
-                agent,
-                max_turns,
-                preamble,
-                memories: memories.clone(),
-            }) as Arc<dyn LlmClient>
+            rig_llm!(client)
         }
     };
     Ok(llm)

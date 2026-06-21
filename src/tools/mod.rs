@@ -1,5 +1,6 @@
 pub mod delegate;
 pub mod file;
+pub mod homeassistant;
 pub mod memory;
 pub mod reminder;
 pub mod session;

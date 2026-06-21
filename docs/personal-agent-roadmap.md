@@ -145,25 +145,22 @@ maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个
 
 这样可以减少 agent 自己污染记忆，也能在回答时追溯"为什么这么认为"。
 
-## 7. 工作流执行记录（run ledger）
+## 7. 工作流执行记录（run ledger）（记录已落地，resume 待做）
 
-长任务需要可恢复、可审计。建议新增 `Run` / `RunStep` 模型，记录每次 agent 执行：
+长任务需要可恢复、可审计。
 
-- 用户原始请求
-- planner 产出的步骤
-- 工具调用参数和结果摘要
-- 失败原因
-- 是否可恢复
-- 最终输出
+**已实现：记录层。** `domain/run.rs` 的 `Run` / `RunStep` 模型 + `RunRepository`（impl 在 `infra/db.rs`，存 `shion.db`——执行态绑定 session，和 messages 一样可丢弃，非持久个人数据）：
 
-这会让以下能力变得自然：
+- 一次 turn = 一条 `Run`（用户原始请求 `input`、planner 决策摘要 `plan`、`status` running/done/failed、`final_output`、`error`、起止时间）
+- 每次工具调用 = 一条 `RunStep`（`tool_name`、`args`、`result`、`error`、`ok`、`seq`、时间）
+- **埋点在 `execute_isolated`**（`services/tool_registry.rs`）——这是 LLM function-calling 与 keyword 路由两条路径唯一的汇聚点，所以账本能捕获**全部**工具调用，而不只是 runtime 显式路由的那几次。`runtime.rs::run_turn` 用一个 `RunContext` task-local + `run` tracing span 包住 turn 主体
+- 所有账本写入 **best-effort**（warn 记录，绝不拖垮 turn 或 tool），对齐 memory `mark_used` 的契约
+- **脱敏**：step `args` 默认全存，但每个 `Tool` 可经 `Tool::redact_args` 自行脱敏——`shell` 擦掉疑似密钥、`file` 丢掉写入正文；`result` 仅截断不脱敏（shell 输出仍可能含密钥，接受，shion.db 本地可删）。字段按 `RUN_FIELD_CAP`/`STEP_FIELD_CAP` 截断
+- aux 子 agent 与 maintenance sweep 没有 `RunContext`，其工具调用不进账本
+- 顺带补上了**全局 tracing subscriber**（`main.rs::init_tracing`）：此前全代码库的 `info!`/`warn!`/`debug!` 因无 subscriber 全是空操作；现在写 stderr（gateway 由 launchd 落到 `~/.shion/logs/gateway.err.log`），`SHION_LOG` 控制级别，默认 `info,toasty=warn`
+- operator 视图：`shion run list [--limit N]` / `shion run inspect <id>`
 
-- `shion run list`
-- `shion run inspect <id>`
-- `resume` 上一次中断任务
-- 复盘 agent 为什么做了某个动作
-
-没有 run ledger，个人 agent 越自动化，越难调试。不过当前 planner 还薄、自动化程度低，调试痛感尚未出现——等 gateway 真的开始自主做事（第 1、3、4 节落地后）再补不迟。第 3 节的权限审计也依赖它。
+**尚未做：** `resume` 上一次中断任务，以及与之配套的 `recoverable` 字段（roadmap §6「无消费者不加字段」，等 resume 真要做时再加）；账本剪枝（runs 像 messages 一样累积，后续可挂一个 operator 清理动作）。第 3 节的权限审计将复用本账本。
 
 ## 8. 更强的 planner / orchestrator
 
@@ -181,6 +178,8 @@ maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个
 - 中途产物保存：长任务可以先落地草稿或 run record
 
 不需要一开始做复杂模型化 planner，但至少要把"一次请求一次回复"升级为"一个有状态执行单元"。
+
+**架构前提（2026-06 决定）：** 多步工具循环目前完全在 rig 的 agent loop（`infra/llm.rs` 的 `agent.prompt().max_turns()`）里，shion 看不见也控制不了中间步。上面这些能力（澄清/重试分类/预算/中途产物）都需要 shion 自己驱动这个循环——即把循环从 rig 收回 `AgentRuntime`，rig 只做单次 completion。这是个有回归风险的核心重写，**刻意推迟**：在没有任何一个上述功能做消费者时先收回循环，只会逐字复刻 rig 行为、徒增耦合与风险（同 §6「无消费者不加结构」）。正确做法是等某个具体控制点（首选"工具瞬时错误自动重试"或"token/次数预算上限"）真正要做时，由它的需求驱动着把循环收回来——那时循环的形状才有依据。曾评估过的"vestigial planner"（`KeywordPlanner`/`Plan`/`MultiStep`）已于同期删除，避免一个既不真编排又不让开的空壳抽象。
 
 ## 9. 可观察性与 inspect
 
@@ -213,6 +212,6 @@ maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个
 4. ✅ reviewer 增加承诺提取方向，capture 进 task inbox（第 2 节）
 5. 飞书日历只读连接器，与 feishu channel 共享鉴权（第 5 节）
 6. ✅ 强化 memory 来源和过期机制（第 6 节；细分类/confidence 暂缓）
-7. 为长任务加入 `Run` / `RunStep` 记录（第 7 节）
+7. ✅ 为长任务加入 `Run` / `RunStep` 记录（第 7 节，记录层 + 全局 tracing；resume 待做）
 
 前两步加上已有的 ingress 合起来才构成从"聊天工具"到"个人 agent"的那次跨越；其余都可以在这个闭环跑起来之后逐步加。

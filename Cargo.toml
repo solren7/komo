@@ -20,9 +20,12 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "c
 open-lark = { version = "0.14", default-features = false, features = ["websocket", "im"] }
 rig = { package = "rig-core", version = "0.38" }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 uuid = { version = "1.23.3", features = ["v4", "v7"] }
 sha2 = "0.10"
 croner = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustyline = "15"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"

@@ -1,6 +1,7 @@
 pub mod db;
 pub mod feishu;
 pub mod home_notifier;
+pub mod homeassistant;
 pub mod kanban;
 pub mod llm;
 pub mod macos_notifier;

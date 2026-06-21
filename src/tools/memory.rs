@@ -4,10 +4,19 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::domain::{
-    memory::{Memory, MemoryConfidence, MemoryKind, MemoryRepository, parse_memory_kind},
-    tool::Tool,
+use crate::{
+    domain::{
+        memory::{
+            Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
+            MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
+        },
+        tool::Tool,
+    },
+    services::tool_registry::current_session,
 };
+
+/// Default cap on search results.
+const SEARCH_LIMIT: usize = 10;
 
 #[derive(Deserialize)]
 struct MemoryArgs {
@@ -18,15 +27,28 @@ struct MemoryArgs {
     kind: Option<String>,
     #[serde(default)]
     query: Option<String>,
-    /// Optional TTL in days (action=save): the memory is hidden from recall
-    /// once it elapses. Omit for a memory that never expires.
+    /// Target memory id (action=update/promote/reject/archive).
+    #[serde(default)]
+    id: Option<String>,
+    /// New status (action=update).
+    #[serde(default)]
+    status: Option<String>,
+    /// Pin/unpin (action=update). Pinning is the only path into L1 injection.
+    #[serde(default)]
+    pinned: Option<bool>,
+    /// New ranking weight 0–100 (action=update).
+    #[serde(default)]
+    importance: Option<i32>,
+    /// Optional TTL in days (action=save).
     #[serde(default)]
     expiry_days: Option<i64>,
 }
 
-/// Long-term, cross-session memory. The model decides what to remember
-/// (`save`) and recalls it later (`list` / `search`). Storage lives behind
-/// [`MemoryRepository`] — the same store the reflective reviewer writes to.
+/// Long-term, cross-session memory with governance. The model `save`s facts,
+/// `search`es them (scoped to the current chat/session), and curates the
+/// library: `promote` a candidate to active, `reject`/`archive` it, or `update`
+/// fields (including `pinned`, which gates L1 per-turn injection). Storage lives
+/// behind [`MemoryRepository`] — the same store the reviewer writes to.
 pub struct MemoryTool {
     memories: Arc<dyn MemoryRepository>,
 }
@@ -34,6 +56,17 @@ pub struct MemoryTool {
 impl MemoryTool {
     pub fn new(memories: Arc<dyn MemoryRepository>) -> Self {
         Self { memories }
+    }
+
+    /// Load a memory by id or return a helpful error.
+    async fn require(&self, id: &Option<String>) -> anyhow::Result<Memory> {
+        let id = id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("`id` is required for this action"))?;
+        self.memories
+            .get(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no memory with id `{id}`"))
     }
 }
 
@@ -44,10 +77,14 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &'static str {
-        "Persistent long-term memory across sessions. action=\"save\" stores a \
-         fact (optional kind: profile | preference | feedback | project | person | \
-         fact | decision | reference); action=\"search\" returns stored facts \
-         matching a query; action=\"list\" returns all stored facts."
+        "Persistent long-term memory across sessions, with governance. \
+         action=\"save\" stores a fact (optional kind: profile | preference | feedback | \
+         project | person | fact | decision | reference); action=\"search\" returns facts \
+         matching a query (scoped to this chat); action=\"list\" returns stored facts; \
+         action=\"update\" changes a memory by id (status / pinned / importance / kind / \
+         content); action=\"promote\" marks a candidate active; action=\"reject\" / \
+         \"archive\" retire one. Pin a memory (update pinned=true) only when the user \
+         confirms it as durable profile context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -56,20 +93,21 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["save", "search", "list"],
+                    "enum": ["save", "search", "list", "update", "promote", "reject", "archive"],
                     "description": "The memory operation to perform."
                 },
-                "text": { "type": "string", "description": "Fact to store (action=save)." },
+                "text": { "type": "string", "description": "Fact to store (action=save) or new content (action=update)." },
                 "kind": {
                     "type": "string",
                     "enum": ["profile", "preference", "feedback", "project", "person", "fact", "decision", "reference"],
-                    "description": "Category of the fact (action=save, default: profile)."
+                    "description": "Category (action=save, default profile; or action=update)."
                 },
-                "expiry_days": {
-                    "type": "integer",
-                    "description": "Optional TTL in days (action=save); the fact is forgotten after this many days. Omit for a permanent memory."
-                },
-                "query": { "type": "string", "description": "Search term (action=search)." }
+                "query": { "type": "string", "description": "Search term (action=search)." },
+                "id": { "type": "string", "description": "Target memory id (action=update/promote/reject/archive)." },
+                "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
+                "pinned": { "type": "boolean", "description": "Pin/unpin for L1 injection (action=update). Only pin user-confirmed durable facts." },
+                "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
+                "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." }
             },
             "required": ["action"]
         })
@@ -78,6 +116,7 @@ impl Tool for MemoryTool {
     async fn execute(&self, input: String) -> anyhow::Result<String> {
         let args: MemoryArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid memory arguments: {e}"))?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         match args.action.as_str() {
             "save" => {
@@ -92,36 +131,98 @@ impl Tool for MemoryTool {
                 let mut memory = Memory::new(kind, text);
                 // An explicit user save is the highest trust tier.
                 memory.confidence = MemoryConfidence::UserWritten;
+                // Scope to the current chat so a channel fact does not leak elsewhere.
+                memory.scope = ctx().write_scope();
                 if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
-                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
                     memory.expires_at = Some(now + days * 86_400);
                 }
                 self.memories.save(&memory).await?;
                 Ok(format!("Saved memory {}.", memory.id))
             }
             "list" => {
-                let memories = self.memories.list().await?;
+                let mut memories = self.memories.list().await?;
+                if let Some(status) = args.status.as_deref().map(parse_memory_status) {
+                    memories.retain(|m| m.status == status);
+                }
                 Ok(render(&memories))
             }
             "search" => {
-                let query = args
+                let text = args
                     .query
-                    .ok_or_else(|| anyhow::anyhow!("`query` is required for action=search"))?
-                    .to_lowercase();
-                let hits: Vec<Memory> = self
-                    .memories
-                    .list()
-                    .await?
-                    .into_iter()
-                    .filter(|m| m.content.to_lowercase().contains(&query))
-                    .collect();
-                Ok(render(&hits))
+                    .ok_or_else(|| anyhow::anyhow!("`query` is required for action=search"))?;
+                let query = MemoryQuery {
+                    text,
+                    allowed_scopes: ctx().allowed_scopes,
+                    kinds: Vec::new(),
+                    statuses: vec![MemoryStatus::Active],
+                    limit: SEARCH_LIMIT,
+                };
+                let hits = self.memories.search(query).await?;
+                Ok(render_scored(&hits))
             }
+            "update" => {
+                let mut memory = self.require(&args.id).await?;
+                if let Some(text) = args.text {
+                    memory.content = text;
+                }
+                if let Some(kind) = args.kind.as_deref() {
+                    memory.kind = parse_memory_kind(kind);
+                }
+                if let Some(status) = args.status.as_deref() {
+                    memory.status = parse_memory_status(status);
+                }
+                if let Some(pinned) = args.pinned {
+                    memory.pinned = pinned;
+                    // Pinning requires high confidence to actually surface in L1.
+                    if pinned && memory.confidence == MemoryConfidence::Extracted {
+                        memory.confidence = MemoryConfidence::Confirmed;
+                    }
+                }
+                if let Some(importance) = args.importance {
+                    memory.importance = importance.clamp(0, 100);
+                }
+                memory.updated_at = now;
+                self.memories.save(&memory).await?;
+                Ok(format!("Updated memory {}.", memory.id))
+            }
+            "promote" => {
+                let mut memory = self.require(&args.id).await?;
+                memory.status = MemoryStatus::Active;
+                memory.confidence = MemoryConfidence::Confirmed;
+                memory.updated_at = now;
+                self.memories.save(&memory).await?;
+                Ok(format!("Promoted memory {} to active.", memory.id))
+            }
+            "reject" => set_status(self, &args.id, MemoryStatus::Rejected, now).await,
+            "archive" => set_status(self, &args.id, MemoryStatus::Archived, now).await,
             other => Err(anyhow::anyhow!(
-                "unknown action `{other}` (expected save/search/list)"
+                "unknown action `{other}` (expected save/search/list/update/promote/reject/archive)"
             )),
         }
     }
+}
+
+/// The memory context for the current turn, derived from the ambient session.
+/// Falls back to a global-only context when there is no session (aux sub-agents
+/// never reach here, but be safe).
+fn ctx() -> MemoryContext {
+    match current_session() {
+        Some(s) => MemoryContext::from_session(&s.session_id),
+        None => MemoryContext::from_session(""),
+    }
+}
+
+async fn set_status(
+    tool: &MemoryTool,
+    id: &Option<String>,
+    status: MemoryStatus,
+    now: i64,
+) -> anyhow::Result<String> {
+    let mut memory = tool.require(id).await?;
+    memory.status = status;
+    memory.updated_at = now;
+    tool.memories.save(&memory).await?;
+    Ok(format!("Set memory {} to {}.", memory.id, status.as_str()))
 }
 
 fn render(memories: &[Memory]) -> String {
@@ -130,13 +231,34 @@ fn render(memories: &[Memory]) -> String {
     }
     memories
         .iter()
-        .map(|m| {
-            let mut line = format!("[{}] {}: {}", m.kind.as_str(), m.id, m.content);
-            if !m.source.is_empty() {
-                line.push_str(&format!(" (from {})", m.source));
-            }
-            line
-        })
+        .map(render_one)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_one(m: &Memory) -> String {
+    let pin = if m.pinned { " 📌" } else { "" };
+    let mut line = format!(
+        "[{}/{}/{}{}] {}: {}",
+        m.kind.as_str(),
+        m.status.as_str(),
+        m.scope.type_str(),
+        pin,
+        m.id,
+        m.content
+    );
+    if !m.source.is_empty() {
+        line.push_str(&format!(" (from {})", m.source));
+    }
+    line
+}
+
+fn render_scored(hits: &[ScoredMemory]) -> String {
+    if hits.is_empty() {
+        return "(no matches)".to_string();
+    }
+    hits.iter()
+        .map(|h| render_one(&h.memory))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -171,7 +293,7 @@ mod tests {
             .unwrap();
         assert!(list.contains("蓝色"));
         assert!(list.contains("Rust"));
-        assert!(list.contains("[project]"));
+        assert!(list.contains("[project/"));
 
         let hit = tool
             .execute(json!({ "action": "search", "query": "rust" }).to_string())
@@ -179,5 +301,53 @@ mod tests {
             .unwrap();
         assert!(hit.contains("Rust"));
         assert!(!hit.contains("蓝色"));
+    }
+
+    #[tokio::test]
+    async fn promote_then_pin_via_update() {
+        let tool = temp_tool("shion_mem_tool_promote");
+        // A candidate (simulating a reviewer extraction).
+        let mut cand = Memory::new(MemoryKind::Preference, "prefers concise answers");
+        cand.status = MemoryStatus::Candidate;
+        cand.confidence = MemoryConfidence::Extracted;
+        tool.memories.save(&cand).await.unwrap();
+
+        tool.execute(json!({ "action": "promote", "id": cand.id }).to_string())
+            .await
+            .unwrap();
+        let after = tool.memories.get(&cand.id).await.unwrap().unwrap();
+        assert_eq!(after.status, MemoryStatus::Active);
+        assert_eq!(after.confidence, MemoryConfidence::Confirmed);
+
+        tool.execute(json!({ "action": "update", "id": cand.id, "pinned": true }).to_string())
+            .await
+            .unwrap();
+        let pinned = tool.memories.get(&cand.id).await.unwrap().unwrap();
+        assert!(pinned.pinned);
+    }
+
+    #[tokio::test]
+    async fn reject_and_archive_set_status() {
+        let tool = temp_tool("shion_mem_tool_reject");
+        let m = Memory::new(MemoryKind::Fact, "ephemeral");
+        tool.memories.save(&m).await.unwrap();
+
+        tool.execute(json!({ "action": "reject", "id": m.id }).to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.memories.get(&m.id).await.unwrap().unwrap().status,
+            MemoryStatus::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn update_unknown_id_errors() {
+        let tool = temp_tool("shion_mem_tool_unknown");
+        let err = tool
+            .execute(json!({ "action": "promote", "id": "nope" }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no memory with id"));
     }
 }

@@ -7,6 +7,7 @@ use crate::{
     domain::{
         reminder::ReminderRepository,
         repository::SessionRepository,
+        run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
     infra::{db::Db, kanban::KanbanDb},
@@ -77,6 +78,86 @@ pub async fn task_list(kanban_url: &str) -> anyhow::Result<()> {
                 line.push_str(&format!("  due {}", local_time(due)));
             }
             println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Truncate a string to `n` chars for a single-line summary, collapsing newlines.
+fn oneline(s: &str, n: usize) -> String {
+    let flat = s.replace('\n', " ");
+    if flat.chars().count() <= n {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(n).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// List recent runs (most recent first), one per line: id, status, time, plan,
+/// and a snippet of the input. The run ledger (roadmap §7).
+pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let runs = RunRepository::list(&db, limit).await?;
+
+    if runs.is_empty() {
+        println!("No runs recorded.");
+        return Ok(());
+    }
+    for r in runs {
+        println!(
+            "{}  [{}]  {}  {}  {}",
+            r.id,
+            r.status.as_str(),
+            local_time(r.started_at),
+            if r.plan.is_empty() { "-" } else { &r.plan },
+            oneline(&r.input, 60),
+        );
+    }
+    Ok(())
+}
+
+/// Show one run in full: its input, plan, outcome, and every tool step in order.
+pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let Some(run) = RunRepository::get(&db, id).await? else {
+        println!("No run with id `{id}`.");
+        return Ok(());
+    };
+
+    println!("run     {}", run.id);
+    println!("session {}", run.session_id);
+    println!("status  {}", run.status.as_str());
+    println!("started {}", local_time(run.started_at));
+    if let Some(ended) = run.ended_at {
+        println!("ended   {}", local_time(ended));
+    }
+    if !run.plan.is_empty() {
+        println!("plan    {}", run.plan);
+    }
+    println!("input   {}", oneline(&run.input, 200));
+    if !run.error.is_empty() {
+        println!("error   {}", run.error);
+    }
+    if !run.final_output.is_empty() {
+        println!("output  {}", oneline(&run.final_output, 200));
+    }
+
+    let steps = RunRepository::steps(&db, &run.id).await?;
+    if steps.is_empty() {
+        println!("\n(no tool steps)");
+        return Ok(());
+    }
+    println!("\nsteps:");
+    for s in steps {
+        let mark = if s.ok { "ok " } else { "ERR" };
+        println!("  #{}  {}  {}", s.seq, mark, s.tool_name);
+        println!("      args   {}", oneline(&s.args, 120));
+        if s.ok {
+            println!("      result {}", oneline(&s.result, 120));
+        } else {
+            println!("      error  {}", oneline(&s.error, 120));
         }
     }
     Ok(())

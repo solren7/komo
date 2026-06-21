@@ -72,6 +72,23 @@ impl Tool for FileTool {
         })
     }
 
+    /// Drop the write `content` body before it reaches the run ledger — the file
+    /// being written can be arbitrarily large and may contain secrets. Keep the
+    /// action, path, and a byte count so the step still reads sensibly.
+    fn redact_args(&self, args: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(args) {
+            Ok(mut v) => {
+                if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+                    let len = content.len();
+                    v["content"] = serde_json::json!(format!("<{len} bytes redacted>"));
+                }
+                v.to_string()
+            }
+            // Unparseable args: keep nothing rather than risk leaking a body.
+            Err(_) => "<file args redacted>".to_string(),
+        }
+    }
+
     async fn execute(&self, input: String) -> anyhow::Result<String> {
         let args: FileArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid file arguments: {e}"))?;
@@ -170,6 +187,16 @@ mod tests {
         let tool = tool_rooted_at(dir);
         let args = json!({ "action": "write", "path": path });
         assert!(tool.execute(args.to_string()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn redact_args_drops_write_content_body() {
+        let tool = tool_rooted_at(std::env::temp_dir());
+        let args = json!({ "action": "write", "path": "/x/y.txt", "content": "secret-body" });
+        let redacted = tool.redact_args(&args.to_string());
+        assert!(!redacted.contains("secret-body"));
+        assert!(redacted.contains("redacted"));
+        assert!(redacted.contains("/x/y.txt")); // path preserved
     }
 
     #[tokio::test]

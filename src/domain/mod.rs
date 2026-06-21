@@ -1,5 +1,4 @@
 pub mod approval;
-pub mod error;
 pub mod gateway;
 pub mod home;
 pub mod llm;
@@ -7,10 +6,10 @@ pub mod memory;
 pub mod message;
 pub mod notify;
 pub mod pairing;
-pub mod planner;
 pub mod reminder;
 pub mod repository;
 pub mod reviewer;
+pub mod run;
 pub mod session;
 pub mod skill;
 pub mod task;

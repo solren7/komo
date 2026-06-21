@@ -1,0 +1,27 @@
+# shion gateway on TrueNAS SCALE (or any Docker host).
+#
+# Usage in TrueNAS: Apps → Custom App → "Install via YAML" and paste this,
+# or `docker compose up -d` from a shell. The image is pulled from your
+# registry (see docs/truenas-docker.md for build + push).
+#
+# No `ports:` — the gateway only makes outbound connections, so nothing needs
+# to be published or port-forwarded.
+services:
+  shion:
+    image: ghcr.io/solren7/shion:latest
+    container_name: shion
+    restart: unless-stopped
+    environment:
+      # Reminders, task-due notices, and the daily briefing fire on local time.
+      TZ: Asia/Shanghai
+      # SHION_HOME defaults to /data in the image. Put config.toml + .env on the
+      # mounted dataset below. Alternatively inject secrets here (these win over
+      # /data/.env — dotenvy never overwrites an already-set var), e.g.:
+      # DEEPSEEK_API_KEY: "sk-..."
+      # TELEGRAM_BOT_TOKEN: "..."
+      # HASS_TOKEN: "..."
+      # HASS_URL: "http://192.168.1.100:8123"
+    volumes:
+      # Replace <pool> with your TrueNAS pool/dataset path. This holds
+      # config.toml, .env, the three SQLite dbs, and logs/.
+      - /mnt/<pool>/apps/shion:/data

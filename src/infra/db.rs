@@ -13,6 +13,7 @@ use crate::domain::{
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
+    run::{Run, RunRepository, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
@@ -111,6 +112,44 @@ struct SettingRecord {
     value: String,
 }
 
+/// One agent turn in the run ledger (`domain/run.rs`, roadmap §7). `ended_at`
+/// uses 0 as the "still running" sentinel (same convention as other optional
+/// i64s here).
+#[derive(Debug, toasty::Model)]
+struct RunRecord {
+    #[key]
+    id: String,
+    session_id: String,
+    input: String,
+    plan: String,
+    status: String, // "running" | "done" | "failed"
+    final_output: String,
+    error: String,
+    started_at: i64,
+    ended_at: i64,
+}
+
+/// One tool invocation within a run. `run_id` indexes back to [`RunRecord`];
+/// `seq` orders steps within a run.
+#[derive(Debug, toasty::Model)]
+struct RunStepRecord {
+    #[key]
+    #[auto]
+    id: u64,
+
+    #[index]
+    run_id: String,
+
+    seq: i64,
+    tool_name: String,
+    args: String,
+    result: String,
+    error: String,
+    ok: bool,
+    started_at: i64,
+    ended_at: i64,
+}
+
 /// Setting key for the runtime home channel (`/sethome`).
 const HOME_SETTING_KEY: &str = "home_chat";
 
@@ -136,7 +175,9 @@ impl Db {
                 SessionTodoRecord,
                 PairingRecord,
                 LockoutRecord,
-                SettingRecord
+                SettingRecord,
+                RunRecord,
+                RunStepRecord
             ))
             .connect(url)
             .await?;
@@ -599,7 +640,123 @@ impl HomeRepository for Db {
     }
 }
 
+// ── RunRepository ─────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl RunRepository for Db {
+    async fn start(&self, run: &Run) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        toasty::create!(RunRecord {
+            id: run.id.clone(),
+            session_id: run.session_id.clone(),
+            input: run.input.clone(),
+            plan: run.plan.clone(),
+            status: run.status.as_str().to_string(),
+            final_output: run.final_output.clone(),
+            error: run.error.clone(),
+            started_at: run.started_at,
+            ended_at: run.ended_at.unwrap_or(0),
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn append_step(&self, step: &RunStep) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        toasty::create!(RunStepRecord {
+            run_id: step.run_id.clone(),
+            seq: step.seq,
+            tool_name: step.tool_name.clone(),
+            args: step.args.clone(),
+            result: step.result.clone(),
+            error: step.error.clone(),
+            ok: step.ok,
+            started_at: step.started_at,
+            ended_at: step.ended_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn finish(&self, run: &Run) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        let mut record = RunRecord::get_by_id(&mut *db, &run.id).await?;
+        record
+            .update()
+            .plan(run.plan.clone())
+            .status(run.status.as_str().to_string())
+            .final_output(run.final_output.clone())
+            .error(run.error.clone())
+            .ended_at(run.ended_at.unwrap_or(0))
+            .exec(&mut *db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
+        let mut db = self.inner.lock().await;
+        let rows = toasty::query!(RunRecord).exec(&mut *db).await?;
+        let mut runs: Vec<Run> = rows
+            .into_iter()
+            .map(run_from_record)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at)); // most recent first
+        runs.truncate(limit);
+        Ok(runs)
+    }
+
+    async fn get(&self, id: &str) -> anyhow::Result<Option<Run>> {
+        let mut db = self.inner.lock().await;
+        match RunRecord::get_by_id(&mut *db, id).await {
+            Ok(record) => Ok(Some(run_from_record(record)?)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn steps(&self, run_id: &str) -> anyhow::Result<Vec<RunStep>> {
+        let mut db = self.inner.lock().await;
+        let rows = toasty::query!(RunStepRecord).exec(&mut *db).await?;
+        let mut steps: Vec<RunStep> = rows
+            .into_iter()
+            .filter(|r| r.run_id == run_id)
+            .map(step_from_record)
+            .collect();
+        steps.sort_by_key(|s| s.seq);
+        Ok(steps)
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
+    Ok(Run {
+        id: record.id,
+        session_id: record.session_id,
+        input: record.input,
+        plan: record.plan,
+        status: parse_run_status(&record.status)?,
+        final_output: record.final_output,
+        error: record.error,
+        started_at: record.started_at,
+        ended_at: (record.ended_at != 0).then_some(record.ended_at),
+    })
+}
+
+fn step_from_record(record: RunStepRecord) -> RunStep {
+    RunStep {
+        run_id: record.run_id,
+        seq: record.seq,
+        tool_name: record.tool_name,
+        args: record.args,
+        result: record.result,
+        error: record.error,
+        ok: record.ok,
+        started_at: record.started_at,
+        ended_at: record.ended_at,
+    }
+}
 
 fn parse_role(s: &str) -> Role {
     match s {
@@ -675,6 +832,61 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&path);
         format!("sqlite:{}", path.display())
+    }
+
+    #[tokio::test]
+    async fn run_ledger_roundtrips_with_ordered_steps() {
+        use crate::domain::run::{Run, RunStatus, RunStep};
+        let db = Db::connect(&sqlite_url("shion_run_repo_test.db"))
+            .await
+            .unwrap();
+
+        let mut run = Run::start("cli:session-1", "do the thing");
+        RunRepository::start(&db, &run).await.unwrap();
+
+        // Append two steps out of seq order; `steps` must return them sorted.
+        let step = |seq: i64, tool: &str, ok: bool| RunStep {
+            run_id: run.id.clone(),
+            seq,
+            tool_name: tool.to_string(),
+            args: format!("{{\"a\":{seq}}}"),
+            result: if ok { "ok".into() } else { String::new() },
+            error: if ok { String::new() } else { "boom".into() },
+            ok,
+            started_at: 100 + seq,
+            ended_at: 101 + seq,
+        };
+        RunRepository::append_step(&db, &step(1, "time", true))
+            .await
+            .unwrap();
+        RunRepository::append_step(&db, &step(0, "shell", false))
+            .await
+            .unwrap();
+
+        run.plan = "multistep:2".into();
+        run.status = RunStatus::Done;
+        run.final_output = "all done".into();
+        run.ended_at = Some(999);
+        RunRepository::finish(&db, &run).await.unwrap();
+
+        let got = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
+        assert_eq!(got.status, RunStatus::Done);
+        assert_eq!(got.final_output, "all done");
+        assert_eq!(got.plan, "multistep:2");
+        assert_eq!(got.ended_at, Some(999));
+
+        let steps = RunRepository::steps(&db, &run.id).await.unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].seq, 0); // sorted by seq
+        assert_eq!(steps[0].tool_name, "shell");
+        assert!(!steps[0].ok);
+        assert_eq!(steps[0].error, "boom");
+        assert_eq!(steps[1].seq, 1);
+        assert!(steps[1].ok);
+
+        let recent = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, run.id);
     }
 
     #[tokio::test]

@@ -191,6 +191,17 @@ impl MemoryRepository for MemoryDb {
         memories.sort_by_key(|m| m.created_at);
         Ok(memories)
     }
+
+    /// Fetch by id directly — unlike the default (which scans `list`), this
+    /// sees expired and any-status rows, so governance can still operate on
+    /// them.
+    async fn get(&self, id: &str) -> anyhow::Result<Option<Memory>> {
+        let mut db = self.inner.lock().await;
+        Ok(MemoryRecord::get_by_id(&mut *db, id)
+            .await
+            .ok()
+            .map(memory_from_record))
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +289,60 @@ mod tests {
         let pinned = db.pinned(&ctx).await.unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].content, "concise answers");
+    }
+
+    #[tokio::test]
+    async fn recall_returns_in_scope_active_matches_only() {
+        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_recall.db"))
+            .await
+            .unwrap();
+
+        // Relevant, active, global → recalled.
+        db.save(&Memory::new(
+            MemoryKind::Project,
+            "the shion project is written in Rust",
+        ))
+        .await
+        .unwrap();
+        // Irrelevant → excluded by term overlap.
+        db.save(&Memory::new(MemoryKind::Fact, "the user likes coffee"))
+            .await
+            .unwrap();
+        // Relevant but a candidate → excluded by status.
+        let mut cand = Memory::new(MemoryKind::Fact, "rust toolchain pinned to nightly");
+        cand.status = MemoryStatus::Candidate;
+        db.save(&cand).await.unwrap();
+        // Relevant but scoped to another channel → excluded by scope.
+        let mut other = Memory::new(MemoryKind::Fact, "rust edition is 2021");
+        other.scope = MemoryScope::Channel {
+            platform: "feishu".into(),
+            chat_id: "oc_other".into(),
+        };
+        db.save(&other).await.unwrap();
+
+        let ctx = MemoryContext::from_session("cli");
+        let hits = db
+            .recall(&ctx, "what language is the rust project in", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].memory.content.contains("written in Rust"));
+    }
+
+    #[tokio::test]
+    async fn mark_used_sets_last_used_without_touching_updated_at() {
+        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_mark_used.db"))
+            .await
+            .unwrap();
+        let mut m = Memory::new(MemoryKind::Fact, "recalled at least once");
+        m.updated_at = 500;
+        db.save(&m).await.unwrap();
+
+        db.mark_used(&[m.id.clone()], 9_000).await.unwrap();
+
+        let after = db.get(&m.id).await.unwrap().unwrap();
+        assert_eq!(after.last_used_at, Some(9_000));
+        assert_eq!(after.updated_at, 500, "recall must not bump updated_at");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, inspect, model, pair, service};
+use super::{chat, gateway, inspect, memory, model, pair, service};
 
 #[derive(Parser)]
 #[command(name = "shion", version, about = "Personal agent framework")]
@@ -35,6 +35,16 @@ enum Commands {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// Inspect the run ledger (every agent turn and its tool steps)
+    Run {
+        #[command(subcommand)]
+        action: RunAction,
+    },
+    /// Inspect and govern the long-term memory library
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
     },
     /// Manage channel pairing: unknown senders must be approved from this
     /// host before the agent talks to them
@@ -74,6 +84,51 @@ enum CronAction {
 enum TaskAction {
     /// List open tasks (inbox / todo / waiting), grouped by status
     List,
+}
+
+#[derive(Subcommand)]
+enum RunAction {
+    /// List recent runs (most recent first)
+    List {
+        /// Maximum number of runs to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show one run in full, including every tool step
+    Inspect {
+        /// Run id (as shown by `run list`)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// List stored memories (optionally filter by status), grouped by status
+    List {
+        /// Only show this status: candidate | active | archived | rejected
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Substring search across all memories
+    Search {
+        /// Text to match in memory content
+        query: String,
+    },
+    /// Promote a candidate to an active, confirmed memory
+    Promote {
+        /// Memory id (as shown by `memory list`)
+        id: String,
+    },
+    /// Reject a candidate so it never surfaces
+    Reject {
+        /// Memory id
+        id: String,
+    },
+    /// Pin a memory into the L1 per-turn profile (the manual, explicit path)
+    Pin {
+        /// Memory id
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,6 +199,20 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Task { action } => match action {
             TaskAction::List => inspect::task_list(&kanban).await,
         },
+        Commands::Run { action } => match action {
+            RunAction::List { limit } => inspect::run_list(&db, limit).await,
+            RunAction::Inspect { id } => inspect::run_inspect(&db, &id).await,
+        },
+        Commands::Memory { action } => {
+            let url = crate::config::default_memory_db_url();
+            match action {
+                MemoryAction::List { status } => memory::list(&url, status).await,
+                MemoryAction::Search { query } => memory::search(&url, &query).await,
+                MemoryAction::Promote { id } => memory::promote(&url, &id).await,
+                MemoryAction::Reject { id } => memory::reject(&url, &id).await,
+                MemoryAction::Pin { id } => memory::pin(&url, &id).await,
+            }
+        }
         Commands::Pair { action } => match action {
             PairAction::List => pair::list(&db).await,
             PairAction::Approve { code } => pair::approve(&db, &code).await,

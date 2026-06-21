@@ -9,8 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     agent::{
-        planner::KeywordPlanner, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
-        system_prompt::SystemPromptBuilder,
+        reviewer::ReflectiveReviewer, runtime::AgentRuntime, system_prompt::SystemPromptBuilder,
     },
     config::ModelConfig,
     domain::{
@@ -29,9 +28,10 @@ use crate::{
     },
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
-        delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
-        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
-        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
+        delegate::DelegateTool, file::FileTool, homeassistant::HomeAssistantTool,
+        memory::MemoryTool, reminder::ReminderTool, session::SessionTool, shell::ShellTool,
+        skill::SkillTool, task::TaskTool, time::TimeTool, todo::TodoTool, web_fetch::WebFetchTool,
+        web_search::WebSearchTool,
     },
 };
 
@@ -55,6 +55,10 @@ pub async fn build(
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
     let model_config = ModelConfig::from_env()?;
+    // Install the process-wide tool-result byte cap (the global backstop in
+    // `execute_isolated`). Resolved like every other setting; first call wins,
+    // which is fine — chat and gateway each build once.
+    crate::services::tool_registry::set_tool_result_cap(model_config.max_tool_result_bytes);
     // File operations are confined to the current working directory.
     let workspace = Arc::new(Workspace::current_dir()?);
 
@@ -71,6 +75,16 @@ pub async fn build(
     tools.register(Arc::new(ReminderTool::new(db.clone())));
     tools.register(Arc::new(TaskTool::new(kanban.clone())));
     tools.register(Arc::new(TodoTool::new(db.clone())));
+
+    // Home Assistant tool, only when configured (HASS_TOKEN set; HASS_URL
+    // optional, defaults to homeassistant.local:8123).
+    if let Some(ha) = crate::config::homeassistant_config() {
+        tools.register(Arc::new(HomeAssistantTool::new(
+            ha.base_url,
+            ha.token,
+            approver.clone(),
+        )));
+    }
 
     // Memories live in their own SQLite file (~/.shion/memory.db), shared by the
     // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
@@ -163,11 +177,10 @@ pub async fn build(
     ));
 
     let runtime = AgentRuntime {
-        planner: Box::new(KeywordPlanner),
         llm,
-        tools,
         sessions: db.clone(),
         messages: db.clone(),
+        runs: db.clone(),
         reviewer: Some(reviewer.clone()),
         review_interval: env.review_interval.filter(|v| *v > 0).unwrap_or(10),
     };

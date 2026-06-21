@@ -94,6 +94,7 @@ pub struct ShionEnv {
     pub schedule: Option<String>,
     pub briefing_schedule: Option<String>,
     pub max_turns: Option<usize>,
+    pub max_tool_result_bytes: Option<usize>,
     pub review_interval: Option<usize>,
     pub skills_path: Option<String>,
 }
@@ -241,6 +242,10 @@ pub struct FileConfig {
     pub briefing_schedule: Option<String>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
+    /// Byte cap on a tool result handed back to the LLM, a global backstop
+    /// against context-window bloat (default: 16384). See
+    /// `services::tool_registry::cap_tool_result`.
+    pub max_tool_result_bytes: Option<usize>,
     /// Ingress channel declarations (`[channels.*]` tables), shaped after
     /// hermes-agent's per-platform config blocks.
     pub channels: Option<ChannelsFileConfig>,
@@ -252,6 +257,66 @@ pub struct FileConfig {
 pub struct ChannelsFileConfig {
     pub feishu: Option<FeishuFileConfig>,
     pub telegram: Option<TelegramFileConfig>,
+    pub homeassistant: Option<HomeAssistantChannelFileConfig>,
+}
+
+/// `[channels.homeassistant]` table: HA as an event-ingress channel. The URL
+/// and token are *not* here — they come from `HASS_URL` / `HASS_TOKEN` (shared
+/// with the `homeassistant` tool). This table only carries event-filter
+/// behavior. Event forwarding is closed by default: with no `watch_*` set and
+/// `watch_all = false`, every event is dropped.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct HomeAssistantChannelFileConfig {
+    pub enabled: bool,
+    /// Forward state changes for entities in these domains (e.g. "binary_sensor").
+    pub watch_domains: Vec<String>,
+    /// Forward state changes for these specific entity ids.
+    pub watch_entities: Vec<String>,
+    /// Never forward these entity ids (takes precedence over watch_*).
+    pub ignore_entities: Vec<String>,
+    /// Forward *every* entity's state change (ignore the watch lists).
+    pub watch_all: bool,
+    /// Per-entity minimum seconds between forwarded events (default 30).
+    pub cooldown_seconds: Option<u64>,
+}
+
+/// Resolved Home Assistant channel settings (behavior + shared credentials).
+pub struct HomeAssistantChannelConfig {
+    pub base_url: String,
+    pub token: String,
+    pub watch_domains: Vec<String>,
+    pub watch_entities: Vec<String>,
+    pub ignore_entities: Vec<String>,
+    pub watch_all: bool,
+    pub cooldown_seconds: u64,
+}
+
+/// Resolve the Home Assistant ingress channel. `None` = not enabled; an error =
+/// enabled but `HASS_TOKEN` is missing (fail fast at startup, like the other
+/// channels).
+pub fn homeassistant_channel_config() -> anyhow::Result<Option<HomeAssistantChannelConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(ha) = file.channels.and_then(|c| c.homeassistant) else {
+        return Ok(None);
+    };
+    if !ha.enabled {
+        return Ok(None);
+    }
+    let creds = homeassistant_config().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[channels.homeassistant] is enabled but HASS_TOKEN is not set (put it in ~/.shion/.env)"
+        )
+    })?;
+    Ok(Some(HomeAssistantChannelConfig {
+        base_url: creds.base_url,
+        token: creds.token,
+        watch_domains: ha.watch_domains,
+        watch_entities: ha.watch_entities,
+        ignore_entities: ha.ignore_entities,
+        watch_all: ha.watch_all,
+        cooldown_seconds: ha.cooldown_seconds.unwrap_or(30),
+    }))
 }
 
 /// `[channels.feishu]` table. App credentials never live here — they are
@@ -318,6 +383,42 @@ pub struct TelegramConfig {
     pub allowed_chats: Vec<String>,
     pub require_mention: bool,
     pub home_chat: Option<String>,
+}
+
+/// Default Home Assistant URL when `HASS_URL` is unset.
+const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
+
+/// `HASS_*` Home Assistant settings from the environment (`~/.shion/.env`).
+/// Unlike the other backends, HA keeps both its URL and its token in `.env` as
+/// one self-contained block (`HASS_TOKEN` required, `HASS_URL` optional) rather
+/// than splitting the URL into config.toml.
+#[derive(Debug, Deserialize, Default)]
+struct HomeAssistantEnv {
+    token: Option<String>,
+    url: Option<String>,
+}
+
+/// Resolved Home Assistant settings.
+pub struct HomeAssistantConfig {
+    pub base_url: String,
+    pub token: String,
+}
+
+/// Resolve the Home Assistant tool config from the environment: `HASS_TOKEN`
+/// (required) and `HASS_URL` (optional, defaults to homeassistant.local:8123).
+/// `None` means no token is set, so the `homeassistant` tool is not registered.
+pub fn homeassistant_config() -> Option<HomeAssistantConfig> {
+    let env: HomeAssistantEnv = envy::prefixed("HASS_").from_env().unwrap_or_default();
+    let token = env.token.filter(|s| !s.is_empty())?;
+    let base_url = env
+        .url
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_HASS_URL.to_string());
+    Some(HomeAssistantConfig {
+        // Trim a trailing slash so `{base_url}/api/...` never doubles up.
+        base_url: base_url.trim_end_matches('/').to_string(),
+        token,
+    })
 }
 
 /// Resolve the Telegram channel config. `None` means the channel is not
@@ -456,11 +557,19 @@ pub struct ModelConfig {
     pub aux_model: Option<String>,
     /// Maximum tool-calling round-trips per user turn.
     pub max_turns: usize,
+    /// Byte cap on a tool result handed back to the LLM (global backstop).
+    pub max_tool_result_bytes: usize,
 }
 
 /// Built-in default for `max_turns` when neither `SHION_MAX_TURNS` nor
 /// config.toml sets one. Multi-file edits easily take 10+ round-trips.
 pub const DEFAULT_MAX_TURNS: usize = 30;
+
+/// Built-in default byte cap on a tool result handed back to the LLM, when
+/// neither `SHION_MAX_TOOL_RESULT_BYTES` nor config.toml sets one. Sized above
+/// the per-tool self-caps (web_fetch / homeassistant trim to 8 KB) so it only
+/// catches tools that don't self-trim.
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
 impl fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -471,6 +580,7 @@ impl fmt::Debug for ModelConfig {
             .field("base_url", &self.base_url)
             .field("aux_model", &self.aux_model)
             .field("max_turns", &self.max_turns)
+            .field("max_tool_result_bytes", &self.max_tool_result_bytes)
             .finish()
     }
 }
@@ -524,6 +634,10 @@ impl ModelConfig {
                 .max_turns
                 .or(file.max_turns)
                 .unwrap_or(DEFAULT_MAX_TURNS),
+            max_tool_result_bytes: env
+                .max_tool_result_bytes
+                .or(file.max_tool_result_bytes)
+                .unwrap_or(DEFAULT_MAX_TOOL_RESULT_BYTES),
         })
     }
 
@@ -541,6 +655,7 @@ impl ModelConfig {
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
             max_turns: self.max_turns,
+            max_tool_result_bytes: self.max_tool_result_bytes,
         }
     }
 }
@@ -706,6 +821,7 @@ mod tests {
             base_url: None,
             aux_model: None,
             max_turns: DEFAULT_MAX_TURNS,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
         };
         let s = format!("{cfg:?}");
         assert!(

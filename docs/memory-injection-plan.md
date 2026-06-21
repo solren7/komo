@@ -409,31 +409,33 @@ rerank = semantic_score + lexical_score + scope/confidence/importance/recency
 
 ## 实施顺序
 
-### Phase 0：模型与存储重构
+### Phase 0：模型与存储重构 ✅（已落地）
 
-- 新增 `infra/memory_db.rs`，连接 `~/.shion/memory.db`。
-- 扩展 `domain/memory.rs`：`status/confidence/scope/importance/pinned/updated_at/last_used_at/source_message_id`。
-- 兼容旧 markdown：提供一次性 import 或启动时迁移命令。
-- 保留 `MdMemoryStore` 作为 import/export 适配层，而不是长期 canonical storage。
+- ✅ 新增 `infra/memory_db.rs`：`MemoryDb` 连接独立 `~/.shion/memory.db`（toasty，schema-first 一次加满）。
+- ✅ 扩展 `domain/memory.rs`：`status/confidence/scope/importance/pinned/updated_at/last_used_at/source_message_id` + 4 个枚举 + `MemoryContext`（从 session id 推导 allowed_scopes，chat 不带 project）。trait 精简为 `save`/`list` 必需 + `pinned` 默认实现。
+- ✅ 兼容旧 markdown：`MemoryDb::import_legacy_markdown` 一次性导入（仅 seed 空库，可重复安全调用，wiring 启动时跑）。
+- ✅ `MdMemoryStore` 降级为 import/export + 迁移源（`read_all`）；旧文件按规则迁移（`source` 非空→`candidate/extracted`，手写→`active/confirmed`；`user`→`Profile`；`expiry`→`expires_at`）。
 
-### Phase 1：L1 Pinned Profile
+### Phase 1：L1 Pinned Profile ✅（已落地）
 
-- 实现 `MemoryRepository::pinned(ctx)`。
-- 实现 `render_pinned_memory_block(&[Memory]) -> Option<String>`。
-- 主 agent `build_llm` 传 `Some(memory_repo.clone())`，aux 传 `None`。
-- 每轮只注入 pinned profile，不注入全量记忆。
+- ✅ `MemoryRepository::pinned(ctx)`（默认实现：`list()` 过滤 `is_pinnable` + 按 importance/recency 排序；`MemoryDb` 继承）。
+- ✅ `render_pinned_memory_block(&[Memory]) -> Option<String>`（`PINNED_MEMORY_BUDGET=800`、整条进出、untrusted caveat、`<!-- shion:memory:pinned -->` 标记）。
+- ✅ 注入在 `complete()` 内、`volatile` 之后；失败 `warn!` 不致命。主 agent `build_llm` 传 `Some(memory_repo)`，aux 传 `None`。
+- ⚠️ 现状：迁移后的自动记忆默认 `candidate` 且非 `pinned`，所以 L1 注入初期为空——pinned 需用户在 Phase 2 显式确认后才会有内容。注入链路已通。
 
-### Phase 2：L2 Memory Tool
+### Phase 2：L2 Memory Tool ✅（已落地）
 
-- 扩展 `memory` tool：`list/search/save/update/archive/promote/reject`。
-- reviewer 写入 `candidate + extracted`，不直接写 high-confidence active memory。
-- CLI 可加 `shion memory list/search/promote/reject`，方便治理。
+- ✅ 扩展 `memory` tool：`save/search/list/update/promote/reject/archive`（save 写 `user_written` + 当前 chat scope；update 可改 status/pinned/importance/kind/content）。
+- ✅ scope-aware `search`：`MemoryRepository::search(MemoryQuery)` 默认实现（scope/status/kind 过滤 + `rerank_score` 打分：lexical + importance + confidence + recency 衰减，无 embedding）。工具按当前会话 `MemoryContext` 限定 allowed_scopes。
+- ✅ reviewer dedup：`find_by_source_message_id`（trait 默认实现）+ reviewer 提取前查重，同会话同事实跨 sweep 不重复。
+- ✅ CLI `shion memory list/search/promote/reject/pin`（operator 视角，跨全部 scope；`pin` 是 pinned 的手动显式路径，解决待拍板）。
 
-### Phase 3：L3 Active Recall
+### Phase 3：L3 Active Recall ✅（已落地）
 
-- `complete()` 内执行规则 recall：`LIKE` 粗筛 + Rust rerank + top-K。
-- 实现 `render_recalled_memory_block(&[ScoredMemory]) -> Option<String>`。
-- 记录 `last_used_at` 或 recall events，为后续“哪些记忆真的有用”提供数据。
+- ✅ `complete()` 内执行规则 recall：取当前 user message 作 query，`MemoryRepository::recall(ctx, text, limit)`（默认实现）token-overlap 粗筛 + Rust rerank + top-K（`RECALL_LIMIT=5`），scope/status 过滤在 repository 层。注入在 pinned 之后，固定 `volatile | pinned | recall` 顺序；和 pinned 同样的 `warn!`-不致命契约。pinned 命中的记忆从 recall 里去重，不重复注入。
+- ✅ recall 匹配独立于 L2 `search`：`search` 用整串 `LIKE` 子串匹配（工具传聚焦关键词），recall 用 `recall_terms` 分词后做 token 交集打分（`recall_score`）——ASCII 词 + CJK 字符 bigram + 停用词过滤，因为 recall 的 query 是整句用户消息，子串匹配不适用。
+- ✅ `render_recalled_memory_block(&[ScoredMemory]) -> Option<String>`（`RECALLED_MEMORY_BUDGET=2_000`、整条进出、untrusted caveat、`<!-- shion:memory:recall -->` 标记、每行带 `source:` 标签）。
+- ✅ 记录 `last_used_at`：`MemoryRepository::mark_used`（默认实现，只改 `last_used_at`、不动 `updated_at`，避免污染 recency 衰减），在 `complete()` 里 `tokio::spawn` 离开回复路径、best-effort、失败 `warn!`。为 Phase 4 usage-based promote/archive 提供数据。
 
 ### Phase 4：Recall 质量升级
 
@@ -500,8 +502,9 @@ rerank = semantic_score + lexical_score + scope/confidence/importance/recency
 - **Scope 推导**：`Project` 只在 CLI 会话（按 cwd）出现，chat 会话只带 `global + channel + session`，绝不从聊天内容推断 project。
 - **注入顺序 `volatile | pinned | recall`**：pinned 先于 recall（缓存 + 语义）。
 - memory 注入必须明确是 untrusted background facts。
+- ✅（已实现）旧 markdown 迁移：reviewer 来源（`source != ""`）→ `candidate + extracted`，手写文件 → `active + confirmed`，安全优先。
 
 **待拍板**：
 
-- 旧 markdown 迁移时 reviewer 写入的 `source != ""` 记忆默认 `candidate` 还是 `active + extracted`。倾向 `candidate`，安全优先。
-- `Pinned` 是否只允许用户手动设置，还是允许 confirmed feedback 自动进入。倾向手动或显式确认。
+- ✅（已定）`Pinned` 只走手动显式路径：`shion memory pin <id>` 或 `memory` tool `update pinned=true`；自动提取永不 pin。
+- ✅（已定，Phase 3 已实现）L3 recall 同时记录 `last_used_at`：每轮把注入的 recall 命中标记 used（只改 `last_used_at`，不动 `updated_at`），作为后续 usage-based promote/archive 的数据源。recall 计数等更细信号留到 Phase 4。

@@ -66,6 +66,17 @@ impl Reviewer for ReflectiveReviewer {
                 .as_deref()
                 .map(parse_memory_kind)
                 .unwrap_or(MemoryKind::Fact);
+            // Content-derived dedup key: skip if this session already produced
+            // the same fact on an earlier sweep (mirrors commitment dedup).
+            let key = memory_key(&suggestion.content);
+            if self
+                .memories
+                .find_by_source_message_id(&session.id, &key)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
             let mut memory = Memory::new(kind, suggestion.content);
             // Automated extraction is a low-trust suggestion: it lands as a
             // Candidate the user confirms or discards (same governance as task
@@ -76,8 +87,7 @@ impl Reviewer for ReflectiveReviewer {
             memory.scope = ctx.write_scope();
             // Tag the origin so a later answer can trace why shion believes this.
             memory.source = session.id.clone();
-            // Content-derived dedup key, so future dedup can recognize a re-extraction.
-            memory.source_message_id = memory_key(&memory.content);
+            memory.source_message_id = key;
             self.memories.save(&memory).await?;
             outcome.memories_written.push(memory.id);
         }
@@ -481,6 +491,25 @@ mod tests {
             }
         );
         assert!(!rows[0].source_message_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dedups_extracted_memory_across_repeated_reviews() {
+        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let memories = Arc::new(FakeMemories::default());
+        let reviewer = ReflectiveReviewer::new(
+            Arc::new(FixedLlm(reply.to_string())),
+            memories.clone(),
+            Arc::new(FakeSkills::default()),
+            Arc::new(FakeTasks::default()),
+        );
+        let s = session("telegram:42");
+
+        reviewer.review(&s).await.unwrap();
+        reviewer.review(&s).await.unwrap();
+
+        // Same session + same fact → no duplicate on the second sweep.
+        assert_eq!(memories.0.lock().unwrap().len(), 1);
     }
 
     #[test]

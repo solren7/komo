@@ -18,15 +18,41 @@ shion gateway start                # install + start under launchd (auto-restart
 shion gateway stop                 # stop and remove from launchd
 shion gateway restart              # regenerate plist + restart (picks up a reinstalled binary)
 shion gateway status               # launchd state (state/pid/last exit code)
+
+shion memory list [--status S]     # list/triage memories (candidate/active/archived/rejected)
+shion memory search <query>        # substring search across all memories
+shion memory promote <id>          # candidate → active+confirmed
+shion memory reject <id>           # candidate → rejected
+shion memory pin <id>              # pin into the L1 per-turn profile (manual-only path)
+
+shion run list [--limit N]         # recent runs (one per turn), newest first
+shion run inspect <id>             # one run in full: input, plan, outcome, every tool step
 ```
 
+Logs: a `tracing` subscriber is installed in `main.rs` (`init_tracing`) — without
+it every `info!`/`warn!`/`debug!` is a silent no-op. Output goes to stderr
+(launchd captures the gateway's via the plist's `StandardErrorPath` →
+`~/.shion/logs/gateway.err.log`). Level is `SHION_LOG` (e.g. `SHION_LOG=debug`),
+defaulting to `info,toasty=warn,rig_core=warn` (shion's own logs at info; ORM
+schema chatter muted; and rig's `prompt_request` INFO events muted — they log
+every tool call's *full result* verbatim, a wall of text for any list-returning
+tool). Each turn runs inside a `run` span (`run_id`) and each tool call inside a
+`tool` span (`name`/`seq`) and is recorded by shion's own concise `tool ok`
+line (name/seq/elapsed, no result), so live logs still line up with the
+persisted run ledger. Set `SHION_LOG=debug` (or `rig_core=info`) to see the full
+tool results again.
+
 `~/.shion/shion.db` is disposable developer state (sessions, messages, session
-todos, skills, reminders, pairings, settings) — delete it freely to reset.
-Durable cross-session **tasks live in a separate file, `~/.shion/kanban.db`**
-(`infra/kanban.rs`), so resetting `shion.db` never wipes real task data.
-After a schema change, delete the affected file — `push_schema` only runs for
-newly created database files: a `TaskRecord` field change means deleting
-`kanban.db`, any other model means `shion.db`.
+todos, skills, reminders, pairings, settings, **run ledger**) — delete it freely
+to reset.
+Two kinds of **durable personal data live in their own files** so resetting
+`shion.db` never wipes them: cross-session **tasks in `~/.shion/kanban.db`**
+(`infra/kanban.rs`) and long-term **memories in `~/.shion/memory.db`**
+(`infra/memory_db.rs`). After a schema change, delete the affected file —
+`push_schema` only runs for newly created database files: a `TaskRecord` change
+means deleting `kanban.db`, a `MemoryRecord` change means `memory.db`, any other
+model means `shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run
+ledger lives in `shion.db`).
 
 Building requires `protoc` (`brew install protobuf`): the feishu channel's websocket
 frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.
@@ -34,9 +60,38 @@ frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at buil
 Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`,
 the opt-in daily `briefing_schedule`, the `[channels.*]` tables) live in
 `~/.shion/config.toml`; credentials (API keys,
-`FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`) only in
-`~/.shion/.env`. Priority: built-in defaults < config.toml < `SHION_*` env vars.
-`SHION_HOME` relocates the whole directory.
+`FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, `HASS_TOKEN`) only
+in `~/.shion/.env`. Priority: built-in defaults < config.toml < `SHION_*` env
+vars. `SHION_HOME` relocates the whole directory.
+
+Home Assistant keeps its URL and token in `.env` as a single self-contained
+block: `HASS_TOKEN` (required — a long-lived access token) and `HASS_URL`
+(optional, defaults to `http://homeassistant.local:8123`). These are shared by
+both HA surfaces. No token = neither the `homeassistant` tool nor the channel
+loads.
+
+```bash
+# ~/.shion/.env
+HASS_TOKEN=your-long-lived-access-token
+HASS_URL=http://192.168.1.100:8123   # optional; omit for homeassistant.local:8123
+```
+
+The `homeassistant` **tool** (agent controls HA) registers automatically once
+`HASS_TOKEN` is set — no config.toml needed. The HA **event channel** (HA
+pushes device events to the agent) is opt-in via `[channels.homeassistant]`,
+which carries only event-filter behavior (URL/token still come from `.env`).
+Forwarding is closed by default — set at least one of `watch_domains` /
+`watch_entities` / `watch_all`:
+
+```toml
+[channels.homeassistant]
+enabled = true
+watch_domains = ["binary_sensor", "lock", "alarm_control_panel"]
+watch_entities = ["cover.garage_door"]
+ignore_entities = ["binary_sensor.always_chatty"]
+watch_all = false            # forward every entity (overrides the watch lists)
+cooldown_seconds = 30        # per-entity min seconds between forwarded events
+```
 
 Env management: dotenvy loads `.env` files into the process env (`main.rs`); envy
 deserializes them into typed structs in `config.rs` (`ShionEnv` for `SHION_*`,
@@ -85,40 +140,50 @@ Personal Agent framework v0.1, implemented in Rust. The codebase follows a DDD-s
 
 **Request flow:**
 ```
-CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Response
+CLI/channel → AgentRuntime → LlmClient (rig agent loop) → RigTool → execute_isolated → tool
+                          ↘ MessageRepository · RunRepository (ledger) → Response
 ```
+The LLM owns tool dispatch: rig's function-calling loop (`agent.prompt().max_turns()`)
+decides and runs tool calls; `AgentRuntime` just persists messages, opens/closes the
+run-ledger entry, and returns the reply. There is no separate planner.
 
 **Layers and their responsibilities:**
 
 `domain/` — pure interfaces, no I/O, no external crates
 - `repository.rs` — `SessionRepository` (find/save) and `MessageRepository` (list_by_session/save); the two traits `AgentRuntime` depends on
-- `planner.rs` — `Planner` trait + `Plan` enum (`RespondDirectly`, `CallTool`, `MultiStep`)
-- `tool.rs` — `Tool` trait (name / description / execute)
+- `tool.rs` — `Tool` trait (name / description / execute / optional `redact_args`)
 - `message.rs`, `session.rs` — core value types
 
-`infra/db.rs` + `infra/kanban.rs` — the only places toasty (SQLite ORM) appears
-- `Db` (`infra/db.rs`) wraps `Arc<Mutex<toasty::Db>>` over `shion.db`; implements every repository trait *except* `TaskRepository` (sessions, messages, skills, reminders, session todos, pairings, settings)
+`infra/db.rs` + `infra/kanban.rs` + `infra/memory_db.rs` — the only places toasty (SQLite ORM) appears
+- `Db` (`infra/db.rs`) wraps `Arc<Mutex<toasty::Db>>` over `shion.db`; implements every repository trait *except* `TaskRepository`/`MemoryRepository` (sessions, messages, skills, reminders, session todos, pairings, settings, the **run ledger** `RunRepository`)
 - `KanbanDb` (`infra/kanban.rs`) is a second, independent connection over `kanban.db`; it holds only `TaskRecord` and implements `TaskRepository`. Separate file = durable tasks survive a `shion.db` reset
-- both: `connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent)
+- `MemoryDb` (`infra/memory_db.rs`) is a third, independent connection over `memory.db`; it holds only `MemoryRecord` and implements `MemoryRepository`. On first run it seeds itself from legacy `~/.shion/memory/*.md` via `import_legacy_markdown` (no-op once populated)
+- all: `connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent — no `IF NOT EXISTS`; toasty 0.7 has a migration engine internally but `Db` exposes no public "migrate" entry point, so adding a table to an existing file means deleting it to rebuild)
+- the `Arc<Mutex<toasty::Db>>` is required, not incidental: toasty's `exec` takes `&mut self` (no internal concurrency for statement exec), so every repository call serializes through this one lock. Concurrency would need per-op `Connection` checkout from toasty's pool — a larger refactor, not done
 - toasty model structs are private to their file
 - SQLite URL format: `sqlite:./path.db` (single colon, not `sqlite://`)
 
 `agent/runtime.rs` — application logic
-- `AgentRuntime` holds `Arc<dyn SessionRepository>` + `Arc<dyn MessageRepository>` — no knowledge of toasty
-- `handle_input` owns the session lifecycle: load-or-create, append messages, dispatch plan, persist reply
+- `AgentRuntime` holds `Arc<dyn LlmClient>` + `Arc<dyn SessionRepository>` + `Arc<dyn MessageRepository>` + `Arc<dyn RunRepository>` — no knowledge of toasty, and (since the planner was removed) no tool routing of its own
+- `handle_input` owns the session lifecycle: load-or-create, append the user message, call the LLM (which drives any tool calls via rig), persist the reply
+- `run_turn` wraps each turn in one ledger `Run` (open → set `RunContext` task-local + a `run` tracing span around `turn_body` → finalize with status/output/error). All ledger writes are best-effort (logged, never change the turn result). `Run.plan` is a post-hoc summary derived from the recorded step count ("respond" or "<n> tool call(s)")
 
-`agent/planner.rs` — `KeywordPlanner`
-- v0.1 rule-based: routes "time" / "now" / "时间" keywords to the `time` tool; everything else → `RespondDirectly` (answered by the LLM)
+`domain/llm.rs` — `LlmClient` trait (`complete(&Session) -> String`); the single seam `AgentRuntime` calls to produce a reply
 
-`domain/llm.rs` — `LlmClient` trait (`complete(&Session) -> String`); the abstraction `AgentRuntime` calls for `RespondDirectly`
+`infra/llm.rs` — `RigLlm<M>`: `LlmClient` backed by the `rig` framework (`rig-core`, aliased as `rig`)
+- `build_llm` constructs it for the configured provider (deepseek/openai/anthropic/openrouter), exposing the tool catalog via function calling; rig's agent loop (`agent.prompt().max_turns()`) owns multi-step tool dispatch
+- sends the full session history: prior turns go through `with_history`, the latest user message is the prompt; rebuilds the tiered system prompt per turn and injects L1 pinned + L3 recalled memories (main agent only)
 
-`infra/llm.rs` — `DeepSeekClient`: `LlmClient` backed by the `rig` framework (`rig-core`, aliased as `rig`) against DeepSeek
-- `from_env()` reads `DEEPSEEK_API_KEY`; model `deepseek-chat`
-- sends the full session history: prior turns go through `with_history`, the latest user message is the prompt
-
-`services/tool_registry.rs` — `HashMap<String, Box<dyn Tool>>` with `register` / `execute`
+`services/tool_registry.rs` — `ToolRegistry` is a `HashMap<String, Arc<dyn Tool>>` catalog (`register` / `tools`); the LLM owns dispatch, so there is no keyword-routed execute path
+- `execute_isolated` is the single choke point all tool calls funnel through (the LLM function-calling adapter `infra/rig_tool.rs::RigTool::call`). It runs each tool on its own panic-catching task, and — when a `RunContext` is in scope (`current_run`) — records the call as a `RunStep` (best-effort, args via `Tool::redact_args`) and wraps it in a `tool` tracing span. This is why the ledger sees **every** tool call
+- it also applies one global backstop on the LLM-facing result: `cap_tool_result` truncates any Ok result over the configured byte cap at a UTF-8 boundary and appends a "narrow your query" marker — applied *after* the ledger records the original, so the audit trail stays full while the model's context stays bounded. The cap is `max_tool_result_bytes` (`SHION_MAX_TOOL_RESULT_BYTES` env > config.toml > `DEFAULT_MAX_TOOL_RESULT_BYTES` = 16 KB), resolved at startup and installed via `set_tool_result_cap` (a `OnceLock`, since rig's `ToolDyn::call` signature can't take a parameter). Sized above the per-tool self-caps (`web_fetch`/`homeassistant` trim to 8 KB) so it only catches tools that don't self-trim; deterministic truncation, not LLM summarization. A tool that wants tighter or smarter trimming still does it itself
+- the `SessionContext` (`SESSION`) and `RunContext` (`RUN`) task-locals both ride here because rig's `ToolDyn::call` signature is fixed; `execute_isolated` re-establishes `SESSION` across its `spawn` and instruments the spawn with the tool span
 
 `tools/time.rs` — first built-in tool; returns RFC 3339 UTC timestamp
+
+`tools/homeassistant.rs` — `HomeAssistantTool`, the Home Assistant integration (reaches a smart-home instance over its REST API, 15s timeout). Four actions: `list_entities` (read; optional `domain` prefix + `area` filter), `get_state` (read one entity), and `list_services` (discover callable services per domain) are read-only; `call_service` (turn devices on/off, etc.) is side-effecting → gated through the shared `Approver` as `Risk::Normal` with a `homeassistant:{domain}.{service}` scope key (approve-for-session). Two safety floors *below* approval (HA has no service-level access control of its own): `domain`/`service`/`entity_id` are shape-validated (`valid_name` / `valid_entity_id`) to block path-traversal/SSRF in the request path, and a `BLOCKED_DOMAINS` list (`shell_command`, `command_line`, `python_script`, `pyscript`, `hassio`, `rest_command`) is refused outright — no approval unlocks it, like shell's hardline list. Registered only when `HASS_TOKEN` is set (`HASS_URL` optional, defaults to homeassistant.local:8123; resolved by `config::homeassistant_config`, wired in `cli/wiring.rs`)
+
+`infra/homeassistant.rs` — `HomeAssistantChannel`, HA as an event-ingress channel (`Channel`, like telegram/feishu but event-driven, not conversational). Opens HA's WebSocket API (`/api/websocket`), authenticates with `HASS_TOKEN`, subscribes to `state_changed`; each qualifying event is formatted into a human-readable line (domain-aware: climate/sensor/binary_sensor/light/switch/fan/lock/alarm) and dispatched as one turn under session `homeassistant:events`, with the reply delivered back as an HA persistent notification (`HomeAssistantSender`, also a `TextSender`). Event forwarding is **closed by default** (`Filters`): no `watch_domains`/`watch_entities` + `watch_all=false` ⇒ everything dropped; an `ignore_entities` list and a per-entity `cooldown_seconds` (default 30) cap the rate so a busy home doesn't fire an LLM call per sensor tick. Auto-reconnects with `[5,10,30,60]`s backoff. **No pairing** — it's a trusted local integration keyed by `HASS_TOKEN`, not a chat with arbitrary senders. Declared in `[channels.homeassistant]` (behavior only; URL/token shared with the tool), resolved by `config::homeassistant_channel_config`, wired in `cli/gateway.rs`. Approval-requiring tool calls during an HA-triggered turn are denied (no human at the keyboard), so HA events can read/notify but not perform `Risk::Normal` actions unattended.
 
 `domain/task.rs` + `tools/task.rs` — durable cross-session tasks (roadmap §2's "kanban layer", shaped after hermes-agent), persisted by `KanbanDb` in its own `kanban.db`
 - single `Task` model: `status` (`inbox`→`todo`→`done`, plus `waiting`/`cancelled`), `waiting_on` (set = a commitment), optional `due_at`, `source`/`source_message_id` (origin session + dedup key for reviewer commitment extraction, see `ReviewSweep`), `board` (optional project/grouping label — a plain string, not a Project entity; the §2 escape hatch, as hermes does)
@@ -132,12 +197,28 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - `todo` tool: call with no args to read; pass `todos` to replace the whole list (full-list replace, no merge). Reads the current session from the ambient turn context (`current_session`); inert (no session) for aux sub-agents and sweeps
 - the turn's session context is established for BOTH paths: the gateway dispatcher sets it (with a real `ReplySink`), and `AgentRuntime::handle_input` sets a *detached* context (no-op sink) when none exists, so the REPL gets `todo` too — see `SessionContext::detached`
 
+`domain/memory.rs` + `tools/memory.rs` + `infra/memory_db.rs` — long-term memory as three surfaces (roadmap §6/§1; design in `docs/memory-injection-plan.md`)
+- `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`. `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat)
+- **L1 pinned** (done): `MemoryRepository::pinned(ctx)` filters `is_pinnable` (pinned + active + confirmed/user_written + identity-kind + in-scope); `system_prompt::render_pinned_memory_block` renders an ≤800-char block injected in `infra/llm.rs::complete` **after** the volatile tier (cache-stable), marked `<!-- shion:memory:pinned -->`, flagged as untrusted data. Main agent only (`build_llm(..., Some(repo))`); aux/delegate get `None`
+- **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `shion memory list/search/promote/reject/pin`. `pin` is the manual-only path into L1 — automated extraction never pins
+- reviewer writes extractions as `candidate + extracted`, scoped to the origin channel, deduped via `find_by_source_message_id` (same governance as task inbox — user triages candidates up to active/pinned)
+- **L3 active recall** (done): `MemoryRepository::recall(ctx, text, limit)` scores active, in-scope memories against the turn's user message by **token overlap** (`recall_terms` = ASCII words + CJK bigrams + stopword filter; `recall_score`), distinct from L2 `search`'s whole-query substring match. Top `RECALL_LIMIT`=5 rendered by `system_prompt::render_recalled_memory_block` into an ≤2000-char block (each line `source:`-tagged, untrusted caveat, `<!-- shion:memory:recall -->`), injected in `infra/llm.rs::complete` **after** pinned (fixed `volatile | pinned | recall` order; pinned hits deduped out of recall). Recall failure is non-fatal but `warn!`-logged. Surfaced memories get `last_used_at` stamped via `MemoryRepository::mark_used` (only touches `last_used_at`, not `updated_at`) on a spawned best-effort task off the reply path — a Phase 4 usage signal
+
+`domain/run.rs` + `RunRepository` (impl in `infra/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
+- one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `shion.db` — execution state bound to a session, disposable like messages, **not** durable personal data
+- steps are captured at `execute_isolated` (see `services/tool_registry.rs`), so the ledger covers LLM-driven and keyword-routed tool calls alike. `RunContext` carries a shared `seq` counter so steps order stably even across the tool's spawned task
+- every write is best-effort (warn-logged, never fails a turn or a tool) — same contract as memory `mark_used`
+- **redaction**: step `args` are stored verbatim *except* each `Tool` may scrub its own via `Tool::redact_args` (default identity) — `shell` strips secret-looking substrings (`key=value`, `Bearer`, `--password`, high-entropy tokens), `file` drops the write `content` body. `result` is truncated but not scrubbed (shell *output* can still contain secrets — accepted, `shion.db` is local/disposable). Fields are length-capped (`RUN_FIELD_CAP`/`STEP_FIELD_CAP`)
+- aux sub-agents and maintenance sweeps run without a `RunContext`, so their tool use never enters the ledger
+- operator view: `shion run list [--limit N]` / `shion run inspect <id>` (`cli/inspect.rs`)
+- deliberately NOT in v1: a `recoverable` flag / `resume` (no consumer yet — roadmap §6's "no dead fields"); ledger pruning (runs accumulate like messages; a later operator action can trim)
+
 `cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
 - Session ids are program-managed (uuid v7); every run starts a fresh session. `/new` and `/clear` are equivalent — both open a new session. There is no user-supplied session id and no `/session` subcommand.
 
 `agent/daemon.rs` — background maintenance supervisor, hosted by the gateway (pattern borrowed from gbrain's `autopilot` supervisor)
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
-- `ReviewSweep` is the one fixed action: run the reflective reviewer over every stored session with ≥1 user turn. Beyond memories/skills, the reviewer also extracts commitments ("I'll do X", "waiting on Y") and captures them as `inbox` tasks tagged with the origin `source` + a content-derived `source_message_id` dedup key (`find_by_source_message_id` guards against re-capturing across sweeps). Auto-extracted tasks only ever land in `inbox`, never `todo` — the user triages them (same governance as auto-written memories).
+- `ReviewSweep` is the one fixed action: run the reflective reviewer over every stored session with ≥1 user turn. Beyond memories/skills, the reviewer also extracts commitments ("I'll do X", "waiting on Y") and captures them as `inbox` tasks tagged with the origin `source` + a content-derived `source_message_id` dedup key (`find_by_source_message_id` guards against re-capturing across sweeps). Auto-extracted tasks only ever land in `inbox`, never `todo`, and extracted memories land as `candidate` (scoped to the origin channel, deduped by `find_by_source_message_id`), never pinned/active — the user triages both up the ladder (`shion task` / `shion memory promote|pin`).
 - `ReminderSweep` delivers due reminders via `Notifier` every minute (10-min grace window; older ones are marked `missed`)
 - `TaskSweep` notifies once when an open task comes due (the task stays open; `due_notified_at` is the at-most-once guard)
 - `BriefingSweep` is the opt-in daily briefing (roadmap §4): it reads open tasks + recently-learned memories, lets the aux LLM compose a short digest (`briefing_prompt` is the pure, clock-injected prompt builder — returns `None` when there's nothing worth a ping), and delivers it through the same `Notifier`. Only scheduled when `briefing_schedule` is set (no default — proactive pings stay opt-in); wired in `cli/gateway.rs`.
@@ -147,7 +228,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder + task sweeps every minute, optional daily briefing), all sharing one `watch` shutdown signal
-- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` and `telegram` are the wired channels
+- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu`, `telegram`, and `homeassistant` (event ingress) are the wired channels
 - sender admission is two-layered: each channel's `admit` filters message shape (non-text, bot senders, group mention gate), then the shared `PairingGuard` (`agent/pairing.rs`, store in `domain/pairing.rs`) decides identity — config `allow_from` is pre-trusted, approved pairings pass, anyone else gets a pairing code (`shion pair approve <code>` on the host admits them; `cli/pair.rs`)
 - `GatewayDispatcher` (`agent/interaction.rs`) is the front door between a channel and the agent: a channel builds a `ReplySink` (`domain/gateway.rs`) for the chat and hands it each inbound message; the dispatcher classifies chat control commands and otherwise runs a turn. Channels no longer await turns or send agent replies themselves — the dispatcher owns that, and runs each turn on a spawned task so the receive loop keeps polling (which is what lets an `/approve` reply arrive mid-turn). One turn at a time per session.
 - chat control commands (any channel): `/new` (also `/clear`, `/reset`) rotates the session hermes-style (`SessionRepository::rotate` archives the old transcript under a fresh id, leaving the chat's session empty — the reviewer can still see it), clears approval state, and clears the session's working todo list; `/approve` (+ `/approve session`) and `/deny` resolve a pending approval; `/sethome` (also `/home`) makes the current chat the home channel for proactive output (persisted via `HomeRepository`, `domain/home.rs`)
@@ -173,7 +254,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - **Add a tool**: implement `Tool` in `src/tools/`, register it in `cli/chat.rs`
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`) for another backend and construct it in `cli/chat.rs`
 - **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
-- **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
+- **Add agent-loop control** (clarify / retry / budget — roadmap §8): build it as a layer in `AgentRuntime::turn_body` *above* `LlmClient`, or drive the tool-call loop in-house instead of delegating it to rig's `agent.prompt().max_turns()`. There is no planner to subclass — the loop currently lives inside rig
 - **Change the scheduled action**: implement `Maintenance` (`agent/daemon.rs`) and construct it in `cli/gateway.rs`
 - **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration — `infra/feishu.rs` is the reference implementation
 

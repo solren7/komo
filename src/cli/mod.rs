@@ -3,6 +3,7 @@ mod chat;
 mod cli;
 mod gateway;
 mod inspect;
+mod memory;
 mod model;
 mod pair;
 mod service;

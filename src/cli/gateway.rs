@@ -17,6 +17,7 @@ use crate::{
         db::Db,
         feishu::{FeishuChannel, FeishuSender},
         home_notifier::{HomeNotifier, TextSender},
+        homeassistant::HomeAssistantChannel,
         kanban::KanbanDb,
         macos_notifier::MacosNotifier,
         telegram::{TelegramChannel, TelegramSender},
@@ -162,11 +163,23 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         )));
         channels.push("telegram");
     }
+    // Whether an interactive chat channel exists — gates the shutdown notice
+    // (HA is event-only, so an HA-only gateway must not pop a macOS notice).
+    let has_chat_channel = !channels.is_empty();
+
+    // Home Assistant event ingress: forwards filtered `state_changed` events to
+    // the agent. No pairing — it is a trusted local integration keyed by
+    // HASS_TOKEN, not a chat with arbitrary senders.
+    let ha_channel = crate::config::homeassistant_channel_config()?;
+    if let Some(cfg) = &ha_channel {
+        gateway = gateway.add_channel(Box::new(HomeAssistantChannel::new(cfg)));
+        channels.push("homeassistant");
+    }
 
     // Send the offline notice on shutdown only when a chat channel exists; with
     // none, the home notifier would fall back to a macOS popup, which is noise
     // on a foreground Ctrl-C.
-    if !channels.is_empty() {
+    if has_chat_channel {
         gateway = gateway.with_shutdown_notice(notifier);
     }
 

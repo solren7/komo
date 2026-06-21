@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -312,9 +314,6 @@ impl MemoryContext {
 /// A scope-bounded search over the memory library. `allowed_scopes` and
 /// `statuses` must be filled before the store is hit — the repository enforces
 /// them, callers cannot widen them downstream.
-// Consumed by L2 search / L3 recall (next increment); defined now so the
-// repository contract is stable. See `docs/memory-injection-plan.md`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MemoryQuery {
     pub text: String,
@@ -325,11 +324,166 @@ pub struct MemoryQuery {
 }
 
 /// A memory plus its rerank score for a given query.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ScoredMemory {
     pub memory: Memory,
     pub score: f64,
+}
+
+/// Explainable rerank score for a memory against a (already lowercased) query.
+/// Returns `None` when a non-empty query does not lexically match the content
+/// (the memory is excluded); otherwise a positive score combining lexical hit,
+/// importance, confidence, and recency. No embedding — `LIKE`-style substring
+/// match plus weighted signals, per the first-version plan. Scope/status/kind
+/// are filtered before this is called.
+pub fn rerank_score(memory: &Memory, query_lower: &str, now: i64) -> Option<f64> {
+    if !query_lower.is_empty() && !memory.content.to_lowercase().contains(query_lower) {
+        return None;
+    }
+    let mut score = 0.0;
+    if !query_lower.is_empty() {
+        score += 2.0; // lexical match
+    }
+    score += memory.importance as f64 / 100.0; // 0..~1
+    score += match memory.confidence {
+        MemoryConfidence::UserWritten => 0.4,
+        MemoryConfidence::Confirmed => 0.3,
+        MemoryConfidence::Inferred => 0.1,
+        MemoryConfidence::Extracted => 0.0,
+    };
+    // Recency: 30-day half-life decay on the last update.
+    let age_days = (now - memory.updated_at).max(0) as f64 / 86_400.0;
+    score += 0.5 * (-age_days / 30.0).exp();
+    Some(score)
+}
+
+// ── recall (L3) ───────────────────────────────────────────────────────────────
+
+/// Extract lexical terms from text for L3 recall matching, language-agnostically:
+/// runs of alphanumeric characters of length ≥ 2 become word terms, and adjacent
+/// CJK characters become bigrams (a cheap stand-in for word segmentation, since
+/// CJK has no whitespace boundaries). Everything lowercased.
+///
+/// This is distinct from [`rerank_score`]'s whole-query substring match: the L2
+/// tool passes a focused keyword query (substring works), but L3 recall passes a
+/// whole user message, where token overlap is the meaningful signal.
+fn recall_terms(text: &str) -> HashSet<String> {
+    let mut terms = HashSet::new();
+    let mut word = String::new();
+    let mut prev_cjk: Option<char> = None;
+    fn flush(word: &mut String, terms: &mut HashSet<String>) {
+        if word.chars().count() >= 2 && !is_stopword(word) {
+            terms.insert(word.clone());
+        }
+        word.clear();
+    }
+    for ch in text.chars() {
+        let lc = ch.to_lowercase().next().unwrap_or(ch);
+        if is_cjk(ch) {
+            if let Some(p) = prev_cjk {
+                terms.insert(format!("{p}{lc}"));
+            }
+            prev_cjk = Some(lc);
+            flush(&mut word, &mut terms);
+        } else if ch.is_alphanumeric() {
+            word.push(lc);
+            prev_cjk = None;
+        } else {
+            flush(&mut word, &mut terms);
+            prev_cjk = None;
+        }
+    }
+    flush(&mut word, &mut terms);
+    terms
+}
+
+/// High-frequency English function words that carry no recall signal — dropping
+/// them keeps a memory like "the user likes coffee" from matching any query that
+/// merely contains "the". Not exhaustive; just the worst offenders.
+fn is_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "are"
+            | "for"
+            | "you"
+            | "your"
+            | "with"
+            | "was"
+            | "were"
+            | "this"
+            | "that"
+            | "what"
+            | "how"
+            | "why"
+            | "when"
+            | "where"
+            | "who"
+            | "does"
+            | "did"
+            | "can"
+            | "will"
+            | "would"
+            | "should"
+            | "has"
+            | "have"
+            | "had"
+            | "not"
+            | "but"
+            | "from"
+            | "into"
+            | "out"
+            | "off"
+            | "all"
+            | "any"
+            | "some"
+            | "than"
+            | "then"
+            | "them"
+            | "they"
+            | "其中"
+            | "可以"
+            | "如何"
+    )
+}
+
+/// CJK ranges where per-character (bigram) matching beats whitespace tokens:
+/// CJK ideographs (+ Ext A), Hiragana/Katakana, Hangul syllables.
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+    )
+}
+
+/// Score a memory for L3 recall against the query's extracted terms. Returns
+/// `None` when there is no lexical overlap (the memory is excluded); otherwise a
+/// positive score: shared-term count plus the same importance/confidence/recency
+/// signals as [`rerank_score`]. Scope/status are filtered before this is called.
+pub fn recall_score(memory: &Memory, query_terms: &HashSet<String>, now: i64) -> Option<f64> {
+    if query_terms.is_empty() {
+        return None;
+    }
+    let mem_terms = recall_terms(&memory.content);
+    let overlap = query_terms
+        .iter()
+        .filter(|t| mem_terms.contains(*t))
+        .count();
+    if overlap == 0 {
+        return None;
+    }
+    let mut score = overlap as f64; // each shared term = 1.0
+    score += memory.importance as f64 / 100.0;
+    score += match memory.confidence {
+        MemoryConfidence::UserWritten => 0.4,
+        MemoryConfidence::Confirmed => 0.3,
+        MemoryConfidence::Inferred => 0.1,
+        MemoryConfidence::Extracted => 0.0,
+    };
+    let age_days = (now - memory.updated_at).max(0) as f64 / 86_400.0;
+    score += 0.5 * (-age_days / 30.0).exp();
+    Some(score)
 }
 
 // ── repository ────────────────────────────────────────────────────────────────
@@ -362,6 +516,114 @@ pub trait MemoryRepository: Send + Sync {
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         Ok(pinned)
+    }
+
+    /// Fetch a single memory by id. Default scans [`list`](MemoryRepository::list)
+    /// (so it does not see expired memories); a store may override to fetch
+    /// directly. Used by governance actions (promote/reject/archive/update).
+    async fn get(&self, id: &str) -> anyhow::Result<Option<Memory>> {
+        Ok(self.list().await?.into_iter().find(|m| m.id == id))
+    }
+
+    /// Scope-bounded L2/L3 search. Filters by `allowed_scopes` / `statuses` /
+    /// `kinds`, scores the rest with [`rerank_score`], and returns the top
+    /// `limit` by score. Default runs over [`list`](MemoryRepository::list); a
+    /// store may override the candidate fetch (e.g. an FTS prefilter) later
+    /// without changing the rerank.
+    async fn search(&self, query: MemoryQuery) -> anyhow::Result<Vec<ScoredMemory>> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let needle = query.text.to_lowercase();
+        let mut scored: Vec<ScoredMemory> = self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|m| query.allowed_scopes.contains(&m.scope))
+            .filter(|m| query.statuses.is_empty() || query.statuses.contains(&m.status))
+            .filter(|m| query.kinds.is_empty() || query.kinds.contains(&m.kind))
+            .filter_map(|m| {
+                rerank_score(&m, &needle, now).map(|score| ScoredMemory { memory: m, score })
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if query.limit > 0 {
+            scored.truncate(query.limit);
+        }
+        Ok(scored)
+    }
+
+    /// Find a memory by its origin + content-derived dedup key, for reviewer
+    /// re-extraction guarding (mirrors `TaskRepository`). An empty key never
+    /// matches a real extraction. Default scans [`list`](MemoryRepository::list).
+    async fn find_by_source_message_id(
+        &self,
+        source: &str,
+        source_message_id: &str,
+    ) -> anyhow::Result<Option<Memory>> {
+        if source_message_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .find(|m| m.source == source && m.source_message_id == source_message_id))
+    }
+
+    /// L3 active recall: the active, in-scope memories most relevant to `text`
+    /// (the current user message), ranked by [`recall_score`], top `limit`.
+    /// Unlike [`search`](MemoryRepository::search) — which substring-matches a
+    /// focused query — recall does token-overlap matching against a whole
+    /// message. Scope/status are enforced here (design principle 3: never widen
+    /// in the render layer). Default runs over [`list`](MemoryRepository::list);
+    /// a store may override the candidate fetch later without changing scoring.
+    async fn recall(
+        &self,
+        ctx: &MemoryContext,
+        text: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ScoredMemory>> {
+        let query_terms = recall_terms(text);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut scored: Vec<ScoredMemory> = self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|m| m.status == MemoryStatus::Active)
+            .filter(|m| ctx.allows(&m.scope))
+            .filter_map(|m| {
+                recall_score(&m, &query_terms, now).map(|score| ScoredMemory { memory: m, score })
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if limit > 0 {
+            scored.truncate(limit);
+        }
+        Ok(scored)
+    }
+
+    /// Record that memories surfaced in recall, for future usage-based
+    /// promotion/archival signals (Phase 4). Updates only `last_used_at`, never
+    /// `updated_at`, so the recency-decay signal stays tied to real edits.
+    /// Best-effort: ids that no longer resolve are skipped.
+    async fn mark_used(&self, ids: &[String], now: i64) -> anyhow::Result<()> {
+        for id in ids {
+            if let Some(mut memory) = self.get(id).await? {
+                memory.last_used_at = Some(now);
+                self.save(&memory).await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -459,6 +721,41 @@ mod tests {
         let mut expired = pinnable_memory();
         expired.expires_at = Some(now - 1);
         assert!(!expired.is_pinnable(&ctx, now));
+    }
+
+    #[test]
+    fn recall_terms_splits_ascii_words_and_cjk_bigrams() {
+        let terms = recall_terms("Uses Rust 项目");
+        assert!(terms.contains("uses"));
+        assert!(terms.contains("rust"));
+        assert!(terms.contains("项目")); // CJK bigram
+    }
+
+    #[test]
+    fn recall_score_requires_term_overlap() {
+        let now = 1_000;
+        let m = Memory::new(MemoryKind::Project, "the project is written in Rust");
+        // Overlapping term "rust" → scored.
+        let hit = recall_terms("what language is the rust project in");
+        assert!(recall_score(&m, &hit, now).is_some());
+        // No overlap → excluded.
+        let miss = recall_terms("当前天气如何");
+        assert!(recall_score(&m, &miss, now).is_none());
+        // Empty query → excluded.
+        assert!(recall_score(&m, &HashSet::new(), now).is_none());
+    }
+
+    #[test]
+    fn recall_score_orders_by_overlap_then_signals() {
+        let now = 1_000;
+        let mut more = Memory::new(MemoryKind::Fact, "rust async tokio runtime");
+        more.updated_at = now;
+        let mut fewer = Memory::new(MemoryKind::Fact, "rust crate");
+        fewer.updated_at = now;
+        let q = recall_terms("rust async tokio");
+        let s_more = recall_score(&more, &q, now).unwrap();
+        let s_fewer = recall_score(&fewer, &q, now).unwrap();
+        assert!(s_more > s_fewer, "more overlapping terms must score higher");
     }
 
     #[test]

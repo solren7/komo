@@ -54,7 +54,7 @@ use crate::{
         pairing::{PairingRepository, PairingStatus},
         reminder::ReminderRepository,
         repository::{MessageRepository, SessionRepository, SkillRepository},
-        run::RunRepository,
+        run::{RunRepository, resume_prompt},
         task::TaskRepository,
     },
     services::tool_registry::{SessionContext, with_session},
@@ -191,6 +191,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/memories/{id}/pin", post(memory_pin))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
+        .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/reminders", get(list_reminders))
         .route("/api/skills", get(list_skills))
         .route("/api/pairings", get(list_pairings))
@@ -560,6 +561,59 @@ async fn get_run(
     Ok(Json(json!({ "run": run, "steps": steps })).into_response())
 }
 
+/// Resume an interrupted run (backs `shion run resume` while the gateway holds
+/// the db lock): compose the priming input from the ledger and drive one normal
+/// turn in the run's original session, then clear the `recoverable` flag.
+/// Trust follows the chat rule — loopback + `X-Shion-Trusted` auto-approves
+/// (the CLI user is the host operator); anyone else runs detached (auto-deny).
+async fn resume_run(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(run) = state.runs.get(&id).await? else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "run not found" })),
+        )
+            .into_response());
+    };
+    if !run.recoverable {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!(
+                "run `{id}` is not recoverable (status: {} — it finished normally, \
+                 failed without interruption, or was already resumed)",
+                run.status.as_str()
+            ) })),
+        )
+            .into_response());
+    }
+    let steps = state.runs.steps(&id).await?;
+    let input = resume_prompt(&run, &steps);
+
+    let trusted = peer.ip().is_loopback() && headers.contains_key("x-shion-trusted");
+    let ctx = if trusted {
+        SessionContext::trusted(&run.session_id)
+    } else {
+        SessionContext::detached(&run.session_id)
+    };
+    let reply = with_session(ctx, state.handler.handle(&run.session_id, input)).await?;
+
+    if let Err(error) = state.runs.mark_resumed(&id).await {
+        warn!(%error, run_id = %id, "failed to clear recoverable flag after resume");
+    }
+    info!(run_id = %id, session = %run.session_id, "run resumed");
+    Ok(Json(ResumeOutcome {
+        run_id: id,
+        session_id: run.session_id,
+        steps: steps.len(),
+        reply,
+    })
+    .into_response())
+}
+
 // ---- control-plane read endpoints (CLI ↔ gateway) --------------------------
 
 /// Pending reminders (backs `shion cron list`), soonest first.
@@ -650,6 +704,16 @@ pub struct PairingView {
     /// `pending` | `approved` | `expired`.
     pub status: String,
     pub created_at: i64,
+}
+
+/// The result of `POST /api/runs/{id}/resume`, consumed by `shion run resume`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeOutcome {
+    pub run_id: String,
+    pub session_id: String,
+    /// How many completed steps the priming digest handed to the model.
+    pub steps: usize,
+    pub reply: String,
 }
 
 /// One candidate in the dreaming preview, with the score that drove its verdict.

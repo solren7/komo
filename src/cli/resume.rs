@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::{
-    cli::{approver::CliApprover, wiring},
+    cli::{approver::CliApprover, gateway_client::GatewayClient, wiring},
     domain::{
         approval::Approver,
         run::{Run, RunRepository, resume_prompt},
@@ -21,9 +21,30 @@ use crate::{
 const RESUME_SCAN_LIMIT: usize = 100;
 
 /// Resume an interrupted run in its original session. `id = None` picks the
-/// most recent recoverable run.
+/// most recent recoverable run. A running gateway holds the db lock, so the
+/// whole action routes to it (`POST /api/runs/{id}/resume`, trusted); otherwise
+/// the turn runs in-process, exactly like `shion chat`.
 pub async fn run(db_url: &str, kanban_url: &str, id: Option<String>) -> anyhow::Result<()> {
-    crate::cli::gateway_client::refuse_if_gateway_running("run resume").await?;
+    if let Some(gw) = GatewayClient::try_connect().await {
+        let target_id = match id {
+            Some(id) => id,
+            None => gw
+                .runs(RESUME_SCAN_LIMIT)
+                .await?
+                .into_iter()
+                .find(|r| r.recoverable)
+                .map(|r| r.id)
+                .ok_or_else(|| anyhow::anyhow!(NO_RECOVERABLE))?,
+        };
+        println!("Resuming {target_id} via the running gateway…\n");
+        let out = gw.resume(&target_id).await?;
+        println!(
+            "Resumed {} (session {}, {} completed step(s) handed to the model).\n",
+            out.run_id, out.session_id, out.steps
+        );
+        println!("Agent: {}", out.reply);
+        return Ok(());
+    }
 
     let db = Arc::new(Db::connect(db_url).await?);
     let target = resolve_target(&*db, id).await?;
@@ -73,10 +94,9 @@ async fn resolve_target(runs: &dyn RunRepository, id: Option<String>) -> anyhow:
             .await?
             .into_iter()
             .find(|r| r.recoverable)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no recoverable runs — nothing was interrupted, or it was already resumed"
-                )
-            }),
+            .ok_or_else(|| anyhow::anyhow!(NO_RECOVERABLE)),
     }
 }
+
+const NO_RECOVERABLE: &str =
+    "no recoverable runs — nothing was interrupted, or it was already resumed";

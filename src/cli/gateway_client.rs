@@ -23,7 +23,7 @@ use crate::domain::{
     skill::Skill,
     task::Task,
 };
-use crate::infra::messaging::api::{DreamItem, PairingView, SessionSummary};
+use crate::infra::messaging::api::{DreamItem, PairingView, ResumeOutcome, SessionSummary};
 use crate::infra::rendezvous::{self, GatewayInfo};
 
 /// How long to wait for the gateway to answer a request (a turn can take a
@@ -121,6 +121,34 @@ impl GatewayClient {
         let steps: Vec<RunStep> =
             serde_json::from_value(map.remove("steps").unwrap_or_else(|| Value::Array(vec![])))?;
         Ok(Some((run, steps)))
+    }
+
+    /// Resume an interrupted run server-side: the gateway composes the priming
+    /// input from its ledger, drives the turn (trusted — loopback + the marker
+    /// header, same as `chat`), and clears the `recoverable` flag. 404 and 409
+    /// come back as clear errors rather than raw HTTP failures.
+    pub async fn resume(&self, id: &str) -> anyhow::Result<ResumeOutcome> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/runs/{id}/resume")))
+            .bearer_auth(&self.key)
+            .header("X-Shion-Trusted", "1")
+            .send()
+            .await?;
+        match resp.status() {
+            reqwest::StatusCode::NOT_FOUND => anyhow::bail!("no run with id `{id}`"),
+            reqwest::StatusCode::CONFLICT => {
+                let v: Value = resp.json().await.unwrap_or_default();
+                let msg = v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("run is not recoverable")
+                    .to_string();
+                anyhow::bail!(msg);
+            }
+            _ => {}
+        }
+        Ok(resp.error_for_status()?.json().await?)
     }
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {

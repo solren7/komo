@@ -186,6 +186,24 @@ impl Rule {
     }
 }
 
+/// A verdict plus which rule produced it (`None` = fell through to a default).
+/// The rule index is into the policy's rule list as configured — `shion policy
+/// list` shows the same numbering, so a `check` result points at a real line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decision {
+    pub verdict: Verdict,
+    pub rule: Option<usize>,
+}
+
+impl Decision {
+    fn fallback(verdict: Verdict) -> Self {
+        Self {
+            verdict,
+            rule: None,
+        }
+    }
+}
+
 /// A resolved permission policy: an ordered rule list plus the fallback verdict
 /// for a `Risk::Normal` action that no rule matches.
 #[derive(Debug, Clone)]
@@ -202,33 +220,61 @@ impl Policy {
         }
     }
 
+    /// The configured rules, in evaluation-list order (for `shion policy list`).
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// The fallback verdict for an unmatched `Risk::Normal` action.
+    pub fn default_normal(&self) -> Verdict {
+        self.default_normal
+    }
+
     /// Evaluate `request` for a turn on `channel` (`None` when no session is in
-    /// scope, e.g. a maintenance sweep).
+    /// scope, e.g. a maintenance sweep), reporting which rule matched — also the
+    /// dry-run surface behind `shion policy check`.
     ///
     /// Deny rules take precedence over allow rules regardless of order; with no
     /// rule matching, `Risk::Normal` falls to `default_normal` and
     /// `Risk::Dangerous` always falls to [`Verdict::Ask`] (only an explicit
     /// `include_dangerous` allow rule grants a dangerous action).
-    pub fn evaluate(&self, request: &ApprovalRequest, channel: Option<&str>) -> Verdict {
+    ///
+    /// `Risk::Safe` gets **deny-only** evaluation: deny rules can block a
+    /// read-only action (network fetch, file read), but nothing ever escalates
+    /// it to a prompt — an unmatched safe action stays allowed. Allow rules are
+    /// meaningless for safe actions and are skipped.
+    pub fn decide(&self, request: &ApprovalRequest, channel: Option<&str>) -> Decision {
         let Some(action) = request.action.as_ref() else {
             // No structured resource to match on; risk-only fallback.
-            return self.default_for(request.risk);
+            return Decision::fallback(self.default_for(request.risk));
         };
 
-        for rule in self.rules.iter().filter(|r| r.effect == Effect::Deny) {
-            if rule.applies(action, channel) && rule.matches(action) {
-                return Verdict::Deny;
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.effect == Effect::Deny && rule.applies(action, channel) && rule.matches(action)
+            {
+                return Decision {
+                    verdict: Verdict::Deny,
+                    rule: Some(i),
+                };
             }
         }
-        for rule in self.rules.iter().filter(|r| r.effect == Effect::Allow) {
-            if rule.applies(action, channel) && rule.matches(action) {
+        if request.risk == Risk::Safe {
+            // Deny-only for read-only actions: no allow rules, no escalation.
+            return Decision::fallback(Verdict::Allow);
+        }
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.effect == Effect::Allow && rule.applies(action, channel) && rule.matches(action)
+            {
                 if request.risk == Risk::Dangerous && !rule.include_dangerous {
                     continue;
                 }
-                return Verdict::Allow;
+                return Decision {
+                    verdict: Verdict::Allow,
+                    rule: Some(i),
+                };
             }
         }
-        self.default_for(request.risk)
+        Decision::fallback(self.default_for(request.risk))
     }
 
     fn default_for(&self, risk: Risk) -> Verdict {
@@ -301,14 +347,53 @@ mod tests {
     }
 
     #[test]
+    fn safe_actions_get_deny_only_evaluation() {
+        let net = |url: &str| {
+            ApprovalRequest::safe("fetch").with_action(ActionRef::Network {
+                url: url.to_string(),
+            })
+        };
+        let p = Policy::new(
+            vec![
+                // An allow rule must be irrelevant to safe actions…
+                rule(Category::Network, Matcher::Suffix, "github.com", Effect::Allow),
+                rule(Category::Network, Matcher::Suffix, "internal.corp", Effect::Deny),
+            ],
+            // …and so must default_normal: even Deny leaves unmatched safe alone.
+            Verdict::Deny,
+        );
+        let denied = p.decide(&net("https://api.internal.corp/x"), Some("cli"));
+        assert_eq!(denied.verdict, Verdict::Deny);
+        assert_eq!(denied.rule, Some(1));
+
+        let unmatched = p.decide(&net("https://example.com"), Some("cli"));
+        assert_eq!(unmatched.verdict, Verdict::Allow);
+        assert_eq!(unmatched.rule, None);
+    }
+
+    #[test]
+    fn decide_reports_the_matching_rule_index() {
+        let p = Policy::new(
+            vec![
+                rule(Category::Shell, Matcher::Prefix, "cargo ", Effect::Allow),
+                rule(Category::Shell, Matcher::Prefix, "git ", Effect::Allow),
+            ],
+            Verdict::Ask,
+        );
+        let d = p.decide(&shell("git status", Risk::Normal), Some("cli"));
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert_eq!(d.rule, Some(1));
+    }
+
+    #[test]
     fn empty_policy_asks_for_normal_and_dangerous() {
         let p = Policy::default();
         assert_eq!(
-            p.evaluate(&shell("ls", Risk::Normal), Some("cli")),
+            p.decide(&shell("ls", Risk::Normal), Some("cli")).verdict,
             Verdict::Ask
         );
         assert_eq!(
-            p.evaluate(&shell("rm -rf x", Risk::Dangerous), Some("cli")),
+            p.decide(&shell("rm -rf x", Risk::Dangerous), Some("cli")).verdict,
             Verdict::Ask
         );
     }
@@ -325,11 +410,11 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.evaluate(&shell("cargo build", Risk::Normal), Some("cli")),
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli")).verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.evaluate(&shell("npm install", Risk::Normal), Some("cli")),
+            p.decide(&shell("npm install", Risk::Normal), Some("cli")).verdict,
             Verdict::Ask
         );
     }
@@ -344,7 +429,7 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.evaluate(&shell("git push origin", Risk::Normal), Some("cli")),
+            p.decide(&shell("git push origin", Risk::Normal), Some("cli")).verdict,
             Verdict::Deny
         );
     }
@@ -356,7 +441,7 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.evaluate(&shell("rm file", Risk::Dangerous), Some("cli")),
+            p.decide(&shell("rm file", Risk::Dangerous), Some("cli")).verdict,
             Verdict::Ask
         );
 
@@ -364,7 +449,7 @@ mod tests {
         allow_dangerous.include_dangerous = true;
         let p = Policy::new(vec![allow_dangerous], Verdict::Ask);
         assert_eq!(
-            p.evaluate(&shell("rm file", Risk::Dangerous), Some("cli")),
+            p.decide(&shell("rm file", Risk::Dangerous), Some("cli")).verdict,
             Verdict::Allow
         );
     }
@@ -380,11 +465,11 @@ mod tests {
         r.access = Some(Access::Write);
         let p = Policy::new(vec![r], Verdict::Ask);
         assert_eq!(
-            p.evaluate(&file_write("/home/me/proj/src/x.rs"), Some("cli")),
+            p.decide(&file_write("/home/me/proj/src/x.rs"), Some("cli")).verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.evaluate(&file_write("/etc/passwd"), Some("cli")),
+            p.decide(&file_write("/etc/passwd"), Some("cli")).verdict,
             Verdict::Ask
         );
     }
@@ -395,16 +480,16 @@ mod tests {
         r.channels = Some(vec!["cli".to_string()]);
         let p = Policy::new(vec![r], Verdict::Ask);
         assert_eq!(
-            p.evaluate(&shell("cargo build", Risk::Normal), Some("cli")),
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli")).verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.evaluate(&shell("cargo build", Risk::Normal), Some("feishu")),
+            p.decide(&shell("cargo build", Risk::Normal), Some("feishu")).verdict,
             Verdict::Ask
         );
         // No session in scope → a channel-scoped rule never matches.
         assert_eq!(
-            p.evaluate(&shell("cargo build", Risk::Normal), None),
+            p.decide(&shell("cargo build", Risk::Normal), None).verdict,
             Verdict::Ask
         );
     }
@@ -426,16 +511,16 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.evaluate(&net("https://api.github.com/repos"), Some("cli")),
+            p.decide(&net("https://api.github.com/repos"), Some("cli")).verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.evaluate(&net("https://github.com"), Some("cli")),
+            p.decide(&net("https://github.com"), Some("cli")).verdict,
             Verdict::Allow
         );
         // Not a real subdomain — must not match.
         assert_eq!(
-            p.evaluate(&net("https://evilgithub.com"), Some("cli")),
+            p.decide(&net("https://evilgithub.com"), Some("cli")).verdict,
             Verdict::Ask
         );
     }
@@ -444,12 +529,12 @@ mod tests {
     fn default_normal_can_deny() {
         let p = Policy::new(Vec::new(), Verdict::Deny);
         assert_eq!(
-            p.evaluate(&shell("ls", Risk::Normal), Some("feishu")),
+            p.decide(&shell("ls", Risk::Normal), Some("feishu")).verdict,
             Verdict::Deny
         );
         // Dangerous still asks regardless of default_normal.
         assert_eq!(
-            p.evaluate(&shell("rm x", Risk::Dangerous), Some("feishu")),
+            p.decide(&shell("rm x", Risk::Dangerous), Some("feishu")).verdict,
             Verdict::Ask
         );
     }

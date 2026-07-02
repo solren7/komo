@@ -1,8 +1,13 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::domain::tool::Tool;
+use crate::domain::{
+    approval::{ActionRef, ApprovalRequest, Approver},
+    tool::Tool,
+};
 
 const MAX_BYTES: usize = 8 * 1024;
 const USER_AGENT: &str = "shion-agent/0.1";
@@ -13,21 +18,24 @@ struct FetchArgs {
 }
 
 /// Fetches a URL and returns its readable text content (HTML stripped).
+///
+/// A GET is read-only (`Risk::Safe`), but it is still an outbound request to an
+/// arbitrary URL — untrusted page content can steer the model into fetching an
+/// attacker's host with sensitive query params. So the fetch consults the
+/// approver with an [`ActionRef::Network`] before sending: the policy layer's
+/// deny rules can blackhole hosts (`category = "network"`), while an unmatched
+/// URL proceeds without any prompt (safe actions never escalate).
 pub struct WebFetchTool {
     client: reqwest::Client,
+    approver: Arc<dyn Approver>,
 }
 
 impl WebFetchTool {
-    pub fn new() -> Self {
+    pub fn new(approver: Arc<dyn Approver>) -> Self {
         Self {
             client: reqwest::Client::new(),
+            approver,
         }
-    }
-}
-
-impl Default for WebFetchTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -59,6 +67,19 @@ impl Tool for WebFetchTool {
     async fn execute(&self, input: String) -> anyhow::Result<String> {
         let args: FetchArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid web_fetch arguments: {e}"))?;
+
+        let request = ApprovalRequest::safe(format!("fetch {}", args.url)).with_action(
+            ActionRef::Network {
+                url: args.url.clone(),
+            },
+        );
+        if !self.approver.approve(&request).await {
+            return Ok(format!(
+                "URL blocked by the permission policy (a `network` deny rule matches {}); \
+                 nothing was fetched.",
+                args.url
+            ));
+        }
 
         let resp = self
             .client
@@ -141,6 +162,25 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DenyAll;
+    #[async_trait]
+    impl Approver for DenyAll {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_fetch_reports_the_block_and_sends_nothing() {
+        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let out = tool
+            .execute(json!({ "url": "https://blocked.example.com/x" }).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("blocked by the permission policy"));
+        assert!(out.contains("blocked.example.com"));
+    }
 
     #[test]
     fn truncation_never_splits_a_multibyte_char() {

@@ -103,6 +103,23 @@ impl Tool for FileTool {
 
         match args.action.as_str() {
             "read" => {
+                // Reads are `Risk::Safe` (never prompt), but the policy layer's
+                // deny rules still apply — `category = "file", access = "read"`
+                // can fence off sensitive paths inside the workspace.
+                let request = ApprovalRequest::safe(format!("read {}", args.path)).with_action(
+                    ActionRef::File {
+                        path: Path::new(&args.path).to_path_buf(),
+                        write: false,
+                    },
+                );
+                if !self.approver.approve(&request).await {
+                    return Ok(format!(
+                        "Read blocked by the permission policy (a `file` deny rule matches {}); \
+                         nothing was read.",
+                        args.path
+                    ));
+                }
+
                 let mut text = tokio::fs::read_to_string(&args.path)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", args.path))?;
@@ -201,6 +218,29 @@ mod tests {
         assert!(!redacted.contains("secret-body"));
         assert!(redacted.contains("redacted"));
         assert!(redacted.contains("/x/y.txt")); // path preserved
+    }
+
+    #[tokio::test]
+    async fn denied_read_is_blocked_by_the_approver() {
+        struct DenyAll;
+        #[async_trait::async_trait]
+        impl Approver for DenyAll {
+            async fn approve(&self, _request: &ApprovalRequest) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("shion_denied_read.txt");
+        std::fs::write(&path, "secret").unwrap();
+        let tool = FileTool::new(
+            Arc::new(Workspace::new(vec![dir])),
+            Arc::new(DenyAll),
+        );
+        let args = json!({ "action": "read", "path": path.to_string_lossy() });
+        let out = tool.execute(args.to_string()).await.unwrap();
+        assert!(out.contains("blocked by the permission policy"));
+        assert!(!out.contains("secret"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

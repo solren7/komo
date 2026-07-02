@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, service, upgrade, wechat,
-    workday,
+    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, policy, service, upgrade,
+    wechat, workday,
 };
 
 #[derive(Parser)]
@@ -76,6 +76,11 @@ enum Commands {
         #[command(subcommand)]
         action: PairAction,
     },
+    /// Inspect and dry-run the permission policy ([policy] in config.toml)
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Show or switch the active LLM provider and model
     Model {
         #[command(subcommand)]
@@ -112,6 +117,28 @@ enum Commands {
 enum WechatAction {
     /// Provision iLink credentials by scanning a login QR (run on the host)
     Login,
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Show the resolved rules (as the approver applies them) and defaults
+    List,
+    /// Dry-run one action: which verdict, and which rule decided it
+    Check {
+        /// Action category: shell | file | network | homeassistant
+        category: String,
+        /// The target: a command, path, URL, or `domain.service`
+        target: String,
+        /// Evaluate as this channel (feishu | telegram | wechat | cli | …)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Classify the action as Risk::Dangerous (shell)
+        #[arg(long)]
+        dangerous: bool,
+        /// file only: check the write path instead of read
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,6 +323,16 @@ pub async fn run() -> anyhow::Result<()> {
             PairAction::List => pair::list(&db).await,
             PairAction::Approve { code } => pair::approve(&db, &code).await,
             PairAction::Revoke { id } => pair::revoke(&db, &id).await,
+        },
+        Commands::Policy { action } => match action {
+            PolicyAction::List => policy::list(),
+            PolicyAction::Check {
+                category,
+                target,
+                channel,
+                dangerous,
+                write,
+            } => policy::check(&category, &target, channel.as_deref(), dangerous, write),
         },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(),

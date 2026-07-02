@@ -45,15 +45,27 @@ fn channel_of(session_id: &str) -> String {
 #[async_trait]
 impl Approver for PolicyApprover {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
-        // Read-only actions never reach the policy, same as the inner approvers.
+        let channel = current_session().map(|c| channel_of(&c.session_id));
+
+        // Read-only actions get deny-only evaluation: a deny rule can block a
+        // network fetch / file read, but nothing escalates one to a prompt — an
+        // unmatched safe action stays allowed without consulting the inner
+        // approver (which would auto-pass it anyway).
         if request.risk == Risk::Safe {
+            let decision = self.policy.decide(request, channel.as_deref());
+            if decision.verdict == Verdict::Deny {
+                info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
+                      "policy: denied (safe action)");
+                return false;
+            }
             return true;
         }
 
-        let channel = current_session().map(|c| channel_of(&c.session_id));
-        match self.policy.evaluate(request, channel.as_deref()) {
+        let decision = self.policy.decide(request, channel.as_deref());
+        match decision.verdict {
             Verdict::Deny => {
-                info!(summary = %request.summary, channel = ?channel, "policy: denied");
+                info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
+                      "policy: denied");
                 false
             }
             // Auto-allow only within a real session turn. With no session in
@@ -61,7 +73,8 @@ impl Approver for PolicyApprover {
             // channel to scope to, so we never grant unattended — fall through to
             // the inner approver, which denies in that case.
             Verdict::Allow if channel.is_some() => {
-                info!(summary = %request.summary, channel = ?channel, "policy: auto-allowed");
+                info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
+                      "policy: auto-allowed");
                 true
             }
             Verdict::Allow | Verdict::Ask => self.inner.approve(request).await,
@@ -137,6 +150,42 @@ mod tests {
         let allowed = approver.approve(&shell_req()).await;
         assert!(!allowed);
         assert!(*inner.asked.lock().unwrap(), "inner should be consulted");
+    }
+
+    #[tokio::test]
+    async fn safe_action_is_blocked_by_a_deny_rule_without_asking() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: true,
+        });
+        let mut deny = allow_rule("");
+        deny.category = Category::Network;
+        deny.matcher = Matcher::Suffix;
+        deny.value = "internal.corp".to_string();
+        deny.effect = Effect::Deny;
+        let approver = PolicyApprover::wrap(Policy::new(vec![deny], Verdict::Ask), inner.clone());
+
+        let req = ApprovalRequest::safe("fetch").with_action(ActionRef::Network {
+            url: "https://api.internal.corp/secrets".to_string(),
+        });
+        let ctx = SessionContext::detached("cli-session");
+        assert!(!with_session(ctx, approver.approve(&req)).await);
+        assert!(!*inner.asked.lock().unwrap(), "safe deny must not prompt");
+    }
+
+    #[tokio::test]
+    async fn unmatched_safe_action_passes_without_consulting_inner() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(Policy::default(), inner.clone());
+        let req = ApprovalRequest::safe("fetch").with_action(ActionRef::Network {
+            url: "https://example.com".to_string(),
+        });
+        // Even with no session in scope (sweep/aux), safe stays allowed.
+        assert!(approver.approve(&req).await);
+        assert!(!*inner.asked.lock().unwrap());
     }
 
     #[tokio::test]

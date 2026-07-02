@@ -78,7 +78,7 @@ pub async fn build(
         workspace.clone(),
         approver.clone(),
     )));
-    tools.register(Arc::new(WebFetchTool::new()));
+    tools.register(Arc::new(WebFetchTool::new(approver.clone())));
     tools.register(Arc::new(WebSearchTool::new()));
     tools.register(Arc::new(SessionTool::new(db.clone())));
     tools.register(Arc::new(ReminderTool::new(db.clone())));

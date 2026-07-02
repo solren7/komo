@@ -49,6 +49,7 @@ pub async fn doctor(db_url: &str) -> anyhow::Result<()> {
 
     model_health();
     schedule_health();
+    policy_health();
     println!("\nchannels:");
     channel_health();
     home_channel_health(gw.as_ref(), db_url).await;
@@ -128,6 +129,32 @@ fn schedule_health() {
     }
     println!("  reminders    every minute");
     println!("  tasks        every minute");
+}
+
+/// The permission policy: configured?, rule count, load errors.
+fn policy_health() {
+    use crate::domain::policy::Verdict;
+    let report = config::policy_report();
+    println!("\npolicy:");
+    if !report.configured {
+        println!("  {OFF} no [policy] table — Normal/Dangerous actions ask interactively");
+        return;
+    }
+    let d = match report.policy.default_normal() {
+        Verdict::Allow => "allow",
+        Verdict::Deny => "deny",
+        Verdict::Ask => "ask",
+    };
+    println!(
+        "  {OK} {} rule(s), default_normal = {d}  (see `shion policy list`)",
+        report.policy.rules().len()
+    );
+    if !report.invalid.is_empty() {
+        println!(
+            "  {BAD} {} invalid rule(s) ignored — fix [[policy.rule]] in config.toml",
+            report.invalid.len()
+        );
+    }
 }
 
 /// One line per ingress channel: enabled?, credentials present?

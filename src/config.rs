@@ -401,17 +401,35 @@ pub struct PolicyRuleFileConfig {
     pub include_dangerous: Option<bool>,
 }
 
+/// The resolved policy plus load diagnostics (for `shion policy list` / doctor).
+pub struct PolicyReport {
+    pub policy: crate::domain::policy::Policy,
+    /// Config indices (0-based `[[policy.rule]]` order) of ignored invalid rules.
+    pub invalid: Vec<usize>,
+    /// Whether a `[policy]` table was present at all.
+    pub configured: bool,
+}
+
 /// Resolve the permission policy from `~/.shion/config.toml`. Absent `[policy]`
 /// (or any invalid rule) degrades to the empty policy — i.e. the current
 /// interactive-only behavior, never more permissive.
 pub fn policy_config() -> crate::domain::policy::Policy {
-    FileConfig::load(&shion_home())
-        .policy
-        .map(build_policy)
-        .unwrap_or_default()
+    policy_report().policy
 }
 
-fn build_policy(cfg: PolicyFileConfig) -> crate::domain::policy::Policy {
+/// [`policy_config`] with load diagnostics.
+pub fn policy_report() -> PolicyReport {
+    match FileConfig::load(&shion_home()).policy {
+        Some(cfg) => build_policy(cfg),
+        None => PolicyReport {
+            policy: Default::default(),
+            invalid: Vec::new(),
+            configured: false,
+        },
+    }
+}
+
+fn build_policy(cfg: PolicyFileConfig) -> PolicyReport {
     use crate::domain::policy::{Policy, Verdict};
 
     let default_normal = cfg
@@ -421,13 +439,21 @@ fn build_policy(cfg: PolicyFileConfig) -> crate::domain::policy::Policy {
         .unwrap_or(Verdict::Ask);
 
     let mut rules = Vec::new();
+    let mut invalid = Vec::new();
     for (i, r) in cfg.rule.into_iter().enumerate() {
         match build_rule(r) {
             Some(rule) => rules.push(rule),
-            None => eprintln!("shion: [policy] rule #{i} is invalid, ignoring it"),
+            None => {
+                eprintln!("shion: [policy] rule #{i} is invalid, ignoring it");
+                invalid.push(i);
+            }
         }
     }
-    Policy::new(rules, default_normal)
+    PolicyReport {
+        policy: Policy::new(rules, default_normal),
+        invalid,
+        configured: true,
+    }
 }
 
 fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {

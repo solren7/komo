@@ -10,6 +10,7 @@ mod logs;
 mod memory;
 mod model;
 mod pair;
+mod policy;
 mod service;
 mod upgrade;
 mod wechat;

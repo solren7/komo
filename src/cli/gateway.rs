@@ -310,6 +310,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
             pairings.clone(),
             enabled,
             config_home.clone(),
+            db.clone(),
         )));
         channels.push("api");
     }

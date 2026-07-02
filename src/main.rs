@@ -35,8 +35,20 @@ fn init_tracing() {
     // text for any list-returning tool). shion's own `tool ok` span line
     // (name/seq/elapsed, no result) still records each call concisely.
     // `SHION_LOG` overrides the whole filter (e.g. `debug` to see everything).
-    let filter = EnvFilter::try_from_env("SHION_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,toasty=warn,rig_core=warn"));
+    //
+    // For every subcommand except the gateway, toasty's connection-pool ERROR
+    // lines are muted too: a CLI that can't open the db (it's locked by the
+    // running gateway) already surfaces that failure in its own output, and
+    // the raw pool spam would just repeat it. The always-on gateway keeps
+    // them — there they are real diagnostics, not an expected condition.
+    let pool_noise = if std::env::args().nth(1).as_deref() == Some("gateway") {
+        ""
+    } else {
+        ",toasty::db::pool=off"
+    };
+    let filter = EnvFilter::try_from_env("SHION_LOG").unwrap_or_else(|_| {
+        EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}"))
+    });
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

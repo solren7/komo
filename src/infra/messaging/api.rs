@@ -46,6 +46,7 @@ use crate::{
     config::ApiConfig,
     domain::{
         gateway::MessageHandler,
+        home::HomeRepository,
         memory::{
             DreamVerdict, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
             parse_memory_status,
@@ -77,6 +78,9 @@ struct AppState {
     channels: Arc<Vec<String>>,
     /// Resolved config `home_chat` fallback, if any (for `/api/status`).
     home: Option<String>,
+    /// The `/sethome` runtime override lives in the db the gateway holds the
+    /// lock on, so `/api/home` is how the CLI (`shion doctor`) reads it.
+    home_repo: Arc<dyn HomeRepository>,
 }
 
 /// The HTTP API channel. Holds the listen config and the shared handler state.
@@ -101,6 +105,7 @@ impl ApiChannel {
         pairings: Arc<dyn PairingRepository>,
         channels: Vec<String>,
         home: Option<String>,
+        home_repo: Arc<dyn HomeRepository>,
     ) -> Self {
         Self {
             bind: config.bind.clone(),
@@ -118,6 +123,7 @@ impl ApiChannel {
                 pairings,
                 channels: Arc::new(channels),
                 home,
+                home_repo,
             },
         }
     }
@@ -175,6 +181,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/status", get(status))
+        .route("/api/home", get(get_home))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/tasks", get(list_tasks))
@@ -404,6 +411,14 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "open_tasks": open_tasks,
         "sessions": sessions,
     })))
+}
+
+/// The `/sethome` runtime override (`None` when unset). The config `home_chat`
+/// fallback is *not* resolved here — the CLI derives it from the same
+/// config.toml locally; only the db-held override needs the gateway.
+async fn get_home(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let over = state.home_repo.get().await?;
+    Ok(Json(json!({ "override": over })))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

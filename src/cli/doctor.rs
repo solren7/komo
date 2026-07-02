@@ -11,7 +11,12 @@
 //! reuses the very `*_config()` resolvers the gateway uses, where `Ok(None)` =
 //! disabled, `Ok(Some)` = ready, and `Err` = enabled-but-misconfigured (the
 //! error message names the missing credential).
+//!
+//! The two db-backed sections (home override, run ledger) follow the standard
+//! CLI read path: a reachable gateway → `GET /api/*` (it holds the exclusive
+//! db lock); none → open the db directly.
 
+use crate::cli::gateway_client::GatewayClient;
 use crate::config::{
     self, FileConfig, Provider, Secrets, ShionEnv, api_config, feishu_config,
     homeassistant_channel_config, homeassistant_config, telegram_config, wechat_config,
@@ -19,6 +24,7 @@ use crate::config::{
 };
 use crate::domain::{home::HomeRepository, run::RunRepository};
 use crate::infra::persistence::db::Db;
+use crate::infra::rendezvous;
 
 /// Status glyph for a channel/credential line.
 const OK: &str = "✓";
@@ -35,13 +41,36 @@ pub async fn doctor(db_url: &str) -> anyhow::Result<()> {
     let home = config::shion_home();
     println!("home: {}", home.display());
 
+    // One probe reused by every db-backed section: reachable gateway → read
+    // over its api channel (it holds the exclusive db lock); none → open the
+    // db directly.
+    let gw = GatewayClient::try_connect().await;
+    gateway_health(gw.is_some());
+
     model_health();
     schedule_health();
     println!("\nchannels:");
     channel_health();
-    home_channel_health(db_url).await;
-    run_health(db_url).await;
+    home_channel_health(gw.as_ref(), db_url).await;
+    run_health(gw.as_ref(), db_url).await;
     Ok(())
+}
+
+/// Is a gateway process actually running and answering? (The channel lines
+/// below describe *configuration*; this is the live process.)
+fn gateway_health(reachable: bool) {
+    match (rendezvous::read(), reachable) {
+        (Some(info), true) => println!(
+            "\ngateway: {OK} running (pid {}, api {}:{})",
+            info.pid, info.bind, info.port
+        ),
+        (Some(info), false) => println!(
+            "\ngateway: {BAD} advertised (pid {}) but not answering — stale {} or mid-restart?",
+            info.pid,
+            rendezvous::path().display()
+        ),
+        (None, _) => println!("\ngateway: {OFF} not running (db opened directly)"),
+    }
 }
 
 /// Provider/model resolution and whether the provider's API key is present.
@@ -157,22 +186,26 @@ fn channel_health() {
 
 /// Resolved proactive-output home: the `/sethome` runtime override (db) wins
 /// over the config `home_chat` fallback (feishu first).
-async fn home_channel_health(db_url: &str) {
+async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
     println!("\nhome channel (proactive output):");
-    match Db::connect(db_url).await {
-        Ok(db) => match HomeRepository::get(&db).await {
-            Ok(Some(session)) => println!("  {OK} /sethome override → {session}"),
-            Ok(None) => match config_home_chat() {
-                Some((platform, chat)) => {
-                    println!("  {OK} config home_chat → {platform}:{chat}")
-                }
-                None => {
-                    println!("  {OFF} none set — proactive output falls back to the macOS notifier")
-                }
-            },
-            Err(e) => println!("  {BAD} could not read home setting: {e}"),
+    let over = match gw {
+        Some(gw) => gw.home_override().await,
+        None => match Db::connect(db_url).await {
+            Ok(db) => HomeRepository::get(&db).await,
+            Err(e) => Err(e.into()),
         },
-        Err(e) => println!("  {BAD} could not open db: {e}"),
+    };
+    match over {
+        Ok(Some(session)) => println!("  {OK} /sethome override → {session}"),
+        Ok(None) => match config_home_chat() {
+            Some((platform, chat)) => {
+                println!("  {OK} config home_chat → {platform}:{chat}")
+            }
+            None => {
+                println!("  {OFF} none set — proactive output falls back to the macOS notifier")
+            }
+        },
+        Err(e) => println!("  {BAD} could not read home setting: {e:#}"),
     }
 }
 
@@ -198,19 +231,19 @@ fn config_home_chat() -> Option<(&'static str, String)> {
 
 /// Recent run-ledger health: how many of the last 50 turns failed, with the
 /// most recent few. The roadmap §9 "last error" view.
-async fn run_health(db_url: &str) {
+async fn run_health(gw: Option<&GatewayClient>, db_url: &str) {
     println!("\nrecent runs:");
-    let db = match Db::connect(db_url).await {
-        Ok(db) => db,
-        Err(e) => {
-            println!("  {BAD} could not open db: {e}");
-            return;
-        }
+    let fetched = match gw {
+        Some(gw) => gw.runs(50).await,
+        None => match Db::connect(db_url).await {
+            Ok(db) => RunRepository::list(&db, 50).await,
+            Err(e) => Err(e),
+        },
     };
-    let runs = match RunRepository::list(&db, 50).await {
+    let runs = match fetched {
         Ok(r) => r,
         Err(e) => {
-            println!("  {BAD} could not read run ledger: {e}");
+            println!("  {BAD} could not read run ledger: {e:#}");
             return;
         }
     };

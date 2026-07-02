@@ -139,6 +139,12 @@ impl GatewayClient {
         self.get_field("/api/pairings", "pairings").await
     }
 
+    /// The `/sethome` runtime override (`None` when unset). The config
+    /// `home_chat` fallback is derived locally from the same config.toml.
+    pub async fn home_override(&self) -> anyhow::Result<Option<String>> {
+        self.get_field("/api/home", "override").await
+    }
+
     /// The dreaming dry-run: `(promote, archive)` candidate lists.
     pub async fn dream_preview(&self) -> anyhow::Result<(Vec<DreamItem>, Vec<DreamItem>)> {
         let mut map: Map<String, Value> = self

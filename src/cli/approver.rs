@@ -61,23 +61,21 @@ impl Approver for CliApprover {
 
         // Session cache: the user already said "allow for this session" for
         // this kind of action.
-        if let Some(key) = &request.scope_key {
-            if self.session_allowed.lock().unwrap().contains(key) {
+        if let Some(key) = &request.scope_key
+            && self.session_allowed.lock().unwrap().contains(key) {
                 println!("✓ auto-approved (session): {}", request.summary);
                 return true;
             }
-        }
 
         // Serialize concurrent prompts onto the single TTY (a round's tools run
         // concurrently) so their stdin reads don't interleave. Held across the
         // blocking read below.
         let _guard = self.prompt_gate.lock().await;
         // A concurrent prompt may have just cached "session" for this scope.
-        if let Some(key) = &request.scope_key {
-            if self.session_allowed.lock().unwrap().contains(key) {
+        if let Some(key) = &request.scope_key
+            && self.session_allowed.lock().unwrap().contains(key) {
                 return true;
             }
-        }
 
         // The prompt + stdin read is blocking; run it off the async runtime.
         let prompt = prompt_text(request);

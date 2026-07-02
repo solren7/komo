@@ -192,11 +192,10 @@ impl Approver for ChatApprover {
         }
 
         // Already approved this kind of action for the session?
-        if let Some(key) = &request.scope_key {
-            if self.state.is_session_approved(&ctx.session_id, key) {
+        if let Some(key) = &request.scope_key
+            && self.state.is_session_approved(&ctx.session_id, key) {
                 return true;
             }
-        }
 
         // Serialize concurrent approvals for this session (a round's tools run
         // concurrently now) so they don't race the single `pending` slot. Held
@@ -205,11 +204,10 @@ impl Approver for ChatApprover {
         let _guard = gate.lock().await;
         // A concurrent approval may have granted this scope "for session" while
         // we waited on the gate — re-check so we don't prompt twice for it.
-        if let Some(key) = &request.scope_key {
-            if self.state.is_session_approved(&ctx.session_id, key) {
+        if let Some(key) = &request.scope_key
+            && self.state.is_session_approved(&ctx.session_id, key) {
                 return true;
             }
-        }
 
         if let Err(error) = ctx.sink.send(&prompt(request)).await {
             warn!(%error, "failed to send approval prompt; denying");

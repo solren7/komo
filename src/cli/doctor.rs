@@ -192,7 +192,7 @@ async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
         Some(gw) => gw.home_override().await,
         None => match Db::connect(db_url).await {
             Ok(db) => HomeRepository::get(&db).await,
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         },
     };
     match over {
@@ -211,21 +211,18 @@ async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
 
 /// The config `home_chat` fallback, feishu-first (matches `HomeNotifier`).
 fn config_home_chat() -> Option<(&'static str, String)> {
-    if let Ok(Some(c)) = feishu_config() {
-        if let Some(chat) = c.home_chat {
+    if let Ok(Some(c)) = feishu_config()
+        && let Some(chat) = c.home_chat {
             return Some(("feishu", chat));
         }
-    }
-    if let Ok(Some(c)) = telegram_config() {
-        if let Some(chat) = c.home_chat {
+    if let Ok(Some(c)) = telegram_config()
+        && let Some(chat) = c.home_chat {
             return Some(("telegram", chat));
         }
-    }
-    if let Ok(Some(c)) = wechat_config() {
-        if let Some(chat) = c.home_chat {
+    if let Ok(Some(c)) = wechat_config()
+        && let Some(chat) = c.home_chat {
             return Some(("wechat", chat));
         }
-    }
     None
 }
 

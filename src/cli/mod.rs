@@ -1,6 +1,6 @@
+mod app;
 mod approver;
 mod chat;
-mod cli;
 mod doctor;
 mod dream;
 mod gateway;
@@ -16,4 +16,4 @@ mod wechat;
 mod wiring;
 mod workday;
 
-pub use cli::run;
+pub use app::run;

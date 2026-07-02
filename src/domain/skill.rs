@@ -16,7 +16,7 @@ impl Skill {
         let fence = rest.find("\n---")?;
         let front = &rest[..fence];
         let body = rest[fence + "\n---".len()..]
-            .trim_start_matches(|c| c == '-')
+            .trim_start_matches('-')
             .trim_start_matches(['\n', '\r'])
             .trim()
             .to_string();

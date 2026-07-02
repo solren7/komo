@@ -69,11 +69,10 @@ pub fn write(info: &GatewayInfo) {
 /// Remove the rendezvous file on shutdown. Best-effort (missing file is fine).
 pub fn clear() {
     let p = path();
-    if let Err(error) = std::fs::remove_file(&p) {
-        if error.kind() != std::io::ErrorKind::NotFound {
+    if let Err(error) = std::fs::remove_file(&p)
+        && error.kind() != std::io::ErrorKind::NotFound {
             warn!(%error, path = %p.display(), "failed to clear gateway rendezvous");
         }
-    }
 }
 
 /// Read the rendezvous file, if present and parseable. `None` means "no gateway

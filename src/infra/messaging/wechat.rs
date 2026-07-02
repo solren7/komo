@@ -61,7 +61,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Construct the shared bot. Created once at wiring time and handed to *both*
 /// the sender and the channel so they share the in-memory `context_token` map
 /// (see the module docs on proactive sends).
-pub fn build_bot(cred_path: &PathBuf) -> Arc<WeChatBot> {
+pub fn build_bot(cred_path: &std::path::Path) -> Arc<WeChatBot> {
     Arc::new(WeChatBot::new(BotOptions {
         cred_path: Some(cred_path.to_string_lossy().into_owned()),
         on_qr_url: Some(Box::new(|_| {

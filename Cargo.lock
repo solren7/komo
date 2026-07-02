@@ -2215,9 +2215,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
+checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
 ]
@@ -4003,7 +4003,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "turso 0.7.0-pre.14",
+ "turso 0.7.0-pre.17",
  "uuid",
  "wechatbot",
 ]
@@ -5048,17 +5048,17 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "299b9f6a6e33687ed23d0ec532a67f11e2ac349695d94927f6ea76fddea9ea25"
+checksum = "fc8e938f54b9f25d016e51a8e2743265ca86c2e288a453edf43707855990f62b"
 dependencies = [
  "mimalloc",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "turso_core 0.7.0-pre.14",
- "turso_sdk_kit 0.7.0-pre.14",
- "turso_sync_sdk_kit 0.7.0-pre.14",
+ "turso_core 0.7.0-pre.17",
+ "turso_sdk_kit 0.7.0-pre.17",
+ "turso_sync_sdk_kit 0.7.0-pre.17",
 ]
 
 [[package]]
@@ -5129,9 +5129,9 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5b55b17fb21a0b19d8d077a01122a8c66e195d1b75bec6b9930734afa88a34e"
+checksum = "2833cab0ea866efec1ea02e26203efbd53c6a7c485c73b6dc2cafe002e22045d"
 dependencies = [
  "aegis",
  "aes",
@@ -5188,9 +5188,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "turso_ext 0.7.0-pre.14",
- "turso_macros 0.7.0-pre.14",
- "turso_parser 0.7.0-pre.14",
+ "turso_ext 0.7.0-pre.17",
+ "turso_macros 0.7.0-pre.17",
+ "turso_parser 0.7.0-pre.17",
  "twox-hash",
  "uncased",
  "uuid",
@@ -5210,13 +5210,13 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b19daf4d6408c6d1b743abc3153ba97368ebc3500363bfba3e95e673a1247147"
+checksum = "3c0ec8083de813d3630ba549c0b09117f04e9779d0739e7c2075f3efa9adb1c2"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
- "turso_macros 0.7.0-pre.14",
+ "turso_macros 0.7.0-pre.17",
 ]
 
 [[package]]
@@ -5232,9 +5232,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e9b20f19d353fe2cacc35164f4155d795214ecff43a8dbcd90f72fb25915ad"
+checksum = "f5baf85c7a8d37ac4b4640517de1770356500405ebbaf1702545ecb2da45789b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5258,9 +5258,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a1801faa9b540001f4e6686af97733506389fedaf18f1fafbad75195523d7fe"
+checksum = "ab8d16ed7c1d7e983e0c7ce0c94d475a2e71aa9e16ca280777292b2e96e01062"
 dependencies = [
  "bitflags",
  "memchr",
@@ -5268,7 +5268,7 @@ dependencies = [
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "thiserror 2.0.18",
- "turso_macros 0.7.0-pre.14",
+ "turso_macros 0.7.0-pre.17",
 ]
 
 [[package]]
@@ -5289,9 +5289,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1038dcaa88536044e984dd58c39c2475f9d1e8218a705338d750b19ad3fd36f"
+checksum = "6ecb12e8bfb7d14b1636537d0d5b266cbf06e51b38eb51fc13a8fc2575e61e31"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -5299,9 +5299,9 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "turso_core 0.7.0-pre.14",
- "turso_ext 0.7.0-pre.14",
- "turso_sdk_kit_macros 0.7.0-pre.14",
+ "turso_core 0.7.0-pre.17",
+ "turso_ext 0.7.0-pre.17",
+ "turso_sdk_kit_macros 0.7.0-pre.17",
 ]
 
 [[package]]
@@ -5317,9 +5317,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c190704cfe45db7f4731d0cd8de26b49a5902910733bba5321741c175b52a022"
+checksum = "5cf97ad2566dc6003c050c42f152ac16bb1cd4c2eb39080b41be3ab838baac21"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5350,9 +5350,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8463a1555f92185e353c4aa14838fe57c2561a9913dea5bb0cd1edddabc48c9"
+checksum = "1fecd94cac87afde8966ebadd83cd0d4b90d888206e25a7894fe1b51251985f7"
 dependencies = [
  "base64",
  "bytes",
@@ -5365,8 +5365,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "turso_core 0.7.0-pre.14",
- "turso_parser 0.7.0-pre.14",
+ "turso_core 0.7.0-pre.17",
+ "turso_parser 0.7.0-pre.17",
  "uuid",
 ]
 
@@ -5391,9 +5391,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.7.0-pre.14"
+version = "0.7.0-pre.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fc34f0a65bb280306aa18e2549f4ba4b3ad4ea26e1cbe8c1ec3bab22cb67603"
+checksum = "75465ffd4cbad0b27d348a521876d7ba4555a943866e3c6b82366669b05673a0"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -5402,10 +5402,10 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "turso_core 0.7.0-pre.14",
- "turso_sdk_kit 0.7.0-pre.14",
- "turso_sdk_kit_macros 0.7.0-pre.14",
- "turso_sync_engine 0.7.0-pre.14",
+ "turso_core 0.7.0-pre.17",
+ "turso_sdk_kit 0.7.0-pre.17",
+ "turso_sdk_kit_macros 0.7.0-pre.17",
+ "turso_sync_engine 0.7.0-pre.17",
 ]
 
 [[package]]
@@ -5740,9 +5740,9 @@ dependencies = [
 
 [[package]]
 name = "wechatbot"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0333abbfb2c2551e0f6559bc497e3e6da8834ad15804847e227cb8299829789"
+checksum = "e65c5449be0a1a049164bf8f056cd87e9e505eb2d1d83230de1f215fcaba8b58"
 dependencies = [
  "aes",
  "base64",

@@ -24,6 +24,7 @@ use crate::{
         llm::{PreambleFn, build_llm},
         memory::memory_db::MemoryDb,
         persistence::{db::Db, kanban::KanbanDb},
+        skills::FsSkillStore,
     },
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
@@ -44,6 +45,9 @@ pub struct Wiring {
     pub aux_llm: Arc<dyn LlmClient>,
     /// The markdown memory store, also read by the briefing sweep.
     pub memories: Arc<dyn MemoryRepository>,
+    /// The governed skill store (`~/.shion/skills`, files — roadmap §9), shared
+    /// with the gateway's api channel.
+    pub skills: Arc<FsSkillStore>,
 }
 
 /// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
@@ -121,10 +125,26 @@ pub async fn build(
     let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble, None, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
+    // The governed skill store: `~/.shion/skills` is the shion-owned home for
+    // durable skills (files, not db — roadmap §9). Reviewer proposals land in
+    // its `.candidates/` for triage; a one-time import moves any skills a
+    // pre-filesystem shion accumulated in shion.db into that triage pile.
+    let skill_store = Arc::new(FsSkillStore::new(FsSkillStore::default_root()));
+    match db.export_legacy_skills().await {
+        Ok(rows) if !rows.is_empty() => match skill_store.import_legacy_db(rows) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(n, "imported legacy shion.db skills as candidates"),
+            Err(error) => tracing::warn!(%error, "legacy skill import failed"),
+        },
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to read legacy db skills"),
+    }
+
     // Skills load from, in priority order (first to define a name wins):
     //   SHION_SKILLS_PATH (colon-separated), <workspace>/skills,
-    //   <workspace>/.claude/skills, and the user-global ~/.claude/skills shared
-    //   by general agents (Claude Agent Skills `SKILL.md` format).
+    //   <workspace>/.claude/skills, the governed ~/.shion/skills store, and the
+    //   user-global ~/.claude/skills shared by general agents (Claude Agent
+    //   Skills `SKILL.md` format).
     let env = crate::config::ShionEnv::load()?;
     let root = workspace.roots().first().cloned().unwrap_or_default();
     let mut skill_dirs: Vec<PathBuf> = Vec::new();
@@ -138,6 +158,7 @@ pub async fn build(
     }
     skill_dirs.push(root.join("skills"));
     skill_dirs.push(root.join(".claude/skills"));
+    skill_dirs.push(skill_store.root().to_path_buf());
     if let Some(home) = dirs::home_dir() {
         skill_dirs.push(home.join(".claude/skills"));
     }
@@ -180,7 +201,7 @@ pub async fn build(
         Some(memory_repo.clone()),
         Some(aux_llm.clone()),
     )?;
-    let skill_repo: Arc<dyn SkillRepository> = db.clone();
+    let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
         aux_llm.clone(),
         memory_repo.clone(),
@@ -210,5 +231,6 @@ pub async fn build(
         reviewer,
         aux_llm,
         memories: memory_repo,
+        skills: skill_store,
     })
 }

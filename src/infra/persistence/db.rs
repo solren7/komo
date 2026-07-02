@@ -16,7 +16,7 @@ use crate::domain::{
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
-    repository::{MessageRepository, SessionRepository, SkillRepository},
+    repository::{MessageRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
@@ -232,52 +232,19 @@ impl Db {
     }
 }
 
-// ── SkillRepository ───────────────────────────────────────────────────────────
+// ── legacy skills (read-only) ─────────────────────────────────────────────────
 
-#[async_trait]
-impl SkillRepository for Db {
-    async fn find(&self, name: &str) -> anyhow::Result<Option<Skill>> {
-        let mut conn = self.inner.connection().await?;
-        match SkillRecord::get_by_name(&mut conn, name).await {
-            Ok(record) => Ok(Some(skill_from_record(record))),
-            Err(_) => Ok(None),
-        }
-    }
-
-    async fn list(&self) -> anyhow::Result<Vec<Skill>> {
+impl Db {
+    /// The skills a pre-filesystem shion accumulated in `shion.db` (the
+    /// reviewer used to write here; the runtime never read it). Read-only:
+    /// skills now live as files under `~/.shion/skills` (`infra/skills.rs`),
+    /// and this backs the one-time candidate import at wiring time. The
+    /// `SkillRecord` table stays in the schema only so old dbs remain readable.
+    pub async fn export_legacy_skills(&self) -> anyhow::Result<Vec<Skill>> {
         let mut conn = self.inner.connection().await?;
         let mut rows = toasty::query!(SkillRecord).exec(&mut conn).await?;
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rows.into_iter().map(skill_from_record).collect())
-    }
-
-    async fn save(&self, skill: &Skill) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            match SkillRecord::get_by_name(&mut conn, &skill.name).await {
-                Ok(mut record) => {
-                    record
-                        .update()
-                        .description(skill.description.clone())
-                        .instructions(skill.instructions.clone())
-                        .protected(skill.protected)
-                        .exec(&mut conn)
-                        .await?;
-                }
-                Err(_) => {
-                    toasty::create!(SkillRecord {
-                        name: skill.name.clone(),
-                        description: skill.description.clone(),
-                        instructions: skill.instructions.clone(),
-                        protected: skill.protected,
-                    })
-                    .exec(&mut conn)
-                    .await?;
-                }
-            }
-            Ok(())
-        })
-        .await
     }
 }
 
@@ -984,6 +951,10 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         description: record.description,
         instructions: record.instructions,
         protected: record.protected,
+        disabled: false,
+        // Every db-era skill was a reviewer extraction (there was no other
+        // writer); tag it so the imported candidate shows its provenance.
+        source: crate::domain::skill::SOURCE_REVIEWER.to_string(),
     }
 }
 
@@ -1519,37 +1490,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_repository_upserts_by_name() {
+    async fn legacy_skills_export_reads_old_rows() {
+        // Skills now live as files (`infra/skills.rs`); the db only backs the
+        // one-time candidate import. Seed a legacy row directly and check the
+        // export maps it with reviewer provenance.
         let db = Db::connect(&sqlite_url("shion_skill_repo_test.db"))
             .await
             .unwrap();
-        let skill = Skill {
+        let mut conn = db.inner.connection().await.unwrap();
+        toasty::create!(SkillRecord {
             name: "debug-builds".to_string(),
             description: "Debug build failures".to_string(),
             instructions: "Check compiler errors first.".to_string(),
             protected: true,
-        };
-
-        SkillRepository::save(&db, &skill).await.unwrap();
-        SkillRepository::save(
-            &db,
-            &Skill {
-                instructions: "Check compiler errors, then run focused tests.".to_string(),
-                ..skill.clone()
-            },
-        )
+        })
+        .exec(&mut conn)
         .await
         .unwrap();
+        drop(conn);
 
-        let found = SkillRepository::find(&db, "debug-builds")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(found.protected);
-        assert!(found.instructions.contains("focused tests"));
-
-        let rows = SkillRepository::list(&db).await.unwrap();
+        let rows = db.export_legacy_skills().await.unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "debug-builds");
+        assert!(rows[0].protected);
+        assert_eq!(rows[0].source, crate::domain::skill::SOURCE_REVIEWER);
     }
 
     #[tokio::test]

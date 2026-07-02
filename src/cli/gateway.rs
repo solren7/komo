@@ -296,7 +296,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         let runs: Arc<dyn RunRepository> = db.clone();
         let memories: Arc<dyn MemoryRepository> = wired.memories.clone();
         let reminders: Arc<dyn ReminderRepository> = db.clone();
-        let skills: Arc<dyn SkillRepository> = db.clone();
+        let skills: Arc<dyn SkillRepository> = wired.skills.clone();
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
             &api,
             handler.clone(),

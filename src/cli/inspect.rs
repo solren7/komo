@@ -7,7 +7,7 @@ use crate::{
     cli::gateway_client::{GatewayClient, refuse_if_gateway_running},
     domain::{
         reminder::ReminderRepository,
-        repository::{SessionRepository, SkillRepository},
+        repository::SessionRepository,
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
@@ -217,20 +217,30 @@ pub async fn run_keep_cutoff(db_url: &str, keep: usize) -> anyhow::Result<Option
     Ok(runs.get(keep).map(|r| r.started_at))
 }
 
-/// List registered skills (name, protected flag, and a one-line description).
-pub async fn skill_list(db_url: &str) -> anyhow::Result<()> {
-    let mut skills = match GatewayClient::try_connect().await {
-        Some(gw) => gw.skills().await?,
-        None => SkillRepository::list(&Db::connect(db_url).await?).await?,
-    };
-    if skills.is_empty() {
-        println!("No skills registered.");
+/// List the governed skill store (`~/.shion/skills`): active skills first,
+/// then reviewer candidates awaiting triage. Pure file reads — works whether
+/// or not the gateway is running (no db lock involved). Workspace-local skill
+/// dirs are per-repo and listed by the agent's own `skill` tool instead.
+pub fn skill_list() -> anyhow::Result<()> {
+    let store = crate::infra::skills::FsSkillStore::new(
+        crate::infra::skills::FsSkillStore::default_root(),
+    );
+    let active = store.list_active();
+    let candidates = store.list_candidates();
+    if active.is_empty() && candidates.is_empty() {
+        println!("No skills in {}.", store.root().display());
         return Ok(());
     }
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    for s in skills {
+    for s in &active {
         let lock = if s.protected { " 🔒" } else { "" };
-        println!("{}{}  {}", s.name, lock, oneline(&s.description, 80));
+        let off = if s.disabled { " [disabled]" } else { "" };
+        println!("{}{}{}  {}", s.name, lock, off, oneline(&s.description, 80));
+    }
+    if !candidates.is_empty() {
+        println!("\ncandidates (`shion skill promote|reject <name>`):");
+        for s in &candidates {
+            println!("  {}  [{}]  {}", s.name, s.source, oneline(&s.description, 80));
+        }
     }
     Ok(())
 }

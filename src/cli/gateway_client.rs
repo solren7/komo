@@ -20,7 +20,6 @@ use crate::domain::{
     memory::Memory,
     reminder::Reminder,
     run::{Run, RunStep},
-    skill::Skill,
     task::Task,
 };
 use crate::infra::messaging::api::{DreamItem, PairingView, ResumeOutcome, SessionSummary};
@@ -157,10 +156,6 @@ impl GatewayClient {
 
     pub async fn reminders(&self) -> anyhow::Result<Vec<Reminder>> {
         self.get_field("/api/reminders", "reminders").await
-    }
-
-    pub async fn skills(&self) -> anyhow::Result<Vec<Skill>> {
-        self.get_field("/api/skills", "skills").await
     }
 
     pub async fn pairings(&self) -> anyhow::Result<Vec<PairingView>> {

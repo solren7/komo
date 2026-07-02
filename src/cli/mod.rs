@@ -13,6 +13,7 @@ mod pair;
 mod policy;
 mod resume;
 mod service;
+mod skill;
 mod upgrade;
 mod wechat;
 mod wiring;

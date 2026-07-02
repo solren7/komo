@@ -100,6 +100,8 @@ mod tests {
             description: "Say hello".to_string(),
             instructions: "Greet the user warmly.".to_string(),
             protected: false,
+            disabled: false,
+            source: "user".to_string(),
         }]))
     }
 

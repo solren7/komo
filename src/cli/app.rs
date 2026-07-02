@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 use super::{
     chat, doctor, dream, gateway, inspect, logs, memory, model, pair, policy, resume, service,
-    upgrade, wechat, workday,
+    skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -237,8 +237,38 @@ enum MemoryAction {
 
 #[derive(Subcommand)]
 enum SkillAction {
-    /// List registered skills (name, protected flag, description)
+    /// List the governed skill store: active skills, then reviewer candidates
     List,
+    /// Accept a reviewer candidate into the active store
+    Promote {
+        /// Skill name (as shown under `candidates` in `skill list`)
+        name: String,
+    },
+    /// Discard a reviewer candidate
+    Reject {
+        /// Skill name
+        name: String,
+    },
+    /// Mark a skill operator-edit-only (the reviewer stops proposing changes)
+    Protect {
+        /// Skill name
+        name: String,
+    },
+    /// Clear the protected flag
+    Unprotect {
+        /// Skill name
+        name: String,
+    },
+    /// Re-enable a disabled skill
+    Enable {
+        /// Skill name
+        name: String,
+    },
+    /// Hide a skill from the agent without deleting it
+    Disable {
+        /// Skill name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -330,7 +360,13 @@ pub async fn run() -> anyhow::Result<()> {
             dream::run(&crate::config::default_memory_db_url(), apply).await
         }
         Commands::Skill { action } => match action {
-            SkillAction::List => inspect::skill_list(&db).await,
+            SkillAction::List => inspect::skill_list(),
+            SkillAction::Promote { name } => skill::promote(&name),
+            SkillAction::Reject { name } => skill::reject(&name),
+            SkillAction::Protect { name } => skill::protect(&name, true),
+            SkillAction::Unprotect { name } => skill::protect(&name, false),
+            SkillAction::Enable { name } => skill::set_enabled(&name, true),
+            SkillAction::Disable { name } => skill::set_enabled(&name, false),
         },
         Commands::Doctor => doctor::doctor(&db).await,
         Commands::Pair { action } => match action {

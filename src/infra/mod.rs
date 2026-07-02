@@ -3,6 +3,7 @@ pub mod codex;
 pub mod llm;
 pub mod rendezvous;
 pub mod rig_tool;
+pub mod skills;
 pub mod workday;
 
 // Layered infra by concern

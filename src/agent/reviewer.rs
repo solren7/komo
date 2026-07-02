@@ -13,7 +13,7 @@ use crate::domain::{
     repository::SkillRepository,
     reviewer::{ReviewOutcome, Reviewer, SELF_REVIEW_PROMPT},
     session::Session,
-    skill::Skill,
+    skill::{SOURCE_REVIEWER, Skill},
     task::{Task, TaskRepository, TaskStatus},
 };
 
@@ -119,6 +119,12 @@ impl Reviewer for ReflectiveReviewer {
                 continue;
             }
             let existing = self.skills.find(&suggestion.name).await?;
+            // Protected = operator edits only: no candidate proposal either,
+            // so a "just promote it" nudge can never overwrite the operator's
+            // version (roadmap §9 — protection guards proposal *generation*).
+            if existing.as_ref().is_some_and(|s| s.protected) {
+                continue;
+            }
             let skill = Skill {
                 name: suggestion.name,
                 description: suggestion
@@ -126,9 +132,17 @@ impl Reviewer for ReflectiveReviewer {
                     .or_else(|| existing.as_ref().map(|s| s.description.clone()))
                     .unwrap_or_default(),
                 instructions: suggestion.instructions,
-                protected: existing.map(|s| s.protected).unwrap_or(false),
+                protected: false,
+                disabled: false,
+                source: SOURCE_REVIEWER.to_string(),
             };
-            self.skills.save(&skill).await?;
+            // `save` writes a *candidate* (never an active skill) — automated
+            // extraction goes through triage like memory candidates. A refused
+            // proposal (bad name, protected race) must not fail the review.
+            if let Err(error) = self.skills.save(&skill).await {
+                tracing::warn!(%error, name = %skill.name, "skill proposal not written");
+                continue;
+            }
             outcome.skills_written.push(skill.name);
         }
 

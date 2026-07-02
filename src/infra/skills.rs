@@ -138,11 +138,7 @@ impl FsSkillStore {
         self.update_active(name, |s| s.disabled = on)
     }
 
-    fn update_active(
-        &self,
-        name: &str,
-        mutate: impl FnOnce(&mut Skill),
-    ) -> anyhow::Result<Skill> {
+    fn update_active(&self, name: &str, mutate: impl FnOnce(&mut Skill)) -> anyhow::Result<Skill> {
         let Some(mut skill) = self.find_active(name) else {
             anyhow::bail!("no active skill named `{name}` in {}", self.root.display());
         };
@@ -180,7 +176,10 @@ impl FsSkillStore {
             }
         }
         fs::create_dir_all(&self.root)?;
-        fs::write(&marker, "legacy shion.db skills were imported as candidates\n")?;
+        fs::write(
+            &marker,
+            "legacy shion.db skills were imported as candidates\n",
+        )?;
         Ok(imported)
     }
 
@@ -359,10 +358,7 @@ mod tests {
                 .instructions
                 .contains("v2 body")
         );
-        let history = store
-            .candidates_root()
-            .join("sync-cal")
-            .join(HISTORY_DIR);
+        let history = store.candidates_root().join("sync-cal").join(HISTORY_DIR);
         assert_eq!(fs::read_dir(history).unwrap().count(), 1);
     }
 

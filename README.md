@@ -39,7 +39,10 @@ shion session clean              # delete empty sessions
 shion cron list                  # pending reminders and next fire times
 shion task list                  # open durable tasks
 shion memory list                # memory candidates/active items
-shion run list                   # recent agent turns
+shion run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
+shion run resume                 # re-dispatch the last interrupted turn from the run ledger
+shion skill list                 # governed skills + reviewer candidates awaiting triage
+shion skill promote <name>       # accept a reviewer-proposed skill into the active store
 ```
 
 ## Gateway (always-on background process)
@@ -80,7 +83,7 @@ The agent can call these during a chat turn:
 | `homeassistant` | Read and control Home Assistant entities when configured |
 | `session` | Look up past conversations |
 | `delegate` | Hand a sub-task to a cheaper auxiliary model |
-| `skill` | Run user-defined skills from `skills/` |
+| `skill` | Load skills: workspace `skills/`·`.claude/skills/` dirs + the governed `~/.shion/skills` store |
 | `time` | Current time (RFC 3339 UTC) |
 
 ## Data Layout
@@ -92,11 +95,12 @@ Everything lives in `~/.shion/` by default, or under `SHION_HOME` when set.
 | `shion.db` | disposable session state: messages, todos, pairings, settings, reminders, run ledger |
 | `kanban.db` | durable cross-session tasks |
 | `memory.db` | durable long-term memories |
+| `skills/` | durable governed skills (`SKILL.md` files; reviewer proposals in `skills/.candidates/`) |
 | `config.toml` | provider/model/channel behavior |
 | `.env` | API keys and channel credentials |
 
-Delete `shion.db` freely to reset development state. Do not delete `kanban.db`
-or `memory.db` unless you intend to wipe durable personal data.
+Delete `shion.db` freely to reset development state. Do not delete `kanban.db`,
+`memory.db`, or `skills/` unless you intend to wipe durable personal data.
 
 ## Configuration
 

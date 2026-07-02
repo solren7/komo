@@ -1,6 +1,6 @@
 # PRD: run resume——从 run ledger 恢复中断任务(roadmap §6 / 推荐顺序 #3)
 
-Status: ready-for-human (design review)
+Status: shipped (implemented 2026-07-03; see git log)
 
 ## 背景与现状
 

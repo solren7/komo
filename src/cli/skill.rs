@@ -10,9 +10,7 @@ use crate::{
     cli::{gateway_client::GatewayClient, inspect::local_time},
     domain::run::RunRepository,
     infra::{
-        messaging::api::skill_invocations_from_steps,
-        persistence::db::Db,
-        skills::FsSkillStore,
+        messaging::api::skill_invocations_from_steps, persistence::db::Db, skills::FsSkillStore,
     },
 };
 
@@ -42,7 +40,10 @@ pub fn reject(name: &str) -> anyhow::Result<()> {
 pub fn protect(name: &str, on: bool) -> anyhow::Result<()> {
     let skill = store().set_protected(name, on)?;
     if skill.protected {
-        println!("Protected `{}` — the reviewer will no longer propose changes to it.", skill.name);
+        println!(
+            "Protected `{}` — the reviewer will no longer propose changes to it.",
+            skill.name
+        );
     } else {
         println!("Unprotected `{}`.", skill.name);
     }
@@ -54,7 +55,10 @@ pub fn protect(name: &str, on: bool) -> anyhow::Result<()> {
 pub fn set_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
     let skill = store().set_disabled(name, !enabled)?;
     if skill.disabled {
-        println!("Disabled `{}` — kept on disk, hidden from the agent. {RESTART_HINT}", skill.name);
+        println!(
+            "Disabled `{}` — kept on disk, hidden from the agent. {RESTART_HINT}",
+            skill.name
+        );
     } else {
         println!("Enabled `{}`. {RESTART_HINT}", skill.name);
     }
@@ -89,7 +93,11 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
     }
     let history = store.candidate_history(name);
     if !history.is_empty() {
-        println!("history    {} prior version(s): {}", history.len(), history.join(", "));
+        println!(
+            "history    {} prior version(s): {}",
+            history.len(),
+            history.join(", ")
+        );
     }
     println!("audit      `shion skill audit {name}` shows which turns loaded it");
     println!("\n{}", skill.instructions);
@@ -115,7 +123,13 @@ pub async fn audit(db_url: &str, name: &str) -> anyhow::Result<()> {
     }
     for i in &invocations {
         let mark = if i.ok { "ok " } else { "ERR" };
-        println!("{}  {}  step #{}  {}", local_time(i.started_at), mark, i.seq, i.run_id);
+        println!(
+            "{}  {}  step #{}  {}",
+            local_time(i.started_at),
+            mark,
+            i.seq,
+            i.run_id
+        );
     }
     println!("\n(`shion run inspect <id>` shows the full turn.)");
     Ok(())

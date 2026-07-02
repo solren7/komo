@@ -141,9 +141,7 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(
                 d.join("SKILL.md"),
-                format!(
-                    "---\nname: {name}\ndescription: d\ndisabled: {disabled}\n---\nbody"
-                ),
+                format!("---\nname: {name}\ndescription: d\ndisabled: {disabled}\n---\nbody"),
             )
             .unwrap();
         }

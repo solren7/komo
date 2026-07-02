@@ -1,6 +1,6 @@
 # PRD: skill governance——inspect、启停/保护、triage、调用审计(roadmap §9 / 推荐顺序 #4)
 
-Status: ready-for-human (design review)
+Status: shipped (implemented 2026-07-03; see git log)
 
 ## 背景与现状
 

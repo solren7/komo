@@ -19,7 +19,7 @@
 - run ledger 已记录每个 turn 和每次工具调用，CLI 可 `shion run list/inspect`。
 - 已有 operator CLI：`cron`、`session`、`task`、`run`、`memory`、`pair`、`model`、`wechat`、`workday`、`logs`、`doctor`、`dream`、`upgrade`。
 
-总体判断：**shion 是一个简洁的 agent core，能力扩展走 skill，不往 core 里堆连接器**。入口、任务、记忆和审计已经有骨架；下一阶段 core 只做四件事——权限策略产品化、memory 质量、run resume、skill governance。日历/邮件/笔记这类真实数据源由 skill 接入（用现有通用工具调 API），core 提供的是让 skill 安全好用的地基。
+总体判断：**shion 是一个简洁的 agent core，能力扩展走 skill，不往 core 里堆连接器**。入口、任务、记忆和审计已经有骨架；core 的四件收官事中 run resume（§6）和 skill governance（§9）已落地，剩权限策略补完（§3，主体已落地）与 memory 质量（§5）。日历/邮件/笔记这类真实数据源由 skill 接入（用现有通用工具调 API），core 提供的是让 skill 安全好用的地基。
 
 ## 1. 真实个人数据：走 skill，不进 core
 
@@ -181,12 +181,16 @@ api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Rayca
 - `shion run prune`
 - `shion dream`：dreaming 预览/手动执行
 
-还可以补——**skill governance**（连接器走 skill 后，这从"锦上添花"升级为核心设施）：
+**skill governance 已落地**（`.scratch/skill-governance/PRD.md`）。前提是先收敛了存储：过去 reviewer 写 shion.db、运行时读文件目录，两套互不可见；现在**文件系统是唯一事实源**——`~/.shion/skills/` 是 shion 自有的 durable skill 主目录（与 memory.db/kanban.db 同级），db 存量一次性导出为 candidate 后 `SkillRecord` 退役。治理四件套：
 
-- skill inspect：单个 skill 的全文、来源（用户写入 / reviewer 提取）、修改历史。
-- 启停与保护：disable 一个可疑 skill 而不删除；`protected` 语义明确化（谁能改、agent 能否自改）。
-- 来源追溯与审查：reviewer 自动提取的 skill 应像 memory candidate 一样有 triage 流程，而不是直接生效。
-- skill 调用审计：run ledger 里能看到某次 turn 用了哪个 skill。
+- triage：reviewer 提取只落 `.candidates/`（覆盖前滚 `.history/`），`shion skill promote|reject` 由 operator 决定，从不直接生效——与 memory candidate 同一梯子。
+- 保护：`protected` = 只有 operator 能改；reviewer 连 candidate 提案都不生成（保护挡在提案生成处，防"一键 promote 覆盖"）；agent 无 skill 写路径。
+- 启停：`disabled` 的 skill 留在盘上可 inspect，但不进模型 catalog，`skill view` 返回明确的"已停用"。
+- inspect 与审计：`shion skill inspect` 显示全文/来源/路径/历史；`shion skill audit` 从 run ledger 的 `skill view` steps **派生**调用记录（不存任何 usage 计数字段）。
+
+所有治理命令都是纯文件操作，gateway 持锁时照常可用；catalog 变更重启 gateway 生效（热加载不做，先例同 policy）。
+
+尚未做：skill 热加载；usage 信号驱动的 candidate 自动归档（skill 版 dreaming，等 candidate 真实堆积再立项）。
 
 目标是让用户随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
 
@@ -207,8 +211,8 @@ core 只做四件事，按依赖顺序：
 1. **权限策略配置化（§3）**：目录、命令前缀、网络域名、channel/session scope 的可配置放行，独立 policy 层。它是 skill 生态和无人值守 sweep 的地基，排第一。
 2. ~~**memory 质量（§5）**~~ ✅ 已落地（`.scratch/memory-quality/PRD.md`）：aux recall agent、candidate 批量 triage、dreaming query-diversity；embedding/hybrid search 仍然后置。
 3. ~~**run resume（§6）**~~ ✅ 已落地（`.scratch/run-resume/PRD.md`）：`shion run resume` 重派中断 turn，`recoverable` 由 reconcile 置位、resume 清零。
-4. **skill governance（§9）**：inspect、启停/保护、triage 流程、调用审计——连接器走 skill 的前提设施。
+4. ~~**skill governance（§9）**~~ ✅ 已落地（`.scratch/skill-governance/PRD.md`）：文件系统为唯一事实源，triage/保护/启停/审计齐备。
 
 明确不做进 core 的：日历/邮件/笔记等数据连接器（走 skill）、briefing 的连接器化增强（等 §3 落地后由 skill 提供数据）、本地快捷入口的新 channel（api channel 的 loopback HTTP 已可承接脚本/Raycast）。
 
-已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、memory 质量（query-diversity / 批量 triage / aux recall agent）、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由（含 memory 写路由）、operator health（doctor / memory report）。下一阶段的主题是：**core 收敛，生态外放**——把权限、记忆、恢复、治理做扎实，让 skill 安全地承接一切具体能力。
+已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、memory 质量（query-diversity / 批量 triage / aux recall agent）、run ledger + prune + **resume**、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由（含 memory 写路由）、operator health（doctor / memory report）、**skill governance**（文件化存储 + triage/保护/启停/审计）。下一阶段的主题是：**core 收敛，生态外放**——把权限、记忆、恢复、治理做扎实，让 skill 安全地承接一切具体能力。

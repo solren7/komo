@@ -222,9 +222,8 @@ pub async fn run_keep_cutoff(db_url: &str, keep: usize) -> anyhow::Result<Option
 /// or not the gateway is running (no db lock involved). Workspace-local skill
 /// dirs are per-repo and listed by the agent's own `skill` tool instead.
 pub fn skill_list() -> anyhow::Result<()> {
-    let store = crate::infra::skills::FsSkillStore::new(
-        crate::infra::skills::FsSkillStore::default_root(),
-    );
+    let store =
+        crate::infra::skills::FsSkillStore::new(crate::infra::skills::FsSkillStore::default_root());
     let active = store.list_active();
     let candidates = store.list_candidates();
     if active.is_empty() && candidates.is_empty() {
@@ -239,7 +238,12 @@ pub fn skill_list() -> anyhow::Result<()> {
     if !candidates.is_empty() {
         println!("\ncandidates (`shion skill promote|reject <name>`):");
         for s in &candidates {
-            println!("  {}  [{}]  {}", s.name, s.source, oneline(&s.description, 80));
+            println!(
+                "  {}  [{}]  {}",
+                s.name,
+                s.source,
+                oneline(&s.description, 80)
+            );
         }
     }
     Ok(())

@@ -99,6 +99,35 @@ impl Memory {
         self.expires_at.is_some_and(|e| e <= now)
     }
 
+    // Governance transitions (the triage ladder). Shared by the CLI, the api
+    // channel, and the `memory` tool so the semantics can never drift between
+    // surfaces.
+
+    /// Promote a candidate to an active, **confirmed** memory (a human vouched
+    /// for it — unlike dreaming's usage-driven promote, which caps at inferred).
+    pub fn promote(&mut self, now: i64) {
+        self.status = MemoryStatus::Active;
+        self.confidence = MemoryConfidence::Confirmed;
+        self.updated_at = now;
+    }
+
+    /// Reject a memory so it never surfaces in recall or injection.
+    pub fn reject(&mut self, now: i64) {
+        self.status = MemoryStatus::Rejected;
+        self.updated_at = now;
+    }
+
+    /// Pin into the L1 per-turn profile (the manual, explicit path — automated
+    /// extraction never pins). Raises confidence so it actually surfaces.
+    pub fn pin(&mut self, now: i64) {
+        self.pinned = true;
+        self.status = MemoryStatus::Active;
+        if self.confidence == MemoryConfidence::Extracted {
+            self.confidence = MemoryConfidence::Confirmed;
+        }
+        self.updated_at = now;
+    }
+
     /// Whether this memory is eligible for L1 pinned-profile injection in the
     /// given context: pinned, active, high-confidence, an identity/preference
     /// kind, in a scope the context allows, and not expired.
@@ -927,6 +956,35 @@ mod tests {
         // A second distinct query unlocks promotion.
         m.recall_query_hashes = vec!["hash-a".into(), "hash-b".into()];
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    #[test]
+    fn governance_transitions_set_status_confidence_and_updated_at() {
+        let now = 9_000;
+        let mut m = candidate(0, 1, 8_000);
+        m.promote(now);
+        assert_eq!(m.status, MemoryStatus::Active);
+        assert_eq!(m.confidence, MemoryConfidence::Confirmed);
+        assert_eq!(m.updated_at, now);
+
+        let mut m = candidate(0, 1, 8_000);
+        m.reject(now);
+        assert_eq!(m.status, MemoryStatus::Rejected);
+
+        let mut m = candidate(0, 1, 8_000);
+        m.pin(now);
+        assert!(m.pinned);
+        assert_eq!(m.status, MemoryStatus::Active);
+        assert_eq!(
+            m.confidence,
+            MemoryConfidence::Confirmed,
+            "pin raises extracted to confirmed so it can surface in L1"
+        );
+        // Pinning must never *lower* confidence.
+        let mut written = candidate(0, 1, 8_000);
+        written.confidence = MemoryConfidence::UserWritten;
+        written.pin(now);
+        assert_eq!(written.confidence, MemoryConfidence::UserWritten);
     }
 
     #[test]

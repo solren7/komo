@@ -48,7 +48,7 @@ use crate::{
         gateway::MessageHandler,
         home::HomeRepository,
         memory::{
-            DreamVerdict, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+            DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
             parse_memory_status,
         },
         pairing::{PairingRepository, PairingStatus},
@@ -186,6 +186,9 @@ fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/tasks", get(list_tasks))
         .route("/api/memories", get(list_memories))
+        .route("/api/memories/{id}/promote", post(memory_promote))
+        .route("/api/memories/{id}/reject", post(memory_reject))
+        .route("/api/memories/{id}/pin", post(memory_pin))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/reminders", get(list_reminders))
@@ -469,6 +472,62 @@ async fn list_memories(
     }
     // Memory derives Serialize, so it serializes verbatim.
     Ok(Json(json!({ "memories": memories })))
+}
+
+// Memory governance writes (`shion memory promote/reject/pin` while the gateway
+// holds the db lock). These are host-operator actions, so — like the trusted
+// chat path — they are gated to **loopback** callers: a publicly-bound api
+// (`[channels.api] enabled = true`) never gets them, valid key or not.
+
+async fn memory_promote(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    memory_transition(&state, peer, &id, Memory::promote).await
+}
+
+async fn memory_reject(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    memory_transition(&state, peer, &id, Memory::reject).await
+}
+
+async fn memory_pin(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    memory_transition(&state, peer, &id, Memory::pin).await
+}
+
+/// Apply one governance transition (a `Memory` method — the domain owns the
+/// semantics) and return the updated memory. 403 off-loopback, 404 unknown id.
+async fn memory_transition(
+    state: &AppState,
+    peer: SocketAddr,
+    id: &str,
+    apply: fn(&mut Memory, i64),
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "memory governance is loopback-only" })),
+        )
+            .into_response());
+    }
+    let Some(mut memory) = state.memories.get(id).await? else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no memory with id `{id}`") })),
+        )
+            .into_response());
+    };
+    apply(&mut memory, now());
+    state.memories.save(&memory).await?;
+    Ok(Json(json!({ "memory": memory })).into_response())
 }
 
 #[derive(Deserialize)]

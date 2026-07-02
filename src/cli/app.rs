@@ -204,15 +204,17 @@ enum MemoryAction {
         /// Text to match in memory content
         query: String,
     },
-    /// Promote a candidate to an active, confirmed memory
+    /// Promote candidates to active, confirmed memories
     Promote {
-        /// Memory id (as shown by `memory list`)
-        id: String,
+        /// Memory ids (as shown by `memory list`)
+        #[arg(required = true)]
+        ids: Vec<String>,
     },
-    /// Reject a candidate so it never surfaces
+    /// Reject candidates so they never surface
     Reject {
-        /// Memory id
-        id: String,
+        /// Memory ids
+        #[arg(required = true)]
+        ids: Vec<String>,
     },
     /// Pin a memory into the L1 per-turn profile (the manual, explicit path)
     Pin {
@@ -306,8 +308,8 @@ pub async fn run() -> anyhow::Result<()> {
             match action {
                 MemoryAction::List { status } => memory::list(&url, status).await,
                 MemoryAction::Search { query } => memory::search(&url, &query).await,
-                MemoryAction::Promote { id } => memory::promote(&url, &id).await,
-                MemoryAction::Reject { id } => memory::reject(&url, &id).await,
+                MemoryAction::Promote { ids } => memory::promote(&url, &ids).await,
+                MemoryAction::Reject { ids } => memory::reject(&url, &ids).await,
                 MemoryAction::Pin { id } => memory::pin(&url, &id).await,
                 MemoryAction::Report => memory::report(&url).await,
             }

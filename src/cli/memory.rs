@@ -4,7 +4,7 @@
 //! host-side operator view: it lists and searches across *all* scopes, so you
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
 
-use crate::cli::gateway_client::{GatewayClient, refuse_if_gateway_running};
+use crate::cli::gateway_client::GatewayClient;
 use crate::domain::memory::{Memory, MemoryConfidence, MemoryRepository, MemoryStatus};
 use crate::infra::memory::memory_db::MemoryDb;
 
@@ -66,38 +66,87 @@ pub async fn search(url: &str, query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Promote a candidate to an active, confirmed memory.
-pub async fn promote(url: &str, id: &str) -> anyhow::Result<()> {
-    refuse_if_gateway_running("memory promote").await?;
-    mutate(url, id, |m| {
-        m.status = MemoryStatus::Active;
-        m.confidence = MemoryConfidence::Confirmed;
+/// Where a governance write lands: a running gateway (which holds the db lock)
+/// over HTTP, or the db directly. Resolved **once** per command so a batch of
+/// ids doesn't re-probe/reconnect per id.
+enum WriteStore {
+    Gateway(GatewayClient),
+    Direct(MemoryDb),
+}
+
+async fn write_store(url: &str) -> anyhow::Result<WriteStore> {
+    Ok(match GatewayClient::try_connect().await {
+        Some(gw) => WriteStore::Gateway(gw),
+        None => WriteStore::Direct(store(url).await?),
     })
-    .await?;
-    println!("Promoted {id} to active.");
+}
+
+/// Apply one governance transition to one id. `action` is the api route leg;
+/// `apply` is the same domain method the gateway itself runs, so both paths
+/// share `Memory`'s semantics.
+async fn transition(
+    store: &WriteStore,
+    id: &str,
+    action: &str,
+    apply: fn(&mut Memory, i64),
+) -> anyhow::Result<()> {
+    match store {
+        WriteStore::Gateway(gw) => gw.memory_transition(id, action).await,
+        WriteStore::Direct(db) => {
+            let mut memory = db
+                .get(id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no memory with id `{id}`"))?;
+            apply(
+                &mut memory,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            db.save(&memory).await
+        }
+    }
+}
+
+/// Run a transition over a batch of ids, reporting per id and failing the
+/// command (after trying every id) if any failed.
+async fn transition_batch(
+    url: &str,
+    ids: &[String],
+    action: &str,
+    apply: fn(&mut Memory, i64),
+    done: &str,
+) -> anyhow::Result<()> {
+    let store = write_store(url).await?;
+    let mut failed = 0usize;
+    for id in ids {
+        match transition(&store, id, action, apply).await {
+            Ok(()) => println!("{done} {id}."),
+            Err(error) => {
+                failed += 1;
+                eprintln!("✗ {id}: {error}");
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} failed", ids.len());
+    }
     Ok(())
 }
 
-/// Reject a candidate (won't surface in recall or injection).
-pub async fn reject(url: &str, id: &str) -> anyhow::Result<()> {
-    refuse_if_gateway_running("memory reject").await?;
-    mutate(url, id, |m| m.status = MemoryStatus::Rejected).await?;
-    println!("Rejected {id}.");
-    Ok(())
+/// Promote candidates to active, confirmed memories.
+pub async fn promote(url: &str, ids: &[String]) -> anyhow::Result<()> {
+    transition_batch(url, ids, "promote", Memory::promote, "Promoted").await
+}
+
+/// Reject candidates (won't surface in recall or injection).
+pub async fn reject(url: &str, ids: &[String]) -> anyhow::Result<()> {
+    transition_batch(url, ids, "reject", Memory::reject, "Rejected").await
 }
 
 /// Pin a memory into the L1 per-turn profile (the manual, explicit path —
 /// automated extraction never pins). Raises confidence so it actually surfaces.
 pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
-    refuse_if_gateway_running("memory pin").await?;
-    mutate(url, id, |m| {
-        m.pinned = true;
-        m.status = MemoryStatus::Active;
-        if m.confidence == MemoryConfidence::Extracted {
-            m.confidence = MemoryConfidence::Confirmed;
-        }
-    })
-    .await?;
+    let store = write_store(url).await?;
+    transition(&store, id, "pin", Memory::pin).await?;
     println!("Pinned {id} into the L1 profile.");
     Ok(())
 }
@@ -196,18 +245,6 @@ fn report_bucket(label: &str, items: &[&Memory]) {
     if items.len() > 10 {
         println!("  … and {} more", items.len() - 10);
     }
-}
-
-async fn mutate(url: &str, id: &str, apply: impl FnOnce(&mut Memory)) -> anyhow::Result<()> {
-    let db = store(url).await?;
-    let mut memory = db
-        .get(id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no memory with id `{id}`"))?;
-    apply(&mut memory);
-    memory.updated_at = time::OffsetDateTime::now_utc().unix_timestamp();
-    db.save(&memory).await?;
-    Ok(())
 }
 
 fn line(m: &Memory) -> String {

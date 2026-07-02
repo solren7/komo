@@ -221,9 +221,7 @@ impl Tool for MemoryTool {
             }
             "promote" => {
                 let mut memory = self.require(&args.id).await?;
-                memory.status = MemoryStatus::Active;
-                memory.confidence = MemoryConfidence::Confirmed;
-                memory.updated_at = now;
+                memory.promote(now);
                 self.memories.save(&memory).await?;
                 Ok(format!("Promoted memory {} to active.", memory.id))
             }

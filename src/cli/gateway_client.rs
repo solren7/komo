@@ -166,6 +166,23 @@ impl GatewayClient {
         Ok((promote, archive))
     }
 
+    /// Apply a memory governance transition (`promote` | `reject` | `pin`)
+    /// through the gateway (which holds the db lock). The endpoint is
+    /// loopback-gated server-side; a 404 becomes a clear "no such id" error.
+    pub async fn memory_transition(&self, id: &str, action: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/memories/{id}/{action}")))
+            .bearer_auth(&self.key)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("no memory with id `{id}`");
+        }
+        resp.error_for_status()?;
+        Ok(())
+    }
+
     /// Run one chat turn server-side and return the reply. Sends the stable
     /// session id (so history threads) and the trusted marker (so the gateway
     /// auto-approves side-effecting tools — it is gated to loopback callers).

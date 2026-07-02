@@ -111,12 +111,16 @@ memory 三层已经落地：
 
 usage-based 治理也已落地：dreaming（`DreamSweep`，默认每晚 3 点，`shion dream [--apply]` 可预览/手动跑）按 recall 使用信号决定 candidate 的去向——常被召回的 promote 到 active，长期没人用的 archive；只动 candidate，pin 仍是手动专属。
 
-下一步是质量升级，而不是再加一个粗糙入口：
+质量升级（`.scratch/memory-quality/PRD.md`）也已落地：
 
-- aux recall agent：从候选 hits 中选择、压缩、解释相关 facts。
-- embedding / hybrid search：作为召回信号，不能绕过 scope/status/expiry/confidence 过滤。
-- dreaming 的 query-diversity 信号（OpenClaw 的 `minUniqueQueries`）：目前只有 recall 计数，没有按 query 的 provenance。
+- dreaming 的 query-diversity（OpenClaw 的 `minUniqueQueries`）：`mark_used` 记录 query 词面指纹到 `recall_query_hashes`（原地加列迁移），promote 判据加 `unique_queries >= 2`——同一问题连问 N 次不再能把 candidate 泵成 active。
+- candidate 批量 triage：memory 写命令经 gateway 的 loopback POST 路由（不再被 db 锁挡住），promote/reject 变参，`shion memory triage` 交互式清堆（最老优先）。
+- aux recall agent（宽取窄注）：recall 取 15 个候选，超过 5 个注入名额时由 aux 模型筛选相关性并可压缩为单行；严格 JSON + id 校验 + 4s 超时回落，`mark_used` 只记真正注入的条目——dreaming 消费的是"相关性过滤后"的信号。
 - reviewer 防自噬规则继续保持：不能从注入块再提取记忆。
+
+剩余缺口：
+
+- embedding / hybrid search：作为召回信号，不能绕过 scope/status/expiry/confidence 过滤。aux 筛选解决 precision 后再评估是否仍需要（解决 recall 面的"捞得全"）。
 
 治理原则不变：自动提取只能进 candidate，不能自动 pin；影响长期行为的内容必须可追溯、可拒绝、可归档。
 
@@ -202,10 +206,10 @@ api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Rayca
 core 只做四件事，按依赖顺序：
 
 1. **权限策略配置化（§3）**：目录、命令前缀、网络域名、channel/session scope 的可配置放行，独立 policy 层。它是 skill 生态和无人值守 sweep 的地基，排第一。
-2. **memory 质量（§5）**：aux recall agent、candidate 批量 triage 体验、dreaming 的 query-diversity 信号；embedding/hybrid search 之后再说。
+2. ~~**memory 质量（§5）**~~ ✅ 已落地（`.scratch/memory-quality/PRD.md`）：aux recall agent、candidate 批量 triage、dreaming query-diversity；embedding/hybrid search 仍然后置。
 3. **run resume（§6）**：从已有 run ledger 恢复中断任务，`recoverable` 字段由它驱动加入。
 4. **skill governance（§9）**：inspect、启停/保护、triage 流程、调用审计——连接器走 skill 的前提设施。
 
 明确不做进 core 的：日历/邮件/笔记等数据连接器（走 skill）、briefing 的连接器化增强（等 §3 落地后由 skill 提供数据）、本地快捷入口的新 channel（api channel 的 loopback HTTP 已可承接脚本/Raycast）。
 
-已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由、operator health（doctor / memory report）。下一阶段的主题是：**core 收敛，生态外放**——把权限、记忆、恢复、治理做扎实，让 skill 安全地承接一切具体能力。
+已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、memory 质量（query-diversity / 批量 triage / aux recall agent）、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由（含 memory 写路由）、operator health（doctor / memory report）。下一阶段的主题是：**core 收敛，生态外放**——把权限、记忆、恢复、治理做扎实，让 skill 安全地承接一切具体能力。

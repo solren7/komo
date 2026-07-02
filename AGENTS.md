@@ -23,9 +23,10 @@ shion logs [-n N] [-f] [--stdout]  # tail the gateway tracing log (-f follows; -
 
 shion memory list [--status S]     # list/triage memories (candidate/active/archived/rejected)
 shion memory search <query>        # substring search across all memories
-shion memory promote <id>          # candidate → active+confirmed
-shion memory reject <id>           # candidate → rejected
+shion memory promote <id>...       # candidates → active+confirmed (batch; works with the gateway up)
+shion memory reject <id>...        # candidates → rejected (batch; works with the gateway up)
 shion memory pin <id>              # pin into the L1 per-turn profile (manual-only path)
+shion memory triage                # interactively clear the candidate pile (oldest first; p/r/s/q)
 shion memory report                # quality report: status/confidence counts + piles needing triage
 shion dream [--apply]              # usage-driven consolidation: preview (default) or run one cycle — promote well-recalled candidates, archive never-recalled ones
 
@@ -62,11 +63,15 @@ to reset.
 Two kinds of **durable personal data live in their own files** so resetting
 `shion.db` never wipes them: cross-session **tasks in `~/.shion/kanban.db`**
 (`infra/persistence/kanban.rs`) and long-term **memories in `~/.shion/memory.db`**
-(`infra/memory/memory_db.rs`). After a schema change, delete the affected file —
-`push_schema` only runs for newly created database files: a `TaskRecord` change
-means deleting `kanban.db`, a `MemoryRecord` change means `memory.db`, any other
-model means `shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run
-ledger lives in `shion.db`).
+(`infra/memory/memory_db.rs`). After a schema change on **disposable** state,
+delete the affected file — `push_schema` only runs for newly created database
+files: a `TaskRecord` change means deleting `kanban.db`, any other model means
+`shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run ledger lives in
+`shion.db`). A **`MemoryRecord` column addition needs no reset**: memories are
+durable personal data, so `memory_db.rs::ensure_columns` `ALTER TABLE ADD
+COLUMN`s any missing column in place on connect — when adding a field, extend
+its `EXPECTED` list (NOT NULL with a DEFAULT, or nullable) instead of telling
+anyone to delete `memory.db`.
 
 **Running the CLI while the gateway is up.** Turso takes an *exclusive
 cross-process lock* on each db file (no multi-process open), so while the gateway
@@ -84,11 +89,15 @@ history) and `X-Shion-Trusted` (the gateway runs the turn with
 user is the host operator; gated to **loopback** callers, so a publicly-bound api
 never gets it). Read commands (`memory`/`task`/`run`/`session`/`cron`/`skill`/
 `pair` list, `dream` preview) route to `GET /api/*`, which serialize the domain
-types verbatim so the CLI reuses its renderers. Write commands not yet routed
-(`memory promote/reject/pin`, `run prune`, `session clean`, `pair approve/revoke`,
-`dream --apply`) print a "gateway holds the lock — stop it, or do it from chat"
-message (`refuse_if_gateway_running`) instead of the raw Turso error; pairing
-admission while the gateway runs is the `/pair` chat command. The api channel is
+types verbatim so the CLI reuses its renderers. Memory governance writes
+(`memory promote/reject/pin/triage`) route to loopback-gated
+`POST /api/memories/{id}/promote|reject|pin` (the transition semantics live on
+`Memory::promote/reject/pin` so CLI, api, and the `memory` tool share one
+definition). Write commands not yet routed (`run prune`, `session clean`,
+`pair approve/revoke`, `dream --apply`) print a "gateway holds the lock — stop
+it, or do it from chat" message (`refuse_if_gateway_running`) instead of the
+raw Turso error; pairing admission while the gateway runs is the `/pair` chat
+command. The api channel is
 loopback-only on an ephemeral port by default; `[channels.api] enabled = true`
 widens it to an external bind/port (requires `API_SERVER_KEY`) for Open WebUI /
 the dashboard.
@@ -288,12 +297,12 @@ kanban.db connections), and two cross-cutting files at the top level —
 - the turn's session context is established for BOTH paths: the gateway dispatcher sets it (with a real `ReplySink`), and `AgentRuntime::handle_input` sets a *detached* context (no-op sink) when none exists, so the REPL gets `todo` too — see `SessionContext::detached`
 
 `domain/memory.rs` + `tools/memory.rs` + `infra/memory/memory_db.rs` — long-term memory as three surfaces (roadmap §5)
-- `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`/`recall_count` (the dreaming usage signal — see below). `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat)
+- `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`/`recall_count`/`recall_query_hashes` (the dreaming usage signals — see below). `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat). Governance transitions live on the model (`Memory::promote/reject/pin`) so the CLI, the api channel, and the `memory` tool share one definition
 - **L1 pinned** (done): `MemoryRepository::pinned(ctx)` filters `is_pinnable` (pinned + active + confirmed/user_written + identity-kind + in-scope); `system_prompt::render_pinned_memory_block` renders an ≤800-char block injected in `infra/llm.rs::complete` **after** the volatile tier (cache-stable), marked `<!-- shion:memory:pinned -->`, flagged as untrusted data. Main agent only (`build_llm(..., Some(repo))`); aux/delegate get `None`
-- **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `shion memory list/search/promote/reject/pin`. `pin` is the manual-only path into L1 — automated extraction never pins
+- **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `shion memory list/search/promote/reject/pin/triage` (promote/reject take multiple ids; `triage` walks the candidate pile oldest-first with p/r/s/q; all three writes route through a running gateway — see the api-channel note above). `pin` is the manual-only path into L1 — automated extraction never pins
 - reviewer writes extractions as `candidate + extracted`, scoped to the origin channel, deduped via `find_by_source_message_id` (same governance as task inbox — user triages candidates up to active/pinned)
-- **L3 active recall** (done): `MemoryRepository::recall(ctx, text, limit)` scores active, in-scope memories against the turn's user message by **token overlap** (`recall_terms` = ASCII words + CJK bigrams + stopword filter; `recall_score`), distinct from L2 `search`'s whole-query substring match. Top `RECALL_LIMIT`=5 rendered by `system_prompt::render_recalled_memory_block` into an ≤2000-char block (each line `source:`-tagged, untrusted caveat, `<!-- shion:memory:recall -->`), injected in `infra/llm.rs::complete` **after** pinned (fixed `volatile | pinned | recall` order; pinned hits deduped out of recall). Recall failure is non-fatal but `warn!`-logged. **Recall surfaces both `Active` and `Candidate`** (only `Archived`/`Rejected` excluded) — a candidate must be recallable to *earn* its usage signal for dreaming; it scores lower and is confidence-tagged in the block. Surfaced memories get `recall_count` bumped and `last_used_at` stamped via `MemoryRepository::mark_used` (never touches `updated_at`) on a spawned best-effort task off the reply path — this `recall_count` is the dreaming signal
-- **Dreaming / consolidation** (OpenClaw-borrowed, on by default — nightly `0 3 * * *`, set `dream_schedule = "off"` to disable): `domain::memory::dream_verdict`/`dream_score` decide each **candidate**'s fate purely from accumulated usage — recalled ≥`DREAM_MIN_RECALL_COUNT`(3) within `DREAM_FORGET_AGE_DAYS`(30) and scoring ≥`DREAM_PROMOTE_MIN_SCORE` → promote to `Active`+`Inferred` (recallable, but still **not** L1-pinnable — pinning stays confirmed-only/manual); old + never recalled → `Archived`. `agent::daemon::DreamSweep` applies it (scheduled via `dream_schedule`, wired in `cli/gateway.rs`; `shion dream [--apply]` is the operator preview/run). Only candidates are touched — active/user-saved memories are left to the operator (`shion memory report`). Importance is proven by use, not guessed at write time. (Query-diversity, OpenClaw's `minUniqueQueries`, is deferred — shion tracks a count, not per-query provenance.) Reviewer/`memory`-tool write guidance follows Hermes: declarative facts not instructions, nothing stale-in-a-week; the `memory` tool reports the L1 pinned-budget usage% on save/list to nudge self-curation
+- **L3 active recall** (done): `MemoryRepository::recall(ctx, text, limit)` scores active, in-scope memories against the turn's user message by **token overlap** (`recall_terms` = ASCII words + CJK bigrams + stopword filter; `recall_score`), distinct from L2 `search`'s whole-query substring match. **Fetch wide, inject narrow**: `assemble` pulls up to `RECALL_FETCH`=15 candidates; ≤`RECALL_LIMIT`=5 survivors inject directly (zero added latency), more get screened by the **aux recall agent** (`aux_select_recall` on the cheap `aux_model`: pick ≤5 genuinely relevant, optionally condense each to one line; strict-JSON reply validated against the candidate set — fabricated ids and oversized rewrites dropped, so aux output can never inject non-memory content; timeout `AUX_RECALL_TIMEOUT`=4s or any failure falls back to the lexical top 5). The kept hits render via `system_prompt::render_recalled_memory_block` into an ≤2000-char block (each line `source:`-tagged, untrusted caveat, `<!-- shion:memory:recall -->`), injected in `infra/llm.rs::complete` **after** pinned (fixed `volatile | pinned | recall` order; pinned hits deduped out of recall). Recall failure is non-fatal but `warn!`-logged. **Recall surfaces both `Active` and `Candidate`** (only `Archived`/`Rejected` excluded) — a candidate must be recallable to *earn* its usage signal for dreaming; it scores lower and is confidence-tagged in the block. Only the **injected** memories get `recall_count` bumped, `last_used_at` stamped, and the turn's query fingerprint (`recall_query_hash`: sorted normalized terms → 16-hex SHA-256 prefix) recorded into `recall_query_hashes` (deduped, capped at `RECALL_QUERY_HASHES_CAP`=8) via `MemoryRepository::mark_used` (never touches `updated_at`) on a spawned best-effort task off the reply path — count + distinct-query fingerprints are the dreaming signals
+- **Dreaming / consolidation** (OpenClaw-borrowed, on by default — nightly `0 3 * * *`, set `dream_schedule = "off"` to disable): `domain::memory::dream_verdict`/`dream_score` decide each **candidate**'s fate purely from accumulated usage — recalled ≥`DREAM_MIN_RECALL_COUNT`(3) **by ≥`DREAM_MIN_UNIQUE_QUERIES`(2) lexically-distinct queries** (the `recall_query_hashes` fingerprints — OpenClaw's `minUniqueQueries`; one repeated question can no longer pump a candidate to active on count alone, and pre-fingerprint candidates wait until diversity accrues) within `DREAM_FORGET_AGE_DAYS`(30) and scoring ≥`DREAM_PROMOTE_MIN_SCORE` → promote to `Active`+`Inferred` (recallable, but still **not** L1-pinnable — pinning stays confirmed-only/manual); old + never recalled → `Archived`. `agent::daemon::DreamSweep` applies it (scheduled via `dream_schedule`, wired in `cli/gateway.rs`; `shion dream [--apply]` is the operator preview/run, showing `recalls=/queries=` per candidate). Only candidates are touched — active/user-saved memories are left to the operator (`shion memory report`). Importance is proven by use, not guessed at write time. Reviewer/`memory`-tool write guidance follows Hermes: declarative facts not instructions, nothing stale-in-a-week; the `memory` tool reports the L1 pinned-budget usage% on save/list to nudge self-curation
 
 `domain/run.rs` + `RunRepository` (impl in `infra/persistence/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
 - one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `shion.db` — execution state bound to a session, disposable like messages, **not** durable personal data

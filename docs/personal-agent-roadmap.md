@@ -136,13 +136,12 @@ run ledger 的记录层已经落地：
 
 剪枝已有 operator 动作：`shion run prune --before <date>|--keep <N>`。
 
+resume 也已落地（`.scratch/run-resume/PRD.md`）：ledger 是审计账不是 checkpoint（中间轮 assistant 消息不持久化、step args 已脱敏截断），所以 `shion run resume [<id>]` 不做断点回放，而是把原始输入 + 已完成步骤摘要组装成 priming 输入，在原 session 重派一轮新 turn，由模型判断哪些副作用已生效；新副作用照常走审批。`recoverable` 字段由 `reconcile_interrupted` 置位、resume 后清零（at-most-once），`run list` 以 `⟲` 标记。gateway 持锁时整个动作路由到 `POST /api/runs/{id}/resume`。不做自动 resume——无人在场重放半完成副作用不可接受。
+
 尚未做：
 
-- `resume` 上一次中断任务。
-- 与 resume 配套的 `recoverable` 字段。
 - 基于 run ledger 的权限审计视图。
-
-`recoverable` 不应提前加成死字段。等真正做 resume 时，再由消费者驱动模型变化。
+- 中断的主动可见性（startup 发现 n>0 时经 HomeNotifier 提示 + `/resume` chat 命令）——后置，等核心链路用出真实需求。
 
 ## 7. 更强的 planner / orchestrator
 
@@ -207,7 +206,7 @@ core 只做四件事，按依赖顺序：
 
 1. **权限策略配置化（§3）**：目录、命令前缀、网络域名、channel/session scope 的可配置放行，独立 policy 层。它是 skill 生态和无人值守 sweep 的地基，排第一。
 2. ~~**memory 质量（§5）**~~ ✅ 已落地（`.scratch/memory-quality/PRD.md`）：aux recall agent、candidate 批量 triage、dreaming query-diversity；embedding/hybrid search 仍然后置。
-3. **run resume（§6）**：从已有 run ledger 恢复中断任务，`recoverable` 字段由它驱动加入。
+3. ~~**run resume（§6）**~~ ✅ 已落地（`.scratch/run-resume/PRD.md`）：`shion run resume` 重派中断 turn，`recoverable` 由 reconcile 置位、resume 清零。
 4. **skill governance（§9）**：inspect、启停/保护、triage 流程、调用审计——连接器走 skill 的前提设施。
 
 明确不做进 core 的：日历/邮件/笔记等数据连接器（走 skill）、briefing 的连接器化增强（等 §3 落地后由 skill 提供数据）、本地快捷入口的新 channel（api channel 的 loopback HTTP 已可承接脚本/Raycast）。

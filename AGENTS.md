@@ -30,8 +30,9 @@ shion memory triage                # interactively clear the candidate pile (old
 shion memory report                # quality report: status/confidence counts + piles needing triage
 shion dream [--apply]              # usage-driven consolidation: preview (default) or run one cycle — promote well-recalled candidates, archive never-recalled ones
 
-shion run list [--limit N]         # recent runs (one per turn), newest first
+shion run list [--limit N]         # recent runs (one per turn), newest first; ⟲ marks recoverable
 shion run inspect <id>             # one run in full: input, plan, outcome, every tool step
+shion run resume [<id>]            # re-dispatch an interrupted run (defaults to the latest recoverable)
 shion run prune --before <date>|--keep <N>   # trim the run ledger (delete old runs + their steps)
 
 shion skill list                   # registered skills (name, protected flag, description)
@@ -311,7 +312,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 - **redaction**: step `args` are stored verbatim *except* each `Tool` may scrub its own via `Tool::redact_args` (default identity) — `shell` strips secret-looking substrings (`key=value`, `Bearer`, `--password`, high-entropy tokens), `file` drops the write `content` body. `result` is truncated but not scrubbed (shell *output* can still contain secrets — accepted, `shion.db` is local/disposable). Fields are length-capped (`RUN_FIELD_CAP`/`STEP_FIELD_CAP`)
 - aux sub-agents and maintenance sweeps run without a `RunContext`, so their tool use never enters the ledger
 - operator view: `shion run list [--limit N]` / `shion run inspect <id>` (`cli/inspect.rs`)
-- deliberately NOT in v1: a `recoverable` flag / `resume` (no consumer yet — roadmap §6's "no dead fields"); ledger pruning (runs accumulate like messages; a later operator action can trim)
+- **resume** (roadmap §6): the ledger is an audit record, not a checkpoint — intermediate assistant turns are never persisted and step args are redacted/truncated, so faithful mid-loop replay is impossible by design. Instead `shion run resume [<id>]` (`cli/resume.rs`) re-dispatches one *fresh* turn in the interrupted run's session, primed by `domain::run::resume_prompt` (original input + a digest of completed steps, elided past `RESUME_DIGEST_CAP`); the model judges which side effects took hold, and new side effects go through approval as usual. `recoverable` is the resumable marker: set by `reconcile_interrupted` (gateway startup flips crash-residue `Running` runs to `Failed`/interrupted), cleared by `mark_resumed` after a resume dispatches (at-most-once), shown as `⟲` in `run list`. Only interruption makes a run recoverable — an ordinary `Failed` has no half-done steps worth handing over. While the gateway holds the db lock the whole action routes to `POST /api/runs/{id}/resume` (trusted for loopback callers, same rule as chat); otherwise the turn runs in-process like `shion chat` with `CliApprover`. No automatic resume: replaying half-done side effects unattended is not acceptable — resume is always an explicit operator action
 
 `cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
 - Session ids are program-managed (uuid v7); every run starts a fresh session. `/new` and `/clear` are equivalent — both open a new session. There is no user-supplied session id and no `/session` subcommand.

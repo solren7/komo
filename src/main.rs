@@ -46,9 +46,8 @@ fn init_tracing() {
     } else {
         ",toasty::db::pool=off"
     };
-    let filter = EnvFilter::try_from_env("SHION_LOG").unwrap_or_else(|_| {
-        EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}"))
-    });
+    let filter = EnvFilter::try_from_env("SHION_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}")));
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

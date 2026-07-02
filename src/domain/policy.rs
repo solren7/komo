@@ -154,9 +154,10 @@ impl Rule {
         }
         // File access scope: a `write` rule applies only to writes, etc.
         if let (Some(want), ActionRef::File { write, .. }) = (self.access, action)
-            && (want == Access::Write) != *write {
-                return false;
-            }
+            && (want == Access::Write) != *write
+        {
+            return false;
+        }
         true
     }
 

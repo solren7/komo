@@ -239,17 +239,20 @@ async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
 /// The config `home_chat` fallback, feishu-first (matches `HomeNotifier`).
 fn config_home_chat() -> Option<(&'static str, String)> {
     if let Ok(Some(c)) = feishu_config()
-        && let Some(chat) = c.home_chat {
-            return Some(("feishu", chat));
-        }
+        && let Some(chat) = c.home_chat
+    {
+        return Some(("feishu", chat));
+    }
     if let Ok(Some(c)) = telegram_config()
-        && let Some(chat) = c.home_chat {
-            return Some(("telegram", chat));
-        }
+        && let Some(chat) = c.home_chat
+    {
+        return Some(("telegram", chat));
+    }
     if let Ok(Some(c)) = wechat_config()
-        && let Some(chat) = c.home_chat {
-            return Some(("wechat", chat));
-        }
+        && let Some(chat) = c.home_chat
+    {
+        return Some(("wechat", chat));
+    }
     None
 }
 

@@ -147,7 +147,7 @@ enum ModelAction {
     List,
     /// Switch provider (and optionally model); persists to config.toml
     Set {
-        /// Provider: deepseek | openai | anthropic | openrouter
+        /// Provider, or a Codex model shortcut such as gpt-5.5
         provider: String,
         /// Model id (defaults to the provider's default model)
         model: Option<String>,
@@ -397,8 +397,8 @@ pub async fn run() -> anyhow::Result<()> {
             } => policy::check(&category, &target, channel.as_deref(), dangerous, write),
         },
         Commands::Model { action } => match action {
-            ModelAction::List => model::list(),
-            ModelAction::Set { provider, model } => model::set(&provider, model),
+            ModelAction::List => model::list().await,
+            ModelAction::Set { provider, model } => model::set(&provider, model).await,
         },
         Commands::Wechat { action } => match action {
             WechatAction::Login => wechat::login().await,

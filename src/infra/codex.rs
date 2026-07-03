@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
@@ -36,6 +36,7 @@ const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// ChatGPT-backed Codex inference endpoint (OpenAI Responses API surface).
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 /// Refresh this many seconds before the access token's `exp`.
 const REFRESH_SKEW_SECS: u64 = 120;
 /// `originator` allow-listed by the Codex backend's Cloudflare layer; non-codex
@@ -43,6 +44,21 @@ const REFRESH_SKEW_SECS: u64 = 120;
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 /// `User-Agent` shaped like the upstream `codex-rs` CLI (beats SDK fingerprinting).
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (shion)";
+
+pub const DEFAULT_CODEX_MODELS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+];
+
+const FORWARD_COMPAT_TEMPLATE_MODELS: &[(&str, &[&str])] = &[
+    ("gpt-5.5", &["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]),
+    ("gpt-5.4-mini", &["gpt-5.3-codex"]),
+    ("gpt-5.4", &["gpt-5.3-codex"]),
+    ("gpt-5.3-codex-spark", &["gpt-5.3-codex"]),
+];
 
 /// Path to the Codex CLI's shared credential file (`$CODEX_HOME/auth.json`,
 /// defaulting to `~/.codex/auth.json`).
@@ -57,6 +73,29 @@ fn codex_auth_path() -> PathBuf {
                 .join(".codex")
         });
     home.join("auth.json")
+}
+
+pub fn codex_auth_file_path() -> PathBuf {
+    codex_auth_path()
+}
+
+fn codex_home() -> PathBuf {
+    codex_auth_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("cannot determine home directory")
+                .join(".codex")
+        })
+}
+
+pub fn looks_like_codex_model_id(model: &str) -> bool {
+    let model = model.trim().to_lowercase();
+    model.starts_with("codex-")
+        || model.contains("-codex")
+        || model.starts_with("gpt-5.")
+        || model.starts_with("gpt-5-")
 }
 
 /// The three fields we need out of the Codex token set.
@@ -150,6 +189,159 @@ fn read_tokens(path: &Path) -> anyhow::Result<CodexTokens> {
         refresh_token,
         account_id,
     })
+}
+
+fn push_unique(out: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !value.is_empty() && !out.iter().any(|v| v == &value) {
+        out.push(value);
+    }
+}
+
+fn add_forward_compat_models(model_ids: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for model in model_ids {
+        push_unique(&mut out, model);
+    }
+    for (synthetic, templates) in FORWARD_COMPAT_TEMPLATE_MODELS {
+        if out.iter().any(|m| m == synthetic) {
+            continue;
+        }
+        if templates
+            .iter()
+            .any(|template| out.iter().any(|m| m == template))
+        {
+            out.push((*synthetic).to_string());
+        }
+    }
+    out
+}
+
+fn read_default_model(codex_home: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(codex_home.join("config.toml")).ok()?;
+    let payload: toml::Value = toml::from_str(&content).ok()?;
+    payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+fn read_cache_models(codex_home: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(codex_home.join("models_cache.json")) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(payload) => payload,
+        Err(_) => return Vec::new(),
+    };
+    let mut sortable = Vec::new();
+    if let Some(models) = payload.get("models").and_then(|m| m.as_array()) {
+        for item in models {
+            let Some(slug) = item
+                .get("slug")
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let hidden = item
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_some_and(|v| matches!(v.to_lowercase().as_str(), "hide" | "hidden"));
+            if hidden {
+                continue;
+            }
+            let rank = item
+                .get("priority")
+                .and_then(|p| p.as_i64())
+                .unwrap_or(10_000);
+            sortable.push((rank, slug.to_string()));
+        }
+    }
+    sortable.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out = Vec::new();
+    for (_, slug) in sortable {
+        push_unique(&mut out, slug);
+    }
+    out
+}
+
+async fn fetch_models_from_api(access_token: &str) -> Vec<String> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client
+        .get(CODEX_MODELS_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        _ => return Vec::new(),
+    };
+    let payload: serde_json::Value = match resp.json().await {
+        Ok(payload) => payload,
+        Err(_) => return Vec::new(),
+    };
+    let mut sortable = Vec::new();
+    if let Some(models) = payload.get("models").and_then(|m| m.as_array()) {
+        for item in models {
+            let Some(slug) = item
+                .get("slug")
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let hidden = item
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_some_and(|v| matches!(v.to_lowercase().as_str(), "hide" | "hidden"));
+            if hidden {
+                continue;
+            }
+            let rank = item
+                .get("priority")
+                .and_then(|p| p.as_i64())
+                .unwrap_or(10_000);
+            sortable.push((rank, slug.to_string()));
+        }
+    }
+    sortable.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    add_forward_compat_models(sortable.into_iter().map(|(_, slug)| slug).collect())
+}
+
+pub async fn codex_model_ids(access_token: Option<&str>) -> Vec<String> {
+    if let Some(token) = access_token.filter(|t| !t.is_empty()) {
+        let live = fetch_models_from_api(token).await;
+        if !live.is_empty() {
+            return live;
+        }
+    }
+
+    let home = codex_home();
+    let mut out = Vec::new();
+    if let Some(model) = read_default_model(&home) {
+        push_unique(&mut out, model);
+    }
+    for model in read_cache_models(&home) {
+        push_unique(&mut out, model);
+    }
+    for model in DEFAULT_CODEX_MODELS {
+        push_unique(&mut out, *model);
+    }
+    add_forward_compat_models(out)
 }
 
 /// Write refreshed tokens back into `auth.json`, preserving every other field
@@ -707,5 +899,51 @@ mod tests {
         assert_eq!(v["tokens"]["access_token"], "new");
         assert_eq!(v["tokens"]["refresh_token"], "newrt");
         assert!(v.get("last_refresh").is_some());
+    }
+
+    #[test]
+    fn cache_models_keep_visible_codex_backend_slugs() {
+        let dir = std::env::temp_dir().join(format!("shion_codex_cache_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("models_cache.json"),
+            r#"{"models":[
+                {"slug":"gpt-5.3-codex","priority":20,"supported_in_api":true},
+                {"slug":"gpt-5.3-codex-spark","priority":6,"supported_in_api":false},
+                {"slug":"gpt-5.4","priority":1,"supported_in_api":true},
+                {"slug":"gpt-5-hidden-codex","priority":2,"visibility":"hidden"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let models = read_cache_models(&dir);
+
+        assert_eq!(models[0], "gpt-5.4");
+        assert!(models.iter().any(|m| m == "gpt-5.3-codex-spark"));
+        assert!(!models.iter().any(|m| m == "gpt-5-hidden-codex"));
+    }
+
+    #[test]
+    fn forward_compat_models_are_added_from_templates() {
+        let models = add_forward_compat_models(vec!["gpt-5.3-codex".into()]);
+        assert_eq!(
+            models,
+            vec![
+                "gpt-5.3-codex",
+                "gpt-5.5",
+                "gpt-5.4-mini",
+                "gpt-5.4",
+                "gpt-5.3-codex-spark"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_model_detection_is_narrow() {
+        assert!(looks_like_codex_model_id("gpt-5.5"));
+        assert!(looks_like_codex_model_id("gpt-5.3-codex-spark"));
+        assert!(looks_like_codex_model_id("codex-fast"));
+        assert!(!looks_like_codex_model_id("gpt-4o-mini"));
+        assert!(!looks_like_codex_model_id("deepseek-chat"));
     }
 }

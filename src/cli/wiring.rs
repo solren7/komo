@@ -175,7 +175,10 @@ pub async fn build(
             skills.catalog_capped(SKILL_CATALOG_CAP)
         )
     });
-    tools.register(Arc::new(SkillTool::new(skills.clone())));
+    tools.register(Arc::new(SkillTool::new(
+        skills.clone(),
+        skill_store.clone(),
+    )));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
     // (gated on the tools actually loaded) + skills catalog, then the workspace

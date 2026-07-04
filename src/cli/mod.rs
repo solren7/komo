@@ -6,6 +6,7 @@ mod dream;
 mod gateway;
 mod gateway_client;
 mod inspect;
+mod journey;
 mod logs;
 mod memory;
 mod model;

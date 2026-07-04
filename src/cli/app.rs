@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, policy, resume, service,
-    skill, upgrade, wechat, workday,
+    chat, doctor, dream, gateway, inspect, journey, logs, memory, model, pair, policy, resume,
+    service, skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -67,6 +67,16 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// Timeline of what shion has learned: memories (born/promoted/archived)
+    /// and skills (proposed/activated), newest first
+    Journey {
+        /// Maximum number of events to show
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Only show events on or after this date (YYYY-MM-DD, local time)
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Config & gateway health: model, schedules, channels, home, recent failures
     Doctor,
@@ -380,6 +390,9 @@ pub async fn run() -> anyhow::Result<()> {
             SkillAction::Inspect { name } => skill::inspect(&name),
             SkillAction::Audit { name } => skill::audit(&db, &name).await,
         },
+        Commands::Journey { limit, since } => {
+            journey::journey(&crate::config::default_memory_db_url(), limit, since).await
+        }
         Commands::Doctor => doctor::doctor(&db).await,
         Commands::Pair { action } => match action {
             PairAction::List => pair::list(&db).await,
@@ -436,7 +449,7 @@ async fn run_prune(db: &str, before: Option<String>, keep: Option<usize>) -> any
 }
 
 /// Parse a `YYYY-MM-DD` date as local-time midnight, returning a unix timestamp.
-fn parse_local_date(s: &str) -> anyhow::Result<i64> {
+pub(crate) fn parse_local_date(s: &str) -> anyhow::Result<i64> {
     use chrono::TimeZone;
     let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
         .map_err(|e| anyhow::anyhow!("invalid date `{s}` (expected YYYY-MM-DD): {e}"))?;

@@ -26,6 +26,10 @@ pub struct Skill {
 /// Provenance values for [`Skill::source`].
 pub const SOURCE_USER: &str = "user";
 pub const SOURCE_REVIEWER: &str = "reviewer";
+/// On-demand distillation the operator explicitly asked for (the `learn` action
+/// of the `skill` tool), as opposed to the reviewer's passive extraction. Both
+/// land as candidates for triage; the provenance only records *why* it exists.
+pub const SOURCE_LEARNED: &str = "learned";
 
 fn default_source() -> String {
     SOURCE_USER.to_string()

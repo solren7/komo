@@ -14,8 +14,8 @@ async fn store(url: &str) -> anyhow::Result<MemoryDb> {
 
 /// Load every memory — from a running gateway (which holds the db lock) if one
 /// is up, else straight from the db. The CLI's list/search/report all filter
-/// this set client-side, so one loader serves all three.
-async fn load_all(url: &str) -> anyhow::Result<Vec<Memory>> {
+/// this set client-side, so one loader serves them all (plus `journey`).
+pub(crate) async fn load_all(url: &str) -> anyhow::Result<Vec<Memory>> {
     match GatewayClient::try_connect().await {
         Some(gw) => gw.memories().await,
         None => store(url).await?.list().await,

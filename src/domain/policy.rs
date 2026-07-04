@@ -357,8 +357,18 @@ mod tests {
         let p = Policy::new(
             vec![
                 // An allow rule must be irrelevant to safe actions…
-                rule(Category::Network, Matcher::Suffix, "github.com", Effect::Allow),
-                rule(Category::Network, Matcher::Suffix, "internal.corp", Effect::Deny),
+                rule(
+                    Category::Network,
+                    Matcher::Suffix,
+                    "github.com",
+                    Effect::Allow,
+                ),
+                rule(
+                    Category::Network,
+                    Matcher::Suffix,
+                    "internal.corp",
+                    Effect::Deny,
+                ),
             ],
             // …and so must default_normal: even Deny leaves unmatched safe alone.
             Verdict::Deny,
@@ -394,7 +404,8 @@ mod tests {
             Verdict::Ask
         );
         assert_eq!(
-            p.decide(&shell("rm -rf x", Risk::Dangerous), Some("cli")).verdict,
+            p.decide(&shell("rm -rf x", Risk::Dangerous), Some("cli"))
+                .verdict,
             Verdict::Ask
         );
     }
@@ -411,11 +422,13 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.decide(&shell("cargo build", Risk::Normal), Some("cli")).verdict,
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli"))
+                .verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.decide(&shell("npm install", Risk::Normal), Some("cli")).verdict,
+            p.decide(&shell("npm install", Risk::Normal), Some("cli"))
+                .verdict,
             Verdict::Ask
         );
     }
@@ -430,7 +443,8 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.decide(&shell("git push origin", Risk::Normal), Some("cli")).verdict,
+            p.decide(&shell("git push origin", Risk::Normal), Some("cli"))
+                .verdict,
             Verdict::Deny
         );
     }
@@ -442,7 +456,8 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.decide(&shell("rm file", Risk::Dangerous), Some("cli")).verdict,
+            p.decide(&shell("rm file", Risk::Dangerous), Some("cli"))
+                .verdict,
             Verdict::Ask
         );
 
@@ -450,7 +465,8 @@ mod tests {
         allow_dangerous.include_dangerous = true;
         let p = Policy::new(vec![allow_dangerous], Verdict::Ask);
         assert_eq!(
-            p.decide(&shell("rm file", Risk::Dangerous), Some("cli")).verdict,
+            p.decide(&shell("rm file", Risk::Dangerous), Some("cli"))
+                .verdict,
             Verdict::Allow
         );
     }
@@ -466,7 +482,8 @@ mod tests {
         r.access = Some(Access::Write);
         let p = Policy::new(vec![r], Verdict::Ask);
         assert_eq!(
-            p.decide(&file_write("/home/me/proj/src/x.rs"), Some("cli")).verdict,
+            p.decide(&file_write("/home/me/proj/src/x.rs"), Some("cli"))
+                .verdict,
             Verdict::Allow
         );
         assert_eq!(
@@ -481,11 +498,13 @@ mod tests {
         r.channels = Some(vec!["cli".to_string()]);
         let p = Policy::new(vec![r], Verdict::Ask);
         assert_eq!(
-            p.decide(&shell("cargo build", Risk::Normal), Some("cli")).verdict,
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli"))
+                .verdict,
             Verdict::Allow
         );
         assert_eq!(
-            p.decide(&shell("cargo build", Risk::Normal), Some("feishu")).verdict,
+            p.decide(&shell("cargo build", Risk::Normal), Some("feishu"))
+                .verdict,
             Verdict::Ask
         );
         // No session in scope → a channel-scoped rule never matches.
@@ -512,7 +531,8 @@ mod tests {
             Verdict::Ask,
         );
         assert_eq!(
-            p.decide(&net("https://api.github.com/repos"), Some("cli")).verdict,
+            p.decide(&net("https://api.github.com/repos"), Some("cli"))
+                .verdict,
             Verdict::Allow
         );
         assert_eq!(
@@ -521,7 +541,8 @@ mod tests {
         );
         // Not a real subdomain — must not match.
         assert_eq!(
-            p.decide(&net("https://evilgithub.com"), Some("cli")).verdict,
+            p.decide(&net("https://evilgithub.com"), Some("cli"))
+                .verdict,
             Verdict::Ask
         );
     }
@@ -535,7 +556,8 @@ mod tests {
         );
         // Dangerous still asks regardless of default_normal.
         assert_eq!(
-            p.decide(&shell("rm x", Risk::Dangerous), Some("feishu")).verdict,
+            p.decide(&shell("rm x", Risk::Dangerous), Some("feishu"))
+                .verdict,
             Verdict::Ask
         );
     }

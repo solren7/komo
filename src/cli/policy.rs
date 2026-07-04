@@ -66,7 +66,9 @@ pub fn check(
     write: bool,
 ) -> anyhow::Result<()> {
     let Some(cat) = Category::parse(category) else {
-        anyhow::bail!("unknown category `{category}` (expected shell | file | network | homeassistant)");
+        anyhow::bail!(
+            "unknown category `{category}` (expected shell | file | network | homeassistant)"
+        );
     };
 
     // Mirror the risk each real tool would attach, so the dry run matches a turn.
@@ -75,7 +77,11 @@ pub fn check(
             ActionRef::Shell {
                 command: target.to_string(),
             },
-            if dangerous { Risk::Dangerous } else { Risk::Normal },
+            if dangerous {
+                Risk::Dangerous
+            } else {
+                Risk::Normal
+            },
         ),
         Category::File => (
             ActionRef::File {
@@ -116,8 +122,12 @@ pub fn check(
         Risk::Normal => "normal",
         Risk::Dangerous => "dangerous",
     };
-    println!("action:  {category} {target}  [risk: {risk_str}{}]",
-        channel.map(|c| format!(", channel: {c}")).unwrap_or_default());
+    println!(
+        "action:  {category} {target}  [risk: {risk_str}{}]",
+        channel
+            .map(|c| format!(", channel: {c}"))
+            .unwrap_or_default()
+    );
 
     match (decision.verdict, decision.rule) {
         (Verdict::Deny, Some(i)) => {
@@ -127,19 +137,29 @@ pub fn check(
         (Verdict::Allow, Some(i)) => {
             println!("verdict: ALLOW — auto-allowed inside a session turn (no prompt)");
             println!("matched: #{i} {}", rule_str(&policy.rules()[i]));
-            println!("note:    with no session in scope (sweep/aux), this still falls to ask → deny");
+            println!(
+                "note:    with no session in scope (sweep/aux), this still falls to ask → deny"
+            );
         }
         (Verdict::Allow, None) if risk == Risk::Safe => {
-            println!("verdict: ALLOW — read-only action, no deny rule matches (deny-only evaluation)");
-            println!("note:    allow rules never apply to safe actions; only a deny rule can block this");
+            println!(
+                "verdict: ALLOW — read-only action, no deny rule matches (deny-only evaluation)"
+            );
+            println!(
+                "note:    allow rules never apply to safe actions; only a deny rule can block this"
+            );
         }
         (Verdict::Allow, None) => {
             println!("verdict: ALLOW — default_normal = allow (no rule matched)");
         }
         (Verdict::Ask, _) => {
-            println!("verdict: ASK — escalates to interactive approval (/approve in chat, y/N at the CLI)");
+            println!(
+                "verdict: ASK — escalates to interactive approval (/approve in chat, y/N at the CLI)"
+            );
             if risk == Risk::Dangerous {
-                println!("note:    dangerous actions auto-allow only via a rule with include_dangerous = true");
+                println!(
+                    "note:    dangerous actions auto-allow only via a rule with include_dangerous = true"
+                );
             }
         }
         (Verdict::Deny, None) => {

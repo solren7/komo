@@ -68,11 +68,10 @@ impl Tool for WebFetchTool {
         let args: FetchArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid web_fetch arguments: {e}"))?;
 
-        let request = ApprovalRequest::safe(format!("fetch {}", args.url)).with_action(
-            ActionRef::Network {
+        let request =
+            ApprovalRequest::safe(format!("fetch {}", args.url)).with_action(ActionRef::Network {
                 url: args.url.clone(),
-            },
-        );
+            });
         if !self.approver.approve(&request).await {
             return Ok(format!(
                 "URL blocked by the permission policy (a `network` deny rule matches {}); \

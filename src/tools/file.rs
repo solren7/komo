@@ -232,10 +232,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("shion_denied_read.txt");
         std::fs::write(&path, "secret").unwrap();
-        let tool = FileTool::new(
-            Arc::new(Workspace::new(vec![dir])),
-            Arc::new(DenyAll),
-        );
+        let tool = FileTool::new(Arc::new(Workspace::new(vec![dir])), Arc::new(DenyAll));
         let args = json!({ "action": "read", "path": path.to_string_lossy() });
         let out = tool.execute(args.to_string()).await.unwrap();
         assert!(out.contains("blocked by the permission policy"));

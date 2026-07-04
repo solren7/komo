@@ -209,18 +209,29 @@ impl Secrets {
 /// Ensure `~/.shion/` exists (0700) and return its path.
 /// Tightens `.env` inside to 0600 if present.
 /// Permission failures are silently ignored (containers, Windows).
+///
+/// Permissions are only applied when they are actually wrong: the home dir is
+/// chmod'd solely on the run that creates it, and `.env` only when its mode
+/// differs from 0600. Re-chmod'ing an existing path on every startup rewrites
+/// the ACL on filesystems that keep one (ZFS/NFSv4 — a mounted TrueNAS
+/// dataset), which would clobber operator-set ACLs on each gateway restart.
 pub fn ensure_shion_home() -> PathBuf {
     let home = shion_home();
+    let newly_created = !home.exists();
     if let Err(e) = std::fs::create_dir_all(&home) {
         eprintln!("shion: could not create {}: {e}", home.display());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+        if newly_created {
+            let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+        }
         let env_path = home.join(".env");
-        if env_path.exists() {
-            let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+        if let Ok(meta) = std::fs::metadata(&env_path) {
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+            }
         }
     }
     home

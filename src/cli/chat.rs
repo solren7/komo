@@ -15,17 +15,43 @@ use crate::{
 /// Otherwise run the agent in-process against the db, exactly as before.
 pub async fn run(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {
     if let Some(gw) = GatewayClient::try_connect().await {
-        return run_remote(gw).await;
+        return run_remote(gw, new_session_id(), false).await;
     }
-    run_local(db_url, kanban_url).await
+    run_local(db_url, kanban_url, new_session_id(), false).await
+}
+
+/// Continue an existing session (`shion session resume <id>`): reopen the REPL
+/// bound to that session id so its history is loaded and the conversation picks
+/// up where it left off. Errors if no such session exists — this never creates
+/// one (that is `shion chat`'s job).
+pub async fn resume(db_url: &str, kanban_url: &str, session_id: &str) -> anyhow::Result<()> {
+    if let Some(gw) = GatewayClient::try_connect().await {
+        // No db here — confirm the session exists server-side before reopening it.
+        let known = gw.sessions().await?.iter().any(|s| s.id == session_id);
+        if !known {
+            anyhow::bail!("no session with id `{session_id}` (see `shion session list`)");
+        }
+        return run_remote(gw, session_id.to_string(), true).await;
+    }
+    run_local(db_url, kanban_url, session_id.to_string(), true).await
 }
 
 /// REPL backed by a running gateway over HTTP. No db is opened here; session
 /// history lives server-side keyed by the session id we send each turn.
-async fn run_remote(gw: GatewayClient) -> anyhow::Result<()> {
-    let mut current_session = new_session_id();
+/// `resuming` only changes the greeting — an existing session's transcript is
+/// threaded automatically once we send turns under its id.
+async fn run_remote(
+    gw: GatewayClient,
+    mut current_session: String,
+    resuming: bool,
+) -> anyhow::Result<()> {
     println!(
-        "Shion v0.1 — connected to the running gateway (session `{}`, trusted). Type /new to start a fresh session, Ctrl-C or Ctrl-D to quit.\n",
+        "Shion v0.1 — connected to the running gateway ({} `{}`, trusted). Type /new to start a fresh session, Ctrl-C or Ctrl-D to quit.\n",
+        if resuming {
+            "resumed session"
+        } else {
+            "session"
+        },
         current_session
     );
     let mut editor = DefaultEditor::new()?;
@@ -66,11 +92,25 @@ async fn run_remote(gw: GatewayClient) -> anyhow::Result<()> {
 }
 
 /// REPL backed by an in-process agent over the local db (no gateway running).
-async fn run_local(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {
+/// When `resuming`, the session id names an existing transcript that must
+/// already exist; otherwise it's a fresh, program-managed session we create.
+async fn run_local(
+    db_url: &str,
+    kanban_url: &str,
+    mut current_session: String,
+    resuming: bool,
+) -> anyhow::Result<()> {
     let db = Arc::new(Db::connect(db_url).await?);
     let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
-    // Session ids are program-managed: every run starts a fresh session.
-    let mut current_session = new_session_id();
+
+    // Resume requires the session to exist already — never create it here.
+    if resuming
+        && SessionRepository::find(&*db, &current_session)
+            .await?
+            .is_none()
+    {
+        anyhow::bail!("no session with id `{current_session}` (see `shion session list`)");
+    }
 
     // Interactive approval at the TTY for side-effecting tools.
     let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
@@ -78,7 +118,12 @@ async fn run_local(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {
 
     ensure_session(&db, &current_session).await?;
     println!(
-        "Shion v0.1 — session `{}`. Type /new (or /clear) to start a fresh session, Ctrl-C or Ctrl-D to quit.\n",
+        "Shion v0.1 — {} `{}`. Type /new (or /clear) to start a fresh session, Ctrl-C or Ctrl-D to quit.\n",
+        if resuming {
+            "resumed session"
+        } else {
+            "session"
+        },
         current_session
     );
 

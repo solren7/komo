@@ -47,7 +47,7 @@ shion policy list                  # resolved permission-policy rules (as the ap
 shion policy check <cat> <target>  # dry-run one action: verdict + deciding rule ([--channel c] [--dangerous] [--write])
 shion doctor                       # config & gateway health: model+key, schedules, policy, channels, home, recent failures
 
-shion wechat login                 # provision WeChat iLink creds by scanning a QR (run on the host)
+shion channel wechat login               # provision WeChat iLink creds by scanning a QR (run on the host)
 
 shion workday [YYYY-MM-DD]          # is a date a Chinese working day? (statutory holidays + 调休); defaults to today
 ```
@@ -188,7 +188,7 @@ home_chat = "wxid_xxx"      # optional: reminders go here instead of macOS notif
 
 WeChat (微信) has no credentials in config.toml or `.env`: login is QR-based and
 the iLink token is stored in `~/.shion/wechat/credentials.json`. Provision it
-once on the host with `shion wechat login` (scan the QR with the WeChat app); the
+once on the host with `shion channel wechat login` (scan the QR with the WeChat app); the
 gateway can't render a QR, so its `[channels.wechat]` is **inert until those
 credentials exist**. WeChat is DM-only (an iLink bot identity can't join ordinary
 groups), so there is no `require_mention`/`allowed_chats` — pairing is the only
@@ -332,7 +332,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 `cli/journey.rs` — `shion journey`, a read-only **learning timeline** across the two learning subsystems (memory §5 + skills §9), newest-first. Composes existing reads with **no new api endpoint or schema**: memories via `cli::memory::load_all` (gateway-over-HTTP when the lock is held, else the db directly), skills via `FsSkillStore` file mtimes (lock-free, like the skill CLI). Flattens each memory into born (`created_at`) + promoted/archived (`updated_at`, only when it moved past creation — the stores keep two timestamps, not a transition log, so these are *inferred*; rejected memories are skipped) and each skill into candidate/active events. `memory_events` and `finalize` (sort desc / `--since` filter / `--limit` cap) are pure and unit-tested. Deliberately **not** an execution log — that's `shion run list`
 
 `cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
-- Session ids are program-managed (uuid v7); every run starts a fresh session. `/new` and `/clear` are equivalent — both open a new session. There is no user-supplied session id and no `/session` subcommand.
+- Session ids are program-managed (uuid v7); `shion chat` always starts a fresh session, and `/new`/`/clear` are equivalent — both open a new session. There is no user-supplied session id at the chat prompt and no `/session` subcommand. The one way to re-enter an existing session is `shion session resume <id>` (`cli/chat.rs::resume`): it reopens the same REPL bound to that id so its transcript threads and the conversation continues, erroring if no such session exists (it never creates one). Routes over the gateway when the lock is held (verifying the id via `GET /api/sessions` first), else in-process against the db like `shion chat`.
 
 `agent/daemon.rs` — background maintenance supervisor, hosted by the gateway (pattern borrowed from gbrain's `autopilot` supervisor)
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
@@ -368,7 +368,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 
 `infra/messaging/wechat.rs` — the WeChat (微信) integration over the **iLink** personal-bot protocol, built on the `wechatbot` crate (HTTP/JSON long-polling against `ilinkai.weixin.qq.com`, no public callback URL). `WeChatChannel` (ingress) + `WeChatSender` (outbound, also a `TextSender`) **share one `WeChatBot` instance** (built by `build_bot`, wired in `cli/gateway.rs`) — required because the crate keeps each user's reply `context_token` in memory, populated by the poll loop, and `send` needs it.
 - the crate owns its own poll loop (`WeChatBot::run`) and fires a **synchronous** `on_message` callback, so the channel adapts rather than drives: the handler clones the message and `tokio::spawn`s the async pairing + `dispatcher.handle`, then `serve` hands the thread to `run()` under a shutdown `select!` (dropping the `run()` future cancels the poll)
-- login is **QR-based**; creds → `~/.shion/wechat/credentials.json`. Provision either on the host with `shion wechat login` (`cli/wechat.rs`, renders the QR in-terminal via the `qrcode` crate) or from chat with `/wechat login` (the QR is sent into the chat as a photo — see the chat-commands list). `WeChatChannel::serve` **waits** for the cred file on an `Arc<Notify>` shared with `WeChatQrLogin` (it doesn't die without creds), so a chat-provisioned login brings the channel online with no restart. QR→PNG is `render_qr_png` (qrcode matrix → `image` crate, png feature only); photo delivery is `ReplySink::send_photo` (default errors; Telegram overrides it via `sendPhoto`)
+- login is **QR-based**; creds → `~/.shion/wechat/credentials.json`. Provision either on the host with `shion channel wechat login` (`cli/wechat.rs`, renders the QR in-terminal via the `qrcode` crate) or from chat with `/wechat login` (the QR is sent into the chat as a photo — see the chat-commands list). `WeChatChannel::serve` **waits** for the cred file on an `Arc<Notify>` shared with `WeChatQrLogin` (it doesn't die without creds), so a chat-provisioned login brings the channel online with no restart. QR→PNG is `render_qr_png` (qrcode matrix → `image` crate, png feature only); photo delivery is `ReplySink::send_photo` (default errors; Telegram overrides it via `sendPhoto`)
 - **DM-only**: an iLink bot identity can't join ordinary WeChat groups, so there's no group/mention gate — `PairingGuard` (`platform = "wechat"`) is the only admission control. Session id is `wechat:{user_id}`
 - known limitation: proactive output (reminders/briefing via `HomeNotifier`) reaches a user only after they've messaged the bot since process start (the `context_token` map is in-memory, not persisted). The `wechatbot` crate also forces `reqwest`'s default TLS (native-tls/openssl) rather than shion's rustls — accepted tech-debt; switching needs a vendored patch
 

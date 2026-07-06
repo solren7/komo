@@ -96,10 +96,10 @@ enum Commands {
         #[command(subcommand)]
         action: ModelAction,
     },
-    /// WeChat (微信) channel operator commands
-    Wechat {
+    /// Channel operator commands (per-platform provisioning/maintenance)
+    Channel {
         #[command(subcommand)]
-        action: WechatAction,
+        action: ChannelAction,
     },
     /// Check the Chinese working-day calendar (statutory holidays + 调休).
     /// Reports whether a date is a workday, fetching+caching its year if needed.
@@ -121,6 +121,15 @@ enum Commands {
     },
     /// Print the shion version
     Version,
+}
+
+#[derive(Subcommand)]
+enum ChannelAction {
+    /// WeChat (微信) channel operator commands
+    Wechat {
+        #[command(subcommand)]
+        action: WechatAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -318,6 +327,12 @@ enum PairAction {
 enum SessionAction {
     /// List stored sessions with creation time and message counts
     List,
+    /// Resume an existing session: reopen the chat REPL bound to its id, so its
+    /// history is loaded and the conversation continues where it left off
+    Resume {
+        /// Session id (as shown by `session list`)
+        id: String,
+    },
     /// Delete sessions that contain no messages
     Clean,
 }
@@ -360,6 +375,7 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
+            SessionAction::Resume { id } => chat::resume(&db, &kanban, &id).await,
             SessionAction::Clean => inspect::session_clean(&db).await,
         },
         Commands::Task { action } => match action {
@@ -421,8 +437,10 @@ pub async fn run() -> anyhow::Result<()> {
             ModelAction::List => model::list().await,
             ModelAction::Set { provider, model } => model::set(&provider, model).await,
         },
-        Commands::Wechat { action } => match action {
-            WechatAction::Login => wechat::login().await,
+        Commands::Channel { action } => match action {
+            ChannelAction::Wechat { action } => match action {
+                WechatAction::Login => wechat::login().await,
+            },
         },
         Commands::Workday { date } => workday::check(date).await,
         Commands::Logs {

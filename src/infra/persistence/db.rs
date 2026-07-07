@@ -320,9 +320,8 @@ impl SessionRepository for Db {
         // `let _ = create!(...)` swallowed *every* error — including an MVCC
         // write conflict, which left the session uncreated and the very next
         // MessageRepository::save failing with a phantom "session not found".
-        // Pre-check existence, then insert only when absent; a conflict now
-        // retries and any real error surfaces. Turns are serialized per session
-        // (the dispatcher's in-flight gate), so no concurrent create races here.
+        // Pre-check existence, then insert only when absent; a conflict retries
+        // and any real error surfaces.
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
             if SessionRecord::get_by_id(&mut conn, &session.id)
@@ -331,13 +330,29 @@ impl SessionRepository for Db {
             {
                 return Ok(());
             }
-            toasty::create!(SessionRecord {
+            let created = toasty::create!(SessionRecord {
                 id: session.id.clone(),
                 created_at: session.created_at,
                 reviewed_through: 0,
             })
             .exec(&mut conn)
-            .await?;
+            .await;
+            if let Err(error) = created {
+                // Concurrent create of the same brand-new id: the dispatcher
+                // serializes chat turns per session, but the api channel calls
+                // the handler directly, so two first-requests can race here.
+                // If the winner committed, Turso reports a UNIQUE-constraint
+                // violation (not a retryable busy/conflict) — the row exists,
+                // which is all save() promises, so treat it as success. A
+                // genuinely absent row means a real failure: propagate.
+                if SessionRecord::get_by_id(&mut conn, &session.id)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
             Ok(())
         })
         .await

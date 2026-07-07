@@ -6,7 +6,7 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::infra::persistence::{
-    DEFAULT_POOL_SIZE, prepare_turso_path, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, ensure_columns, prepare_turso_path, turso_marker_path, with_write_retry,
 };
 
 use crate::domain::{
@@ -188,6 +188,22 @@ impl Db {
         // start fresh. Durable personal data lives in memory.db / kanban.db,
         // which migrate their rows instead of resetting.
         let (path, is_new) = prepare_turso_path(url)?;
+
+        // Additive in-place migration for an EXISTING db: `push_schema` only
+        // runs for new files, so a column added to a model after the file was
+        // created would otherwise be missing and every query on that table
+        // would fail — turning "disposable, delete to reset" into "broken on
+        // upgrade until the operator remembers to delete". Same mechanism as
+        // memory.db's ensure_columns; when adding a column to a model here,
+        // extend this list (NOT NULL with a DEFAULT, or nullable) — a new
+        // *table* still needs the delete-to-reset.
+        if !is_new && let Some(p) = &path {
+            const SESSION_COLUMNS: &[(&str, &str)] = &[(
+                "reviewed_through",
+                "\"reviewed_through\" integer NOT NULL DEFAULT 0",
+            )];
+            ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
+        }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
         let driver = match &path {
@@ -1705,5 +1721,77 @@ mod tests {
             MessageRepository::count_user_turns(&db, sid).await.unwrap(),
             2
         );
+    }
+
+    /// A shion.db created before `reviewed_through` existed must gain the
+    /// column **in place** on connect (additive ALTER, like memory.db's
+    /// ensure_columns) — an upgraded gateway must not hard-fail every session
+    /// query until the operator remembers the delete-to-reset convention.
+    #[tokio::test]
+    async fn adds_missing_session_columns_in_place() {
+        let path = std::env::temp_dir().join("shion_db_addcol.db");
+        crate::infra::persistence::reset_test_db(&path);
+
+        // 1. Seed a turso file with the OLD session_records shape (no
+        //    reviewed_through) plus its messages table, then drop the handle.
+        //    (connect skips push_schema for an existing file, so every table a
+        //    session query touches must pre-exist, as it would in a real old db.)
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"session_records\" (\
+                 \"id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE \"message_records\" (\
+                 \"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \
+                 \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"session_records\" VALUES ('cli:old', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"message_records\" VALUES ('m1', 'cli:old', 'user', 'hello', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        // Mark it turso-native so connect() does not stage it as a sqlite backup.
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        // 2. Connect via Db: ensure_columns adds reviewed_through in place.
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let session = SessionRepository::find(&db, "cli:old").await.unwrap();
+        let session = session.expect("pre-migration session survives");
+        assert_eq!(session.messages.len(), 1, "transcript intact");
+
+        // 3. The added column is fully usable: watermark reads 0 and advances.
+        let candidates = SessionRepository::review_candidates(&db).await.unwrap();
+        let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
+        assert_eq!(c.reviewed_through, 0, "new column defaults to 0");
+        assert_eq!(c.user_turns, 1);
+        SessionRepository::mark_reviewed(&db, "cli:old", 1)
+            .await
+            .unwrap();
+        let candidates = SessionRepository::review_candidates(&db).await.unwrap();
+        let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
+        assert_eq!(c.reviewed_through, 1);
     }
 }

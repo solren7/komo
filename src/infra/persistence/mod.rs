@@ -23,6 +23,64 @@ pub(crate) fn sqlite_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Bring an existing `table` up to the current model shape by adding any
+/// columns it lacks, in place — an additive `ALTER TABLE ADD COLUMN` so
+/// existing rows take the default and **no data is lost**. Idempotent: a column
+/// already present is skipped, so it is safe to run on every connect.
+///
+/// This is the in-place alternative to the "delete the db after a schema
+/// change" reset that toasty's non-idempotent `push_schema` would otherwise
+/// force. Toasty's typed API has no raw-DDL path, so the migration runs with a
+/// direct `turso` handle, opened and dropped here — before toasty's pool
+/// connects — so the two never contend for the file.
+///
+/// `expected` maps column name → full column DDL. Every column listed MUST be
+/// `NOT NULL` with a `DEFAULT` (or be nullable), or `ALTER TABLE ADD COLUMN`
+/// fails on a non-empty table.
+pub(crate) async fn ensure_columns(
+    path: &Path,
+    table: &str,
+    expected: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} for column migration", path.display()))?;
+    let conn = db.connect()?;
+    // Match the engine mode the file was written in (the driver enables MVCC
+    // under concurrent_writes); harmless if it was not.
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    // Existing column names: PRAGMA table_info returns (cid, name, type, …) —
+    // the name is column index 1.
+    let mut existing = std::collections::HashSet::new();
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info(\"{table}\")"), ())
+        .await
+        .with_context(|| format!("reading {table} columns"))?;
+    while let Some(row) = rows.next().await? {
+        if let turso::Value::Text(name) = row.get_value(1)? {
+            existing.insert(name);
+        }
+    }
+    // No columns → the table doesn't exist yet; leave it to toasty's push_schema.
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    for (name, ddl) in expected {
+        if !existing.contains(*name) {
+            conn.execute(&format!("ALTER TABLE \"{table}\" ADD COLUMN {ddl}"), ())
+                .await
+                .with_context(|| format!("adding column `{name}` to {table}"))?;
+            tracing::info!(column = name, table, "added missing column in place");
+        }
+    }
+    Ok(())
+}
+
 /// Shared prologue for every Turso-backed `connect(url)`: parse the
 /// `turso:<path>` url to its bare filesystem path (`None` for in-memory), ensure
 /// the parent dir exists, stage any legacy SQLite file aside, and report whether

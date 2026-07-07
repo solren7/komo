@@ -284,18 +284,9 @@ impl MemoryRepository for MemoryDb {
 }
 
 /// Bring an existing `memory_records` table up to the current `MemoryRecord`
-/// shape by adding any columns it lacks, in place — an additive `ALTER TABLE ADD
-/// COLUMN` so existing rows take the default and **no data is lost**. Idempotent:
-/// a column already present is skipped (so this is safe to run on every connect).
-///
-/// This is the in-place alternative to the "delete the db after a schema change"
-/// reset that toasty's non-idempotent `push_schema` would otherwise force.
-/// Toasty's typed API has no raw-DDL path, so the migration is run with a direct
-/// `turso` handle, opened and dropped here — before toasty's pool connects — so
-/// the two never contend for the file.
-///
-/// Every column listed here MUST be `NOT NULL` with a `DEFAULT` (or be nullable),
-/// or `ALTER TABLE ADD COLUMN` fails on a non-empty table.
+/// shape by adding any columns it lacks, in place (no data loss, idempotent) —
+/// the shared additive migration in `infra/persistence/mod.rs`. When adding a
+/// `MemoryRecord` field, extend this list (NOT NULL with a DEFAULT, or nullable).
 async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
     const EXPECTED: &[(&str, &str)] = &[
         (
@@ -307,48 +298,7 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "\"recall_query_hashes\" text NOT NULL DEFAULT ''",
         ),
     ];
-
-    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await
-        .with_context(|| format!("opening {} for column migration", path.display()))?;
-    let conn = db.connect()?;
-    // Match the engine mode the file was written in (the driver enables MVCC
-    // under concurrent_writes); harmless if it was not.
-    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-
-    // Existing column names: PRAGMA table_info returns (cid, name, type, …) — the
-    // name is column index 1.
-    let mut existing = std::collections::HashSet::new();
-    let mut rows = conn
-        .query("PRAGMA table_info(\"memory_records\")", ())
-        .await
-        .context("reading memory_records columns")?;
-    while let Some(row) = rows.next().await? {
-        if let turso::Value::Text(name) = row.get_value(1)? {
-            existing.insert(name);
-        }
-    }
-    // No columns → the table doesn't exist yet; leave it to toasty's push_schema.
-    if existing.is_empty() {
-        return Ok(());
-    }
-
-    for (name, ddl) in EXPECTED {
-        if !existing.contains(*name) {
-            conn.execute(
-                &format!("ALTER TABLE \"memory_records\" ADD COLUMN {ddl}"),
-                (),
-            )
-            .await
-            .with_context(|| format!("adding column `{name}` to memory_records"))?;
-            info!(
-                column = name,
-                "migrated memory.db: added missing column in place"
-            );
-        }
-    }
-    Ok(())
+    crate::infra::persistence::ensure_columns(path, "memory_records", EXPECTED).await
 }
 
 /// Read every memory row from a legacy SQLite db file (opened with toasty's

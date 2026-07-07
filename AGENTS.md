@@ -75,11 +75,15 @@ Two kinds of **durable personal data live in their own files** so resetting
 delete the affected file — `push_schema` only runs for newly created database
 files: a `TaskRecord` change means deleting `kanban.db`, any other model means
 `shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run ledger lives in
-`shion.db`). A **`MemoryRecord` column addition needs no reset**: memories are
-durable personal data, so `memory_db.rs::ensure_columns` `ALTER TABLE ADD
-COLUMN`s any missing column in place on connect — when adding a field, extend
-its `EXPECTED` list (NOT NULL with a DEFAULT, or nullable) instead of telling
-anyone to delete `memory.db`.
+`shion.db`). **Column additions can skip the reset**: the shared
+`infra/persistence/mod.rs::ensure_columns` runs an additive `ALTER TABLE ADD
+COLUMN` in place on connect — `memory.db` uses it for every `MemoryRecord`
+column (durable data must never need a reset; extend the `EXPECTED` list in
+`memory_db.rs`), and `shion.db` uses it for `SessionRecord` columns (see
+`SESSION_COLUMNS` in `db.rs::connect` — extend it when adding a column, so an
+upgraded gateway doesn't hard-fail on the old file until someone remembers to
+delete it). Columns must be NOT NULL with a DEFAULT, or nullable. A new *table*
+or any non-additive change still means deleting the disposable file.
 
 **Running the CLI while the gateway is up.** Turso takes an *exclusive
 cross-process lock* on each db file (no multi-process open), so while the gateway

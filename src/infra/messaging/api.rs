@@ -177,6 +177,22 @@ impl Channel for ApiChannel {
 /// Build the router: `/health` is public, everything else sits behind the
 /// bearer-key middleware.
 fn build_router(state: AppState) -> Router {
+    // Control-plane writes: host-operator actions (memory governance, run
+    // prune, session clean, pairing admission, dream apply). Loopback-gated as
+    // a *layer*, not per-handler checks, so a write route added here is gated
+    // by construction — a publicly-bound api (`[channels.api] enabled = true`)
+    // never reaches these, valid key or not.
+    let operator_writes = Router::new()
+        .route("/api/memories/{id}/promote", post(memory_promote))
+        .route("/api/memories/{id}/reject", post(memory_reject))
+        .route("/api/memories/{id}/pin", post(memory_pin))
+        .route("/api/runs/prune", post(prune_runs))
+        .route("/api/sessions/clean", post(clean_sessions))
+        .route("/api/pairings/approve", post(pair_approve))
+        .route("/api/pairings/{id}/revoke", post(pair_revoke))
+        .route("/api/dream/apply", post(dream_apply))
+        .route_layer(middleware::from_fn(require_loopback));
+
     let protected = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -186,28 +202,39 @@ fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/tasks", get(list_tasks))
         .route("/api/memories", get(list_memories))
-        .route("/api/memories/{id}/promote", post(memory_promote))
-        .route("/api/memories/{id}/reject", post(memory_reject))
-        .route("/api/memories/{id}/pin", post(memory_pin))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/resume", post(resume_run))
-        .route("/api/runs/prune", post(prune_runs))
-        .route("/api/sessions/clean", post(clean_sessions))
         .route("/api/reminders", get(list_reminders))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}/audit", get(skill_audit))
         .route("/api/pairings", get(list_pairings))
-        .route("/api/pairings/approve", post(pair_approve))
-        .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream", get(dream_preview))
-        .route("/api/dream/apply", post(dream_apply))
+        .merge(operator_writes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .route("/health", get(health))
         .merge(protected)
         .with_state(state)
+}
+
+/// Reject any control-plane write not arriving over loopback. These are
+/// host-operator actions — like the trusted chat path, they must be unreachable
+/// on an external bind regardless of the bearer key.
+async fn require_loopback(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "operator write endpoints are loopback-only" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Reject any request whose `Authorization: Bearer <key>` does not match.
@@ -498,49 +525,37 @@ async fn list_memories(
 }
 
 // Memory governance writes (`shion memory promote/reject/pin` while the gateway
-// holds the db lock). These are host-operator actions, so — like the trusted
-// chat path — they are gated to **loopback** callers: a publicly-bound api
-// (`[channels.api] enabled = true`) never gets them, valid key or not.
+// holds the db lock). Host-operator actions — loopback-gated by the
+// `require_loopback` layer on the operator-writes router.
 
 async fn memory_promote(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, peer, &id, Memory::promote).await
+    memory_transition(&state, &id, Memory::promote).await
 }
 
 async fn memory_reject(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, peer, &id, Memory::reject).await
+    memory_transition(&state, &id, Memory::reject).await
 }
 
 async fn memory_pin(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, peer, &id, Memory::pin).await
+    memory_transition(&state, &id, Memory::pin).await
 }
 
 /// Apply one governance transition (a `Memory` method — the domain owns the
-/// semantics) and return the updated memory. 403 off-loopback, 404 unknown id.
+/// semantics) and return the updated memory. 404 on an unknown id.
 async fn memory_transition(
     state: &AppState,
-    peer: SocketAddr,
     id: &str,
     apply: fn(&mut Memory, i64),
 ) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "memory governance is loopback-only" })),
-        )
-            .into_response());
-    }
     let Some(mut memory) = state.memories.get(id).await? else {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -636,21 +651,12 @@ async fn resume_run(
     .into_response())
 }
 
-// ---- control-plane write endpoints (loopback-only) -------------------------
+// ---- control-plane write endpoints ------------------------------------------
 //
 // These back the maintenance CLIs (`run prune`, `session clean`,
 // `pair approve|revoke`, `dream --apply`) while the gateway holds the db lock.
-// Like memory governance and trusted chat, they are **loopback-gated** — a
-// publicly-bound api (`[channels.api] enabled = true`) never gets them.
-
-/// 403 response body for an off-loopback control-plane write.
-fn loopback_only(action: &str) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({ "error": format!("{action} is loopback-only") })),
-    )
-        .into_response()
-}
+// All of them are loopback-gated by the `require_loopback` layer on the
+// operator-writes router (see `build_router`) — not per-handler checks.
 
 #[derive(Deserialize)]
 struct PruneParams {
@@ -661,24 +667,14 @@ struct PruneParams {
 /// `--before`/`--keep` into the cutoff (it can read runs over `/api/runs`).
 async fn prune_runs(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(params): Query<PruneParams>,
 ) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok(loopback_only("run prune"));
-    }
     let removed = state.runs.prune(params.cutoff).await?;
     Ok(Json(json!({ "removed": removed })).into_response())
 }
 
 /// Delete every session with no messages (backs `shion session clean`).
-async fn clean_sessions(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok(loopback_only("session clean"));
-    }
+async fn clean_sessions(State(state): State<AppState>) -> Result<Response, ApiError> {
     let removed = state.sessions.delete_empty_sessions().await?;
     Ok(Json(json!({ "removed": removed })).into_response())
 }
@@ -692,12 +688,8 @@ struct ApproveParams {
 /// outcome variant is echoed so the CLI prints the same message it would locally.
 async fn pair_approve(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(body): Json<ApproveParams>,
 ) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok(loopback_only("pair approve"));
-    }
     let json = match state.pairings.approve_code(&body.code).await? {
         ApproveOutcome::Approved(request) => json!({ "outcome": "approved", "id": request.id }),
         ApproveOutcome::NotFound => json!({ "outcome": "not_found" }),
@@ -711,25 +703,15 @@ async fn pair_approve(
 /// Remove a pairing by id (backs `shion pair revoke`).
 async fn pair_revoke(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok(loopback_only("pair revoke"));
-    }
     let revoked = state.pairings.revoke(&id).await?;
     Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
 /// Run one dreaming consolidation cycle (backs `shion dream --apply`) — the same
 /// `DreamSweep` the gateway schedules.
-async fn dream_apply(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Ok(loopback_only("dream --apply"));
-    }
+async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = DreamSweep {
         memories: state.memories.clone(),
     }

@@ -222,24 +222,38 @@ impl GatewayClient {
         Ok(())
     }
 
-    /// POST a loopback-gated control-plane write and pull one field out of the
-    /// `{ "<field>": T }` reply. Shared by the maintenance write routes below.
+    /// POST a loopback-gated control-plane write and return the JSON reply
+    /// object. The one request path all the maintenance write routes share —
+    /// auth, error mapping, and the version-skew case live here: a running
+    /// gateway from before the endpoint existed answers 404, which would
+    /// otherwise surface as an opaque reqwest error with no db fallback
+    /// possible (the old gateway holds the lock), so it becomes an actionable
+    /// "restart the gateway" message instead.
+    async fn post_json(&self, path: &str, body: Value) -> anyhow::Result<Map<String, Value>> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "the running gateway doesn't serve `{path}` — it predates this command.\n\
+                 Restart it onto the current binary (`shion gateway restart`) and retry."
+            );
+        }
+        Ok(resp.error_for_status()?.json().await?)
+    }
+
+    /// [`post_json`], pulling one field out of the `{ "<field>": T }` envelope.
     async fn post_field<T: DeserializeOwned>(
         &self,
         path: &str,
         body: Value,
         field: &str,
     ) -> anyhow::Result<T> {
-        let mut map: Map<String, Value> = self
-            .http
-            .post(self.url(path))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let mut map = self.post_json(path, body).await?;
         let val = map
             .remove(field)
             .with_context(|| format!("gateway response missing `{field}`"))?;
@@ -264,15 +278,8 @@ impl GatewayClient {
 
     /// Approve a pending pairing by code server-side.
     pub async fn pair_approve(&self, code: &str) -> anyhow::Result<PairApprove> {
-        let v: Value = self
-            .http
-            .post(self.url("/api/pairings/approve"))
-            .bearer_auth(&self.key)
-            .json(&json!({ "code": code }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let v = self
+            .post_json("/api/pairings/approve", json!({ "code": code }))
             .await?;
         match v.get("outcome").and_then(|o| o.as_str()) {
             Some("approved") => Ok(PairApprove::Approved(
@@ -299,23 +306,14 @@ impl GatewayClient {
     /// Run one dreaming consolidation cycle server-side; returns
     /// `(promoted, archived)` counts.
     pub async fn dream_apply(&self) -> anyhow::Result<(usize, usize)> {
-        let mut map: Map<String, Value> = self
-            .http
-            .post(self.url("/api/dream/apply"))
-            .bearer_auth(&self.key)
-            .json(&json!({}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let take = |m: &mut Map<String, Value>, k: &str| -> anyhow::Result<usize> {
+        let mut map = self.post_json("/api/dream/apply", json!({})).await?;
+        let mut take = |k: &str| -> anyhow::Result<usize> {
             Ok(serde_json::from_value(
-                m.remove(k).unwrap_or(Value::from(0)),
+                map.remove(k).unwrap_or(Value::from(0)),
             )?)
         };
-        let promoted = take(&mut map, "promoted")?;
-        let archived = take(&mut map, "archived")?;
+        let promoted = take("promoted")?;
+        let archived = take("archived")?;
         Ok((promoted, archived))
     }
 

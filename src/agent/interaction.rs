@@ -19,11 +19,13 @@
 //! The turn's session context (id + reply sink) reaches the approver through
 //! the task-local in `services::tool_registry`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -327,7 +329,22 @@ pub struct GatewayDispatcher {
     wechat_login: Option<Arc<dyn WeChatLogin>>,
     /// Backs the `/pair` chat commands (same store the `shion pair` CLI uses).
     pairings: Arc<dyn PairingRepository>,
-    inflight: Mutex<HashSet<String>>,
+    /// Per-session turn state. A session key is present iff a turn is in flight;
+    /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
+    /// FIFO as each turn finishes (so a quick follow-up is answered, not dropped).
+    inflight: Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+}
+
+/// How many mid-turn messages a session may queue before further ones are
+/// rejected. Small on purpose: it absorbs a rapid follow-up without letting a
+/// spamming sender build an unbounded backlog.
+const QUEUE_CAP: usize = 2;
+
+/// A message that arrived while its session's turn was in flight, held for
+/// dispatch when the turn finishes.
+struct QueuedMessage {
+    input: String,
+    sink: Arc<dyn ReplySink>,
 }
 
 impl GatewayDispatcher {
@@ -348,7 +365,7 @@ impl GatewayDispatcher {
             todos,
             wechat_login,
             pairings,
-            inflight: Mutex::new(HashSet::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -517,19 +534,38 @@ impl GatewayDispatcher {
     }
 
     fn spawn_turn(self: &Arc<Self>, session_id: &str, input: String, sink: Arc<dyn ReplySink>) {
-        // One turn at a time per session: a second message that arrives while a
-        // turn is in flight is rejected (an `/approve` reply, handled above,
-        // never reaches here). This keeps a session's history append-ordered.
-        if !self.inflight.lock().unwrap().insert(session_id.to_string()) {
-            let sink = sink.clone();
-            tokio::spawn(async move {
-                let _ = sink.send("正在处理上一条消息，请稍候…").await;
-            });
-            return;
+        // One turn at a time per session (keeps a session's history
+        // append-ordered). A message that arrives mid-turn is queued (bounded)
+        // so a quick follow-up is answered after the current turn instead of
+        // dropped; past the cap it's rejected with a hint to resend. (An
+        // `/approve` reply is handled above and never reaches here.)
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            if let Some(queue) = inflight.get_mut(session_id) {
+                if queue.len() >= QUEUE_CAP {
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        let _ = sink
+                            .send("上一条还在处理、队列已满；这条未处理，请稍后重发。")
+                            .await;
+                    });
+                } else {
+                    queue.push_back(QueuedMessage { input, sink });
+                }
+                return;
+            }
+            // No turn in flight: mark the session busy (empty queue) and fall
+            // through to dispatch.
+            inflight.insert(session_id.to_string(), VecDeque::new());
         }
+        self.dispatch_turn(session_id.to_string(), input, sink);
+    }
 
+    /// Run one turn on a spawned task. The session is already marked in-flight;
+    /// [`TurnGuard`] guarantees the session is released (and the next queued
+    /// message dispatched) on every exit path, including a panic or cancellation.
+    fn dispatch_turn(self: &Arc<Self>, session: String, input: String, sink: Arc<dyn ReplySink>) {
         let this = self.clone();
-        let session = session_id.to_string();
         let ctx = SessionContext {
             session_id: session.clone(),
             sink: sink.clone(),
@@ -539,21 +575,86 @@ impl GatewayDispatcher {
             auto_approve: false,
         };
         tokio::spawn(async move {
-            let reply = match with_session(ctx, this.handler.handle(&session, input)).await {
-                Ok(reply) => reply,
-                Err(error) => {
+            // Armed until normal completion below. If the task is cancelled
+            // (e.g. gateway shutdown), its Drop releases the session so it is
+            // never left wedged — see `TurnGuard`.
+            let mut guard = TurnGuard {
+                dispatcher: this.clone(),
+                session: session.clone(),
+                armed: true,
+            };
+            // Catch a panic in the turn (LLM client, a repository, etc.) so a
+            // single bad turn neither wedges the session nor loses the queued
+            // follow-ups: the session is advanced normally below either way.
+            let outcome =
+                AssertUnwindSafe(with_session(ctx, this.handler.handle(&session, input)))
+                    .catch_unwind()
+                    .await;
+            let reply = match outcome {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(error)) => {
                     warn!(%error, "message handling failed");
                     format!("处理消息时出错了: {error}")
+                }
+                Err(_panic) => {
+                    warn!(session = %session, "turn panicked");
+                    "处理消息时发生内部错误，请重试。".to_string()
                 }
             };
             if let Err(error) = sink.send(&reply).await {
                 warn!(%error, "failed to send reply");
             }
-            // Turn done: clear the in-flight flag and any approval left pending
-            // (e.g. the agent abandoned a tool call without resolving it).
-            this.approvals.forget_pending(&session);
-            this.inflight.lock().unwrap().remove(&session);
+            // Normal completion: advance the queue ourselves (safe to spawn from
+            // this async context) and disarm the guard's emergency path.
+            guard.armed = false;
+            this.finish_turn(&session);
         });
+    }
+
+    /// A turn finished normally: drop any approval it left pending, then either
+    /// dispatch the next queued message or clear the session's in-flight flag.
+    fn finish_turn(self: &Arc<Self>, session: &str) {
+        // Any approval the turn abandoned (a tool call never resolved) is dropped.
+        self.approvals.forget_pending(session);
+        let next = {
+            let mut inflight = self.inflight.lock().unwrap();
+            let Some(queue) = inflight.get_mut(session) else {
+                return;
+            };
+            match queue.pop_front() {
+                // Keep the session marked in-flight for the next turn.
+                Some(msg) => Some(msg),
+                // Queue drained: the session is now idle.
+                None => {
+                    inflight.remove(session);
+                    None
+                }
+            }
+        };
+        if let Some(QueuedMessage { input, sink }) = next {
+            self.dispatch_turn(session.to_string(), input, sink);
+        }
+    }
+}
+
+/// Releases a session's turn state on the exit paths a normal completion can't
+/// cover — a panic that escapes the catch, or task cancellation. On drop while
+/// still `armed` it forgets any pending approval and clears the in-flight flag
+/// (dropping any queued messages), so a session is never left permanently busy.
+/// The normal path disarms it and calls [`GatewayDispatcher::finish_turn`], which
+/// also advances the queue; the guard deliberately does *not* spawn from Drop.
+struct TurnGuard {
+    dispatcher: Arc<GatewayDispatcher>,
+    session: String,
+    armed: bool,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dispatcher.approvals.forget_pending(&self.session);
+            self.dispatcher.inflight.lock().unwrap().remove(&self.session);
+        }
     }
 }
 
@@ -637,5 +738,206 @@ mod tests {
         assert!(!state.is_session_approved("s2", "file:write"));
         state.clear("s1");
         assert!(!state.is_session_approved("s1", "file:write"));
+    }
+
+    // --- GatewayDispatcher turn queue / panic recovery -----------------------
+
+    use crate::domain::{
+        pairing::PairingRequest, repository::SessionRepository, session::Session, todo::TodoItem,
+    };
+    use tokio::sync::{Semaphore, mpsc};
+
+    /// A handler that announces each entered input on a channel and blocks until
+    /// the test grants a completion permit — so a test can hold a turn "in
+    /// flight" and observe dispatch order. Panics on the input `"boom"`.
+    struct GateHandler {
+        entered: mpsc::UnboundedSender<String>,
+        permits: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for GateHandler {
+        async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
+            let _ = self.entered.send(input.clone());
+            if input == "boom" {
+                panic!("boom");
+            }
+            let permit = self.permits.acquire().await.unwrap();
+            permit.forget();
+            Ok(input)
+        }
+    }
+
+    /// A sink that records every text sent through it.
+    struct RecordingSink {
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReplySink for RecordingSink {
+        async fn send(&self, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    // The plain-text turn path touches only the handler, approval state, and the
+    // in-flight map — never these repositories — so the fakes are unreachable.
+    struct UnusedSessions;
+    #[async_trait]
+    impl SessionRepository for UnusedSessions {
+        async fn find(&self, _id: &str) -> anyhow::Result<Option<Session>> {
+            unimplemented!()
+        }
+        async fn find_windowed(&self, _id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
+            unimplemented!()
+        }
+        async fn list(&self) -> anyhow::Result<Vec<Session>> {
+            unimplemented!()
+        }
+        async fn save(&self, _session: &Session) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+        async fn rotate(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+            unimplemented!()
+        }
+    }
+
+    struct UnusedHome;
+    #[async_trait]
+    impl HomeRepository for UnusedHome {
+        async fn get(&self) -> anyhow::Result<Option<String>> {
+            unimplemented!()
+        }
+        async fn set(&self, _session_id: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct UnusedTodos;
+    #[async_trait]
+    impl SessionTodoRepository for UnusedTodos {
+        async fn get(&self, _session_id: &str) -> anyhow::Result<Vec<TodoItem>> {
+            unimplemented!()
+        }
+        async fn set(&self, _session_id: &str, _items: &[TodoItem]) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn clear(&self, _session_id: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct UnusedPairings;
+    #[async_trait]
+    impl PairingRepository for UnusedPairings {
+        async fn upsert(&self, _request: &PairingRequest) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn find(
+            &self,
+            _platform: &str,
+            _sender_id: &str,
+        ) -> anyhow::Result<Option<PairingRequest>> {
+            unimplemented!()
+        }
+        async fn count_active_pending(&self, _platform: &str) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+        async fn approve_code(&self, _code: &str) -> anyhow::Result<ApproveOutcome> {
+            unimplemented!()
+        }
+        async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
+            unimplemented!()
+        }
+        async fn revoke(&self, _id: &str) -> anyhow::Result<bool> {
+            unimplemented!()
+        }
+    }
+
+    fn dispatcher_with(handler: Arc<GateHandler>) -> Arc<GatewayDispatcher> {
+        Arc::new(GatewayDispatcher::new(
+            handler,
+            Arc::new(ApprovalState::new()),
+            Arc::new(UnusedSessions),
+            Arc::new(UnusedHome),
+            Arc::new(UnusedTodos),
+            None,
+            Arc::new(UnusedPairings),
+        ))
+    }
+
+    /// Wait for the next entered input, failing the test on timeout so a wedge
+    /// surfaces as a failure rather than a hang.
+    async fn next_entered(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for a turn to start")
+            .expect("handler channel closed")
+    }
+
+    #[tokio::test]
+    async fn mid_turn_messages_queue_fifo_and_cap() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: permits.clone(),
+        });
+        let dispatcher = dispatcher_with(handler);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+
+        // m1 dispatches and blocks in the handler.
+        dispatcher.handle("s1", "m1".into(), sink.clone()).await;
+        assert_eq!(next_entered(&mut entered_rx).await, "m1");
+
+        // m2, m3 queue behind it; m4 overflows the cap and is rejected.
+        dispatcher.handle("s1", "m2".into(), sink.clone()).await;
+        dispatcher.handle("s1", "m3".into(), sink.clone()).await;
+        dispatcher.handle("s1", "m4".into(), sink.clone()).await;
+
+        // Release turns one at a time; the queue drains in FIFO order.
+        permits.add_permits(1);
+        assert_eq!(next_entered(&mut entered_rx).await, "m2");
+        permits.add_permits(1);
+        assert_eq!(next_entered(&mut entered_rx).await, "m3");
+        permits.add_permits(1);
+
+        // Let the final reply + rejection settle, then assert the overflow hint
+        // was delivered and no fourth turn ever started.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|t| t.contains("队列已满")),
+            "m4 should be rejected with the queue-full hint, got {sent:?}"
+        );
+        assert!(entered_rx.try_recv().is_err(), "m4 must not have run");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_does_not_wedge_the_session() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: permits.clone(),
+        });
+        let dispatcher = dispatcher_with(handler);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+
+        // First turn panics — the catch keeps the task alive and the guard/finish
+        // path releases the session.
+        dispatcher.handle("s1", "boom".into(), sink.clone()).await;
+        assert_eq!(next_entered(&mut entered_rx).await, "boom");
+
+        // A later message must still be handled (session not permanently busy).
+        dispatcher.handle("s1", "after".into(), sink.clone()).await;
+        permits.add_permits(1);
+        assert_eq!(next_entered(&mut entered_rx).await, "after");
     }
 }

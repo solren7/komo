@@ -664,11 +664,26 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         if self.armed {
             self.dispatcher.approvals.forget_pending(&self.session);
-            self.dispatcher
+            self.dispatcher.approvals.release_gate(&self.session);
+            let dropped = self
+                .dispatcher
                 .inflight
                 .lock()
                 .unwrap()
-                .remove(&self.session);
+                .remove(&self.session)
+                .map(|q| q.len())
+                .unwrap_or(0);
+            // Queued messages can't be dispatched from Drop (no spawning here)
+            // and their senders can't be notified (replies are async). This
+            // path is effectively cancellation-only — gateway shutdown — so the
+            // loss is inherent, but it must at least be visible in the log.
+            if dropped > 0 {
+                warn!(
+                    session = %self.session,
+                    dropped,
+                    "turn cancelled; queued messages discarded"
+                );
+            }
         }
     }
 }

@@ -8,7 +8,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 ```bash
 cargo check                        # fast compile check
 cargo build                        # build
-cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
+cargo run -- chat                  # interactive chat: full-screen TUI on a terminal, line REPL when piped or with --plain (db at ~/.shion/shion.db)
 cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram, wechat)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
@@ -340,6 +340,8 @@ kanban.db connections), and two cross-cutting files at the top level —
 
 `cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
 - Session ids are program-managed (uuid v7); `shion chat` always starts a fresh session, and `/new`/`/clear` are equivalent — both open a new session. There is no user-supplied session id at the chat prompt and no `/session` subcommand. The one way to re-enter an existing session is `shion session resume <id>` (`cli/chat.rs::resume`): it reopens the same REPL bound to that id so its transcript threads and the conversation continues, erroring if no such session exists (it never creates one). Routes over the gateway when the lock is held (verifying the id via `GET /api/sessions` first), else in-process against the db like `shion chat`.
+
+`tui/` — the full-screen chat TUI (ratatui), `shion chat`'s default front end on a real terminal (`--plain` or a piped stdin/stdout keeps the line REPL above — `cli/app.rs::use_tui` is the dispatch, mirrored by `main.rs::will_run_tui` which routes tracing to `~/.shion/logs/chat-tui.log` so stderr log lines can't tear the alternate screen). Strictly a front end: it reuses the same two backends as the REPL (`GatewayClient::chat` over trusted loopback when the gateway holds the lock, else the in-process `AgentRuntime`) and adds no protocol of its own. Layout: scrollable transcript (CJK-width-aware wrapping in `tui/ui.rs`, bottom-anchored scroll) · status line with a turn spinner · bordered input box. In local mode, tool approvals arrive over a channel (`tui/approver.rs::TuiApprover`, replacing `CliApprover`'s stdin prompt) and render as a modal — `y` allow once / `s` allow for the session / `n`/Esc deny; concurrent requests queue, one modal at a time, and a dropped modal reads as denial. Turn futures run on spawned tasks so the event loop (`tui/mod.rs`, `tokio::select!` over key events / turn results / approval prompts / a spinner tick) keeps handling keys mid-turn; one turn at a time per session, `/new` rotates the id client-side exactly like the REPL. State + key handling live terminal-free in `tui/app.rs` (unit-tested); streaming output and markdown rendering are deliberately not in v1.
 
 `agent/daemon.rs` — background maintenance supervisor, hosted by the gateway (pattern borrowed from gbrain's `autopilot` supervisor)
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work

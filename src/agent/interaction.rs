@@ -586,10 +586,9 @@ impl GatewayDispatcher {
             // Catch a panic in the turn (LLM client, a repository, etc.) so a
             // single bad turn neither wedges the session nor loses the queued
             // follow-ups: the session is advanced normally below either way.
-            let outcome =
-                AssertUnwindSafe(with_session(ctx, this.handler.handle(&session, input)))
-                    .catch_unwind()
-                    .await;
+            let outcome = AssertUnwindSafe(with_session(ctx, this.handler.handle(&session, input)))
+                .catch_unwind()
+                .await;
             let reply = match outcome {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(error)) => {
@@ -653,7 +652,11 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         if self.armed {
             self.dispatcher.approvals.forget_pending(&self.session);
-            self.dispatcher.inflight.lock().unwrap().remove(&self.session);
+            self.dispatcher
+                .inflight
+                .lock()
+                .unwrap()
+                .remove(&self.session);
         }
     }
 }

@@ -21,7 +21,10 @@ use crate::{
     config::{ModelConfig, Provider},
     domain::{
         llm::{LlmClient, Step, ToolCallReq, ToolOutcome, TurnDriver},
-        memory::{MemoryContext, MemoryRepository, ScoredMemory, recall_query_hash},
+        memory::{
+            MemoryContext, MemoryRepository, ScoredMemory, recall_query_hash, select_pinned,
+            select_recall,
+        },
         message::{Message, Role},
         session::Session,
         tool::Tool,
@@ -143,33 +146,35 @@ where
         if let Some(memories) = &self.memories {
             let ctx = MemoryContext::from_session(&session.id);
 
-            // L1 pinned profile. Capture the ids so the same memory is not also
-            // echoed by L3 recall below (a pinned memory is active + in-scope, so
-            // it would otherwise surface twice).
-            let mut pinned_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            match memories.pinned(&ctx).await {
-                Ok(pinned) => {
-                    pinned_ids = pinned.iter().map(|m| m.id.clone()).collect();
+            // Load the store once and derive both tiers from it — pinned and
+            // recall used to each scan the whole store, so this halves the
+            // per-turn memory IO (and deserialization) on the reply path.
+            match memories.list().await {
+                Ok(all) => {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+                    // L1 pinned profile. Capture the ids so the same memory is
+                    // not also echoed by L3 recall below (a pinned memory is
+                    // active + in-scope, so it would otherwise surface twice).
+                    let pinned = select_pinned(&all, &ctx, now);
+                    let pinned_ids: std::collections::HashSet<String> =
+                        pinned.iter().map(|m| m.id.clone()).collect();
                     if let Some(block) = render_pinned_memory_block(&pinned) {
                         preamble.push_str("\n\n");
                         preamble.push_str(&block);
                     }
-                }
-                Err(error) => tracing::warn!(%error, "failed to load pinned memories"),
-            }
 
-            // L3 active recall: facts relevant to this turn's message, appended
-            // after pinned so the volatile|pinned|recall order holds (pinned is
-            // cross-turn stable, recall is per-query cold — stable goes first to
-            // keep the prefix cacheable). Same non-fatal-but-logged contract.
-            //
-            // Fetch wide, inject narrow: up to RECALL_FETCH lexical candidates;
-            // past RECALL_LIMIT survivors the aux recall agent screens them
-            // (lexical CJK-bigram overlap has real false positives), otherwise
-            // the top RECALL_LIMIT inject directly with zero added latency.
-            match memories.recall(&ctx, &prompt, RECALL_FETCH).await {
-                Ok(mut hits) => {
+                    // L3 active recall: facts relevant to this turn's message,
+                    // appended after pinned so the volatile|pinned|recall order
+                    // holds (pinned is cross-turn stable, recall is per-query
+                    // cold — stable goes first to keep the prefix cacheable).
+                    //
+                    // Fetch wide, inject narrow: up to RECALL_FETCH lexical
+                    // candidates; past RECALL_LIMIT survivors the aux recall
+                    // agent screens them (lexical CJK-bigram overlap has real
+                    // false positives), otherwise the top RECALL_LIMIT inject
+                    // directly with zero added latency.
+                    let mut hits = select_recall(&all, &ctx, &prompt, RECALL_FETCH, now);
                     hits.retain(|h| !pinned_ids.contains(&h.memory.id));
                     let hits = match &self.aux {
                         Some(aux) if hits.len() > RECALL_LIMIT => {
@@ -203,7 +208,7 @@ where
                         });
                     }
                 }
-                Err(error) => tracing::warn!(%error, "failed to recall memories"),
+                Err(error) => tracing::warn!(%error, "failed to load memories for turn"),
             }
         }
 

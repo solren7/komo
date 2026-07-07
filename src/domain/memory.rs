@@ -386,17 +386,25 @@ pub fn rerank_score(memory: &Memory, query_lower: &str, now: i64) -> Option<f64>
     if !query_lower.is_empty() {
         score += 2.0; // lexical match
     }
-    score += memory.importance as f64 / 100.0; // 0..~1
-    score += match memory.confidence {
+    score += signal_bonus(memory, now);
+    Some(score)
+}
+
+/// The importance + confidence + recency bonus shared by L2 rerank
+/// ([`rerank_score`]) and L3 recall ([`recall_score`]) scoring. Factored out so
+/// the two ranking formulas can't drift apart: importance in `0..~1`, a
+/// confidence step, and a 30-day half-life decay on the last update.
+fn signal_bonus(memory: &Memory, now: i64) -> f64 {
+    let mut bonus = memory.importance as f64 / 100.0; // 0..~1
+    bonus += match memory.confidence {
         MemoryConfidence::UserWritten => 0.4,
         MemoryConfidence::Confirmed => 0.3,
         MemoryConfidence::Inferred => 0.1,
         MemoryConfidence::Extracted => 0.0,
     };
-    // Recency: 30-day half-life decay on the last update.
     let age_days = (now - memory.updated_at).max(0) as f64 / 86_400.0;
-    score += 0.5 * (-age_days / 30.0).exp();
-    Some(score)
+    bonus += 0.5 * (-age_days / 30.0).exp();
+    bonus
 }
 
 // ── recall (L3) ───────────────────────────────────────────────────────────────
@@ -542,16 +550,63 @@ pub fn recall_score(memory: &Memory, query_terms: &HashSet<String>, now: i64) ->
         return None;
     }
     let mut score = overlap as f64; // each shared term = 1.0
-    score += memory.importance as f64 / 100.0;
-    score += match memory.confidence {
-        MemoryConfidence::UserWritten => 0.4,
-        MemoryConfidence::Confirmed => 0.3,
-        MemoryConfidence::Inferred => 0.1,
-        MemoryConfidence::Extracted => 0.0,
-    };
-    let age_days = (now - memory.updated_at).max(0) as f64 / 86_400.0;
-    score += 0.5 * (-age_days / 30.0).exp();
+    score += signal_bonus(memory, now);
     Some(score)
+}
+
+/// Filter + rank an already-loaded memory set for the L1 pinned profile in
+/// `ctx` (most-important first, ties by most-recent). Split out from
+/// [`MemoryRepository::pinned`] so a caller holding a fresh `list()` can derive
+/// both pinned and recall from a single load — see `assemble` in `infra/llm.rs`,
+/// which used to scan the store twice per turn.
+pub fn select_pinned(memories: &[Memory], ctx: &MemoryContext, now: i64) -> Vec<Memory> {
+    let mut pinned: Vec<Memory> = memories
+        .iter()
+        .filter(|m| m.is_pinnable(ctx, now))
+        .cloned()
+        .collect();
+    pinned.sort_by(|a, b| {
+        b.importance
+            .cmp(&a.importance)
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    pinned
+}
+
+/// Rank an already-loaded memory set for L3 recall against `text`, top `limit`
+/// (`0` = no cap). Same filter/score/sort as [`MemoryRepository::recall`], split
+/// out for the single-load turn path (see [`select_pinned`]).
+pub fn select_recall(
+    memories: &[Memory],
+    ctx: &MemoryContext,
+    text: &str,
+    limit: usize,
+    now: i64,
+) -> Vec<ScoredMemory> {
+    let query_terms = recall_terms(text);
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<ScoredMemory> = memories
+        .iter()
+        .filter(|m| matches!(m.status, MemoryStatus::Active | MemoryStatus::Candidate))
+        .filter(|m| ctx.allows(&m.scope))
+        .filter_map(|m| {
+            recall_score(m, &query_terms, now).map(|score| ScoredMemory {
+                memory: m.clone(),
+                score,
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if limit > 0 {
+        scored.truncate(limit);
+    }
+    scored
 }
 
 // ── repository ────────────────────────────────────────────────────────────────
@@ -571,19 +626,7 @@ pub trait MemoryRepository: Send + Sync {
     /// [`Memory::is_pinnable`]; a store may override for efficiency.
     async fn pinned(&self, ctx: &MemoryContext) -> anyhow::Result<Vec<Memory>> {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut pinned: Vec<Memory> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|m| m.is_pinnable(ctx, now))
-            .collect();
-        // Most important first; ties broken by most-recently-updated.
-        pinned.sort_by(|a, b| {
-            b.importance
-                .cmp(&a.importance)
-                .then(b.updated_at.cmp(&a.updated_at))
-        });
-        Ok(pinned)
+        Ok(select_pinned(&self.list().await?, ctx, now))
     }
 
     /// Fetch a single memory by id. Default scans [`list`](MemoryRepository::list)
@@ -662,30 +705,8 @@ pub trait MemoryRepository: Send + Sync {
         text: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<ScoredMemory>> {
-        let query_terms = recall_terms(text);
-        if query_terms.is_empty() {
-            return Ok(Vec::new());
-        }
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut scored: Vec<ScoredMemory> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|m| matches!(m.status, MemoryStatus::Active | MemoryStatus::Candidate))
-            .filter(|m| ctx.allows(&m.scope))
-            .filter_map(|m| {
-                recall_score(&m, &query_terms, now).map(|score| ScoredMemory { memory: m, score })
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if limit > 0 {
-            scored.truncate(limit);
-        }
-        Ok(scored)
+        Ok(select_recall(&self.list().await?, ctx, text, limit, now))
     }
 
     /// Record that memories surfaced in recall: bump `recall_count`, stamp
@@ -902,6 +923,40 @@ mod tests {
         assert!(recall_score(&m, &miss, now).is_none());
         // Empty query → excluded.
         assert!(recall_score(&m, &HashSet::new(), now).is_none());
+    }
+
+    #[test]
+    fn select_pinned_keeps_only_eligible_and_orders_by_importance() {
+        let ctx = MemoryContext::from_session("cli");
+        let now = 1_000;
+        let mut low = pinnable_memory();
+        low.importance = 10;
+        let mut high = pinnable_memory();
+        high.importance = 90;
+        let mut ineligible = pinnable_memory();
+        ineligible.pinned = false; // not pinnable
+        let picked = select_pinned(&[low.clone(), high.clone(), ineligible], &ctx, now);
+        assert_eq!(picked.len(), 2, "the un-pinned memory is excluded");
+        assert_eq!(picked[0].id, high.id, "most important first");
+        assert_eq!(picked[1].id, low.id);
+    }
+
+    #[test]
+    fn select_recall_ranks_in_scope_matches_and_caps() {
+        let ctx = MemoryContext::from_session("cli");
+        let now = 1_000;
+        let mut hit = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
+        hit.updated_at = now;
+        let miss = Memory::new(MemoryKind::Fact, "unrelated weather note");
+        let scored = select_recall(&[hit.clone(), miss], &ctx, "rust toolchain", 5, now);
+        assert_eq!(
+            scored.len(),
+            1,
+            "only the lexically overlapping memory scores"
+        );
+        assert_eq!(scored[0].memory.id, hit.id);
+        // limit is honoured.
+        assert!(select_recall(&[hit], &ctx, "rust toolchain", 0, now).len() <= 1);
     }
 
     #[test]

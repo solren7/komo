@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -435,24 +434,28 @@ impl SessionRepository for Db {
     async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
         let mut conn = self.inner.connection().await?;
         let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
-        // One scan of user messages → per-session user-turn counts, instead of
-        // materializing every session's transcript just to size the sweep.
-        let role = format!("{:?}", Role::User).to_lowercase();
-        let user_msgs = toasty::query!(MessageRecord FILTER .role == #role)
+        // Per-session COUNT pushed down to SQL (via the `session_id` index, same
+        // pattern as `count_user_turns`), so no message body is ever
+        // materialized just to size the sweep. Sessions accumulate (`/new`
+        // archives keep their transcripts), so a full user-message scan here
+        // would deserialize every transcript's content each cycle.
+        let mut candidates = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let sid = &s.id;
+            let role = format!("{:?}", Role::User).to_lowercase();
+            let n = toasty::query!(
+                MessageRecord FILTER .session_id == #sid AND .role == #role
+            )
+            .count()
             .exec(&mut conn)
             .await?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for m in user_msgs {
-            *counts.entry(m.session_id).or_default() += 1;
-        }
-        Ok(sessions
-            .into_iter()
-            .map(|s| ReviewCandidate {
-                user_turns: counts.get(&s.id).copied().unwrap_or(0),
+            candidates.push(ReviewCandidate {
+                user_turns: n as usize,
                 reviewed_through: s.reviewed_through.max(0) as usize,
                 id: s.id,
-            })
-            .collect())
+            });
+        }
+        Ok(candidates)
     }
 
     async fn mark_reviewed(&self, session_id: &str, through: usize) -> anyhow::Result<()> {

@@ -94,7 +94,15 @@ impl Notifier for HomeNotifier {
                 } else {
                     format!("{title}\n{body}")
                 };
-                sender.send_text(&chat_id, &text).await
+                // Surface a delivery failure (e.g. a WeChat home with no
+                // in-memory context_token yet after a restart) — the caller
+                // still sees the Err, but silence made "why didn't the reminder
+                // arrive" unanswerable.
+                if let Err(error) = sender.send_text(&chat_id, &text).await {
+                    warn!(%error, %chat_id, "home notification delivery failed");
+                    return Err(error);
+                }
+                Ok(())
             }
             None => self.local.notify(title, body).await,
         }

@@ -93,12 +93,19 @@ pub struct ReviewSweep {
 #[async_trait]
 impl Maintenance for ReviewSweep {
     async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        let sessions = self.sessions.list().await?;
+        // Scan the cheap projection (id + counts, no transcripts) and review
+        // only sessions with user turns the reviewer hasn't seen yet, instead of
+        // loading and re-reviewing every session every cycle.
+        let candidates = self.sessions.review_candidates().await?;
         let mut summary = MaintenanceSummary::default();
-        for session in sessions {
-            if session.user_turns() == 0 {
+        for candidate in candidates {
+            if candidate.user_turns == 0 || candidate.user_turns <= candidate.reviewed_through {
                 continue;
             }
+            // Materialize the full transcript only for a session that needs it.
+            let Some(session) = self.sessions.find(&candidate.id).await? else {
+                continue;
+            };
             // Isolate per-session failures: a single bad review must not abort
             // the whole sweep (gbrain's "a failing phase never crashes the loop").
             match self.reviewer.review(&session).await {
@@ -107,9 +114,20 @@ impl Maintenance for ReviewSweep {
                     summary.memories_written += outcome.memories_written.len();
                     summary.skills_written += outcome.skills_written.len();
                     summary.tasks_captured += outcome.tasks_captured.len();
+                    // Advance the watermark so the next sweep skips this session
+                    // until new turns arrive. Best-effort: a failed mark just
+                    // means it's reviewed again next cycle (dedup guards make
+                    // that harmless), never a failed sweep.
+                    if let Err(error) = self
+                        .sessions
+                        .mark_reviewed(&candidate.id, candidate.user_turns)
+                        .await
+                    {
+                        warn!(%error, session = %candidate.id, "failed to advance review watermark");
+                    }
                 }
                 Err(error) => {
-                    warn!(%error, session = %session.id, "session review failed (skipped)")
+                    warn!(%error, session = %candidate.id, "session review failed (skipped)")
                 }
             }
         }
@@ -1246,6 +1264,116 @@ mod tests {
             *inner.0.lock().unwrap(),
             0,
             "inner must not run off a workday"
+        );
+    }
+
+    // ── ReviewSweep watermark ─────────────────────────────────────────────────
+
+    use crate::domain::repository::{ReviewCandidate, SessionRepository};
+    use crate::domain::reviewer::{ReviewOutcome, Reviewer};
+    use crate::domain::session::Session;
+
+    /// Sessions with hand-set watermarks; records which ids were reviewed and
+    /// what watermark they were marked at.
+    struct FakeSessions {
+        candidates: Vec<ReviewCandidate>,
+        marked: Mutex<Vec<(String, usize)>>,
+    }
+
+    #[async_trait]
+    impl SessionRepository for FakeSessions {
+        async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
+            // A non-empty transcript so the reviewer has something to chew on.
+            let mut s = Session::new(id);
+            s.messages.push(Message::user("hi"));
+            Ok(Some(s))
+        }
+        async fn find_windowed(&self, id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
+            self.find(id).await
+        }
+        async fn list(&self) -> anyhow::Result<Vec<Session>> {
+            unimplemented!("the sweep uses review_candidates, not list")
+        }
+        async fn save(&self, _session: &Session) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn rotate(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+            Ok(self
+                .candidates
+                .iter()
+                .map(|c| ReviewCandidate {
+                    id: c.id.clone(),
+                    user_turns: c.user_turns,
+                    reviewed_through: c.reviewed_through,
+                })
+                .collect())
+        }
+        async fn mark_reviewed(&self, session_id: &str, through: usize) -> anyhow::Result<()> {
+            self.marked
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), through));
+            Ok(())
+        }
+    }
+
+    /// Records which session ids it was asked to review.
+    #[derive(Default)]
+    struct RecordingReviewer(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Reviewer for RecordingReviewer {
+        async fn review(&self, session: &Session) -> anyhow::Result<ReviewOutcome> {
+            self.0.lock().unwrap().push(session.id.clone());
+            Ok(ReviewOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn review_sweep_skips_sessions_without_new_turns() {
+        let sessions = Arc::new(FakeSessions {
+            candidates: vec![
+                // No user turns → skipped.
+                ReviewCandidate {
+                    id: "empty".into(),
+                    user_turns: 0,
+                    reviewed_through: 0,
+                },
+                // Already reviewed through its current turns → skipped.
+                ReviewCandidate {
+                    id: "caught-up".into(),
+                    user_turns: 3,
+                    reviewed_through: 3,
+                },
+                // New turns since last review → reviewed, watermark advanced.
+                ReviewCandidate {
+                    id: "fresh".into(),
+                    user_turns: 5,
+                    reviewed_through: 2,
+                },
+            ],
+            marked: Mutex::new(Vec::new()),
+        });
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let sweep = ReviewSweep {
+            sessions: sessions.clone() as Arc<dyn SessionRepository>,
+            reviewer: reviewer.clone() as Arc<dyn Reviewer>,
+        };
+
+        let summary = sweep.run().await.unwrap();
+
+        assert_eq!(summary.sessions_reviewed, 1);
+        assert_eq!(*reviewer.0.lock().unwrap(), vec!["fresh".to_string()]);
+        assert_eq!(
+            *sessions.marked.lock().unwrap(),
+            vec![("fresh".to_string(), 5)],
+            "only the reviewed session's watermark advances, to its live count"
         );
     }
 }

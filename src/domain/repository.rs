@@ -2,6 +2,18 @@ use async_trait::async_trait;
 
 use super::{message::Message, session::Session, skill::Skill};
 
+/// A session's identity + review watermark without its transcript — the cheap
+/// projection the review sweep scans to decide which sessions have new activity,
+/// so it needn't materialize every session's messages every cycle.
+pub struct ReviewCandidate {
+    pub id: String,
+    /// Live user-turn count (matches [`Session::user_turns`]).
+    pub user_turns: usize,
+    /// User-turn count already reviewed (0 = never). A session is skipped when
+    /// `user_turns <= reviewed_through`.
+    pub reviewed_through: usize,
+}
+
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
     /// Find a session by id. Returns None if it does not exist.
@@ -27,6 +39,19 @@ pub trait SessionRepository: Send + Sync {
     /// transcript is preserved (the reviewer can still see it). Returns the
     /// archived id, or `None` when there was nothing to archive.
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// Lightweight scan for the review sweep: each session's id, live user-turn
+    /// count, and review watermark, with no transcript loaded. Default returns
+    /// nothing — a store without a watermark opts out of incremental review.
+    async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        Ok(Vec::new())
+    }
+
+    /// Record that `session_id` has been reviewed through `through` user turns,
+    /// so the next sweep skips it until new turns arrive. Default is a no-op.
+    async fn mark_reviewed(&self, _session_id: &str, _through: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

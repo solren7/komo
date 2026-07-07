@@ -156,12 +156,20 @@ impl AgentRuntime {
                 // rather than handing it the truncated working window.
                 if let Some(snapshot) = self.sessions.find(session_id).await? {
                     let reviewer = reviewer.clone();
+                    // Advance the shared review watermark on success so the
+                    // background sweep doesn't re-review what this just covered.
+                    let sessions = self.sessions.clone();
+                    let sid = session_id.to_string();
                     tokio::spawn(async move {
                         match reviewer.review(&snapshot).await {
-                            Ok(outcome) if !outcome.is_empty() => {
-                                info!(?outcome, "self-improvement review")
+                            Ok(outcome) => {
+                                if !outcome.is_empty() {
+                                    info!(?outcome, "self-improvement review");
+                                }
+                                if let Err(error) = sessions.mark_reviewed(&sid, turns).await {
+                                    warn!(%error, "failed to advance review watermark");
+                                }
                             }
-                            Ok(_) => {}
                             Err(error) => warn!(%error, "review failed (non-fatal)"),
                         }
                     });

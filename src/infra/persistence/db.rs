@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use crate::domain::{
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
-    repository::{MessageRepository, SessionRepository},
+    repository::{MessageRepository, ReviewCandidate, SessionRepository},
     run::{INTERRUPTED_ERROR, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
@@ -30,6 +31,12 @@ struct SessionRecord {
     #[key]
     id: String,
     created_at: i64,
+
+    /// User-turn count already covered by the reflective reviewer (0 = never
+    /// reviewed). The review sweep compares this against the live user-turn
+    /// count and skips a session with no new turns, so it no longer re-reviews
+    /// every session on every cycle. Reset to 0 when the transcript rotates.
+    reviewed_through: i64,
 
     #[has_many]
     messages: toasty::Deferred<Vec<MessageRecord>>,
@@ -311,6 +318,7 @@ impl SessionRepository for Db {
         let _ = toasty::create!(SessionRecord {
             id: session.id.clone(),
             created_at: session.created_at,
+            reviewed_through: 0,
         })
         .exec(&mut conn)
         .await;
@@ -339,7 +347,7 @@ impl SessionRepository for Db {
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
         let mut conn = self.inner.connection().await?;
         // Nothing to archive if the session is absent or already empty.
-        let Ok(live) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+        let Ok(mut live) = SessionRecord::get_by_id(&mut conn, session_id).await else {
             return Ok(None);
         };
         let msgs = live.messages().exec(&mut conn).await?;
@@ -349,11 +357,17 @@ impl SessionRepository for Db {
 
         // Move the transcript to a fresh archive session, preserving its start
         // time; the live row stays and is now empty for the next conversation.
+        // The archive inherits the live session's review watermark (its
+        // transcript, hence its user-turn count, is unchanged) so an
+        // already-reviewed conversation isn't re-reviewed under the archive id,
+        // while any unreviewed tail still is.
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let archived_id = format!("{session_id}#{now}");
+        let prior_reviewed = live.reviewed_through;
         toasty::create!(SessionRecord {
             id: archived_id.clone(),
             created_at: live.created_at,
+            reviewed_through: prior_reviewed,
         })
         .exec(&mut conn)
         .await?;
@@ -369,7 +383,47 @@ impl SessionRepository for Db {
             .await?;
             msg.delete().exec(&mut conn).await?;
         }
+        // The live row is now a fresh, empty conversation: reset its watermark
+        // so the first new turn isn't compared against the archived count.
+        live.update().reviewed_through(0).exec(&mut conn).await?;
         Ok(Some(archived_id))
+    }
+
+    async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        let mut conn = self.inner.connection().await?;
+        let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
+        // One scan of user messages → per-session user-turn counts, instead of
+        // materializing every session's transcript just to size the sweep.
+        let role = format!("{:?}", Role::User).to_lowercase();
+        let user_msgs = toasty::query!(MessageRecord FILTER .role == #role)
+            .exec(&mut conn)
+            .await?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for m in user_msgs {
+            *counts.entry(m.session_id).or_default() += 1;
+        }
+        Ok(sessions
+            .into_iter()
+            .map(|s| ReviewCandidate {
+                user_turns: counts.get(&s.id).copied().unwrap_or(0),
+                reviewed_through: s.reviewed_through.max(0) as usize,
+                id: s.id,
+            })
+            .collect())
+    }
+
+    async fn mark_reviewed(&self, session_id: &str, through: usize) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = SessionRecord::get_by_id(&mut conn, session_id).await?;
+            record
+                .update()
+                .reviewed_through(through as i64)
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 }
 

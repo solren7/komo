@@ -58,20 +58,31 @@ impl Reviewer for ReflectiveReviewer {
         let ctx = MemoryContext::from_session(&session.id);
         let mut outcome = ReviewOutcome::default();
 
-        // Anti-self-cannibalization (roadmap §5): collect the content keys of the
-        // active, in-scope memories — exactly the set eligible to be recalled
-        // into this session. A re-extraction whose content matches one of these
-        // is the assistant echoing its own injected context, not a fresh user
-        // disclosure, so it must not be re-ingested as a new candidate. Exact
-        // content-key match only; fuzzy/semantic dedup is deferred to embedding-
-        // based recall (§5-D).
-        let known_keys: std::collections::HashSet<String> = self
-            .memories
-            .list()
-            .await?
-            .into_iter()
+        // Load the memory store once and derive both dedup guards from it,
+        // instead of re-scanning per suggestion (the sweep runs the reviewer
+        // over every active session — the per-suggestion scans were O(sessions ×
+        // suggestions) full-table reads).
+        //
+        //  - `known_keys` (anti-self-cannibalization, roadmap §5): content keys
+        //    of active, in-scope memories — exactly the set eligible to be
+        //    recalled into this session. A re-extraction matching one is the
+        //    assistant echoing its own injected context, not a fresh user
+        //    disclosure. Exact content-key match only; fuzzy/semantic dedup is
+        //    deferred to embedding-based recall (§5-D).
+        //  - `seen_keys` (cross-sweep dedup): the `source_message_id`s this
+        //    session already produced (any status), mirroring
+        //    `find_by_source_message_id(session.id, key)`. Mutable so a duplicate
+        //    within this same review is also caught.
+        let all_memories = self.memories.list().await?;
+        let known_keys: std::collections::HashSet<String> = all_memories
+            .iter()
             .filter(|m| m.status == MemoryStatus::Active && ctx.allows(&m.scope))
             .map(|m| memory_key(&m.content))
+            .collect();
+        let mut seen_keys: std::collections::HashSet<String> = all_memories
+            .iter()
+            .filter(|m| m.source == session.id && !m.source_message_id.is_empty())
+            .map(|m| m.source_message_id.clone())
             .collect();
 
         for suggestion in suggestions.memories {
@@ -84,19 +95,10 @@ impl Reviewer for ReflectiveReviewer {
                 .map(parse_memory_kind)
                 .unwrap_or(MemoryKind::Fact);
             // Content-derived dedup key: skip if this session already produced
-            // the same fact on an earlier sweep (mirrors commitment dedup).
+            // the same fact (an earlier sweep or earlier in this review), or if
+            // shion already holds it as an active, in-scope memory.
             let key = memory_key(&suggestion.content);
-            if self
-                .memories
-                .find_by_source_message_id(&session.id, &key)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            // …or if shion already holds this fact as an active, in-scope memory
-            // (the self-cannibalization guard above).
-            if known_keys.contains(&key) {
+            if seen_keys.contains(&key) || known_keys.contains(&key) {
                 continue;
             }
             let mut memory = Memory::new(kind, suggestion.content);
@@ -109,8 +111,9 @@ impl Reviewer for ReflectiveReviewer {
             memory.scope = ctx.write_scope();
             // Tag the origin so a later answer can trace why shion believes this.
             memory.source = session.id.clone();
-            memory.source_message_id = key;
+            memory.source_message_id = key.clone();
             self.memories.save(&memory).await?;
+            seen_keys.insert(key);
             outcome.memories_written.push(memory.id);
         }
 

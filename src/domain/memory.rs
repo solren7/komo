@@ -666,24 +666,6 @@ pub trait MemoryRepository: Send + Sync {
         Ok(scored)
     }
 
-    /// Find a memory by its origin + content-derived dedup key, for reviewer
-    /// re-extraction guarding (mirrors `TaskRepository`). An empty key never
-    /// matches a real extraction. Default scans [`list`](MemoryRepository::list).
-    async fn find_by_source_message_id(
-        &self,
-        source: &str,
-        source_message_id: &str,
-    ) -> anyhow::Result<Option<Memory>> {
-        if source_message_id.is_empty() {
-            return Ok(None);
-        }
-        Ok(self
-            .list()
-            .await?
-            .into_iter()
-            .find(|m| m.source == source && m.source_message_id == source_message_id))
-    }
-
     /// L3 active recall: the in-scope memories most relevant to `text` (the
     /// current user message), ranked by [`recall_score`], top `limit`. Unlike
     /// [`search`](MemoryRepository::search) — which substring-matches a focused
@@ -699,6 +681,12 @@ pub trait MemoryRepository: Send + Sync {
     /// the `DreamSweep` then uses to auto-promote it. Candidates score lower
     /// (their `Extracted` confidence adds nothing) and the rendered block tags
     /// each line with confidence, so the model treats them cautiously.
+    ///
+    /// The per-turn hot path in `infra/llm.rs` uses [`select_recall`] over a
+    /// single shared `list()` instead (see [`select_pinned`]); this method is
+    /// the standalone entry point retained for the memory store's query surface
+    /// and its integration tests.
+    #[allow(dead_code)]
     async fn recall(
         &self,
         ctx: &MemoryContext,

@@ -27,6 +27,7 @@ use crate::{
         skills::FsSkillStore,
     },
     services::{
+        memory_enrichment::MemoryEnricher,
         skill_registry::SkillRegistry,
         tool_execution::{ToolExecutionConfig, ToolExecutor},
     },
@@ -132,7 +133,7 @@ pub async fn build(
     let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
-    let aux_llm = build_llm(&aux_config, None, aux_preamble, None, None)?;
+    let aux_llm = build_llm(&aux_config, None, aux_preamble, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // The governed skill store: `~/.shion/skills` is the shion-owned home for
@@ -201,15 +202,13 @@ pub async fn build(
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 
     // Hand the same tool instances to the LLM so the model can call them, plus
-    // the memory store for L1 pinned injection and the aux agent for recall
-    // screening (main agent only).
-    let llm = build_llm(
-        model_config,
-        Some(&tools),
-        preamble,
-        Some(memory_repo.clone()),
+    // the memory enricher (main agent only): the memory store for pinned/recall
+    // selection and the aux agent for recall screening, behind one interface.
+    let enricher = Arc::new(MemoryEnricher::new(
+        memory_repo.clone(),
         Some(aux_llm.clone()),
-    )?;
+    ));
+    let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher))?;
     let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
         aux_llm.clone(),

@@ -5,7 +5,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    agent::system_prompt::{PINNED_MEMORY_BUDGET, render_pinned_memory_block},
     domain::{
         memory::{
             Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
@@ -13,7 +12,7 @@ use crate::{
         },
         tool::Tool,
     },
-    services::tool_execution::current_session,
+    services::{memory_enrichment::pinned_budget_usage, tool_execution::current_session},
 };
 
 /// Default cap on search results.
@@ -66,15 +65,13 @@ impl MemoryTool {
     /// to report). Best-effort: a load failure just omits the line.
     async fn pinned_usage_line(&self) -> Option<String> {
         let pinned = self.memories.pinned(&ctx()).await.ok()?;
-        let used = render_pinned_memory_block(&pinned)
-            .map(|b| b.len())
-            .unwrap_or(0);
+        let (used, budget) = pinned_budget_usage(&pinned);
         if used == 0 {
             return None;
         }
-        let pct = (used * 100) / PINNED_MEMORY_BUDGET;
+        let pct = (used * 100) / budget;
         Some(format!(
-            "L1 pinned profile: {used}/{PINNED_MEMORY_BUDGET} chars ({pct}%) used."
+            "L1 pinned profile: {used}/{budget} chars ({pct}%) used."
         ))
     }
 

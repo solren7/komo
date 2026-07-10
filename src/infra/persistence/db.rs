@@ -202,6 +202,11 @@ impl Db {
                 "\"reviewed_through\" integer NOT NULL DEFAULT 0",
             )];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
+            const RUN_COLUMNS: &[(&str, &str)] = &[(
+                "recoverable",
+                "\"recoverable\" boolean NOT NULL DEFAULT false",
+            )];
+            ensure_columns(p, "run_records", RUN_COLUMNS).await?;
         }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
@@ -1827,6 +1832,64 @@ mod tests {
         let candidates = SessionRepository::review_candidates(&db).await.unwrap();
         let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
         assert_eq!(c.reviewed_through, 1);
+    }
+
+    /// A shion.db created before `recoverable` existed must gain the column
+    /// **in place** on connect, like `reviewed_through` above — otherwise an
+    /// upgraded gateway 500s every run-ledger read ("no such column:
+    /// recoverable") until the operator remembers the delete-to-reset.
+    #[tokio::test]
+    async fn adds_missing_run_columns_in_place() {
+        let path = std::env::temp_dir().join("shion_db_addcol_runs.db");
+        crate::infra::persistence::reset_test_db(&path);
+
+        // 1. Seed a turso file with the OLD run_records shape (no recoverable):
+        //    one crash-residue row, still `running` with the ended_at sentinel.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"run_records\" (\
+                 \"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \
+                 \"input\" TEXT NOT NULL, \"plan\" TEXT NOT NULL, \
+                 \"status\" TEXT NOT NULL, \"final_output\" TEXT NOT NULL, \
+                 \"error\" TEXT NOT NULL, \"started_at\" BIGINT NOT NULL, \
+                 \"ended_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"run_records\" VALUES \
+                 ('r-old', 'cli:old', 'hi', 'respond', 'running', '', '', 100, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        // 2. Connect via Db: ensure_columns adds `recoverable` in place, and
+        //    run-ledger reads work again.
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let runs = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "pre-migration run survives");
+        assert!(!runs[0].recoverable, "new column defaults to false");
+
+        // 3. The added column is fully writable: startup reconciliation flips
+        //    the crash residue to failed + recoverable.
+        let flipped = RunRepository::reconcile_interrupted(&db, 200)
+            .await
+            .unwrap();
+        assert_eq!(flipped, 1);
+        let runs = RunRepository::list(&db, 10).await.unwrap();
+        assert!(runs[0].recoverable, "interrupted run became resumable");
     }
 
     /// A stale watermark write (the runtime reviewer's detached task finishing

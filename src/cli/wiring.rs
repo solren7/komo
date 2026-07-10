@@ -9,16 +9,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     agent::{
-        reviewer::ReflectiveReviewer, runtime::AgentRuntime, system_prompt::SystemPromptBuilder,
+        review_coordinator::ReviewCoordinator, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
+        system_prompt::SystemPromptBuilder,
     },
     config::ConfigSnapshot,
     domain::{
-        approval::Approver,
-        llm::LlmClient,
-        memory::MemoryRepository,
-        repository::{SessionRepository, SkillRepository},
-        reviewer::Reviewer,
-        workspace::Workspace,
+        approval::Approver, llm::LlmClient, memory::MemoryRepository, repository::SkillRepository,
+        reviewer::Reviewer, workspace::Workspace,
     },
     infra::{
         llm::{PreambleFn, build_llm},
@@ -43,8 +40,9 @@ use crate::{
 /// the reviewer the sweep invokes).
 pub struct Wiring {
     pub runtime: AgentRuntime,
-    pub sessions: Arc<dyn SessionRepository>,
-    pub reviewer: Arc<dyn Reviewer>,
+    /// The shared review coordinator (post-turn + scheduled), for the
+    /// gateway's `ReviewSweep`.
+    pub review: Arc<ReviewCoordinator>,
     /// The auxiliary (cheaper) LLM, reused by the daily briefing sweep.
     pub aux_llm: Arc<dyn LlmClient>,
     /// The markdown memory store, also read by the briefing sweep.
@@ -216,6 +214,15 @@ pub async fn build(
         skill_repo,
         kanban.clone(),
     ));
+    // One coordinator instance shared by the runtime's post-turn trigger and
+    // the gateway's scheduled sweep — that sharing is what makes its
+    // per-session in-flight guard effective across the two paths.
+    let review = Arc::new(ReviewCoordinator::new(
+        db.clone(),
+        db.clone(),
+        reviewer,
+        config.runtime.review_interval,
+    ));
 
     let runtime = AgentRuntime {
         llm,
@@ -229,14 +236,12 @@ pub async fn build(
         // Mirror the LLM's history window so the turn loads exactly what the
         // model will replay (no full-transcript read on long chat sessions).
         history_window: model_config.max_history_messages,
-        reviewer: Some(reviewer.clone()),
-        review_interval: config.runtime.review_interval,
+        review: Some(review.clone()),
     };
 
     Ok(Wiring {
         runtime,
-        sessions: db.clone(),
-        reviewer,
+        review,
         aux_llm,
         memories: memory_repo,
         skills: skill_store,

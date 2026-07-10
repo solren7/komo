@@ -3,6 +3,7 @@ pub mod gateway;
 pub mod interaction;
 pub mod pairing;
 pub mod policy_approver;
+pub mod review_coordinator;
 pub mod reviewer;
 pub mod runtime;
 pub mod system_prompt;

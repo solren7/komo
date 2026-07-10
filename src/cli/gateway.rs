@@ -88,8 +88,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let wired = wiring::build(config, db.clone(), kanban.clone(), approver).await?;
 
     let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
-        sessions: wired.sessions.clone(),
-        reviewer: wired.reviewer.clone(),
+        review: wired.review.clone(),
     });
 
     // Ingress channels, from the snapshot (validate_gateway above already

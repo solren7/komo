@@ -3,11 +3,11 @@ use std::sync::Arc;
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::{
+    agent::review_coordinator::{ReviewCoordinator, ReviewTrigger},
     domain::{
         llm::{LlmClient, Step, ToolOutcome},
         message::Message,
         repository::{MessageRepository, SessionRepository},
-        reviewer::Reviewer,
         run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, truncate},
         session::Session,
     },
@@ -42,8 +42,9 @@ pub struct AgentRuntime {
     /// per-turn hot path off a full-transcript read for long-lived chat
     /// sessions — the LLM windows again to the same bound, so this is loss-free.
     pub history_window: usize,
-    pub reviewer: Option<Arc<dyn Reviewer>>,
-    pub review_interval: usize,
+    /// Post-turn reviews go through the shared coordinator (also driven by the
+    /// gateway's scheduled sweep); `None` = no reflective reviewing.
+    pub review: Option<Arc<ReviewCoordinator>>,
 }
 
 fn now() -> i64 {
@@ -149,37 +150,22 @@ impl AgentRuntime {
         self.messages.save(session_id, &assistant_msg).await?;
         session.messages.push(assistant_msg);
 
-        if let Some(reviewer) = &self.reviewer {
-            let interval = self.review_interval.max(1);
-            // Cadence is driven by the true user-turn total (a cheap COUNT), not
-            // the windowed in-memory session, whose count would plateau at the
-            // window size and mis-fire the modulo.
-            let turns = self.messages.count_user_turns(session_id).await?;
-            if turns % interval == 0 {
-                // The reflective reviewer needs the whole transcript, so reload
-                // the full session (this turn's messages are already persisted)
-                // rather than handing it the truncated working window.
-                if let Some(snapshot) = self.sessions.find(session_id).await? {
-                    let reviewer = reviewer.clone();
-                    // Advance the shared review watermark on success so the
-                    // background sweep doesn't re-review what this just covered.
-                    let sessions = self.sessions.clone();
-                    let sid = session_id.to_string();
-                    tokio::spawn(async move {
-                        match reviewer.review(&snapshot).await {
-                            Ok(outcome) => {
-                                if !outcome.is_empty() {
-                                    info!(?outcome, "self-improvement review");
-                                }
-                                if let Err(error) = sessions.mark_reviewed(&sid, turns).await {
-                                    warn!(%error, "failed to advance review watermark");
-                                }
-                            }
-                            Err(error) => warn!(%error, "review failed (non-fatal)"),
-                        }
-                    });
+        // Post-turn review, detached from the reply path. Whether this turn is
+        // due (cadence), which snapshot the reviewer sees, and the watermark
+        // are all the coordinator's knowledge — the runtime only reports that
+        // a turn finished.
+        if let Some(review) = &self.review {
+            let review = review.clone();
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                match review.run(ReviewTrigger::AfterTurn { session_id }).await {
+                    Ok(report) if !report.is_empty() => {
+                        info!(?report, "self-improvement review")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "review failed (non-fatal)"),
                 }
-            }
+            });
         }
 
         Ok(reply)
@@ -376,8 +362,7 @@ mod tests {
             tool_executor: executor,
             max_turns,
             history_window: 0,
-            reviewer: None,
-            review_interval: 10,
+            review: None,
         };
         (rt, received)
     }

@@ -40,14 +40,6 @@ pub struct ReviewOutcome {
     pub tasks_captured: Vec<String>,
 }
 
-impl ReviewOutcome {
-    pub fn is_empty(&self) -> bool {
-        self.memories_written.is_empty()
-            && self.skills_written.is_empty()
-            && self.tasks_captured.is_empty()
-    }
-}
-
 #[async_trait]
 pub trait Reviewer: Send + Sync {
     async fn review(&self, session: &Session) -> anyhow::Result<ReviewOutcome>;

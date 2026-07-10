@@ -36,7 +36,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -47,17 +47,23 @@ use crate::{
     domain::{
         gateway::MessageHandler,
         home::HomeRepository,
-        memory::{
-            DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
-            parse_memory_status,
-        },
-        pairing::{ApproveOutcome, PairingRepository, PairingStatus},
+        memory::{Memory, MemoryRepository, MemoryStatus, parse_memory_status},
+        pairing::{ApproveOutcome, PairingRepository},
         reminder::ReminderRepository,
         repository::{MessageRepository, SessionRepository, SkillRepository},
-        run::{RunRepository, RunStep, resume_prompt, step_views_skill},
+        run::{RunRepository, resume_prompt},
         task::TaskRepository,
     },
-    services::tool_registry::{SessionContext, with_session},
+    services::{
+        operator_control::{
+            ResumeOutcome,
+            actions::{
+                AUDIT_RESULT_CAP, AUDIT_SCAN_LIMIT, dream_classify, pairing_views,
+                session_summaries, skill_invocations,
+            },
+        },
+        tool_registry::{SessionContext, with_session},
+    },
 };
 use std::net::SocketAddr;
 
@@ -477,18 +483,7 @@ async fn get_home(State(state): State<AppState>) -> Result<Json<Value>, ApiError
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     // Summaries only — never dump every transcript in a list view.
-    let sessions: Vec<SessionSummary> = state
-        .sessions
-        .list()
-        .await?
-        .into_iter()
-        .map(|s| SessionSummary {
-            created_at: s.created_at,
-            messages: s.messages.len(),
-            user_turns: s.user_turns(),
-            id: s.id,
-        })
-        .collect();
+    let sessions = session_summaries(state.sessions.list().await?);
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -741,149 +736,32 @@ async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
     Ok(Json(json!({ "skills": skills })))
 }
 
-/// How many `skill`-tool ledger steps one audit request scans, and how many
-/// matches it returns.
-const AUDIT_SCAN_LIMIT: usize = 500;
-const AUDIT_RESULT_CAP: usize = 50;
-
 /// Which turns loaded a skill (backs `shion skill audit` while the gateway
-/// holds the db lock). Derived from the run ledger — a skill "used" is exactly
-/// a `skill view` step; nothing stores usage counters.
+/// holds the db lock). Derived from the run ledger via the shared operator
+/// projection.
 async fn skill_audit(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let steps = state.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
-    let invocations = skill_invocations_from_steps(steps, &name, AUDIT_RESULT_CAP);
+    let invocations = skill_invocations(steps, &name, AUDIT_RESULT_CAP);
     Ok(Json(json!({ "invocations": invocations })))
-}
-
-/// Filter `skill`-tool steps down to the views of one skill (newest-first in,
-/// newest-first out). Shared by the api handler and the CLI's direct-db path.
-pub fn skill_invocations_from_steps(
-    steps: Vec<RunStep>,
-    name: &str,
-    cap: usize,
-) -> Vec<SkillInvocation> {
-    steps
-        .into_iter()
-        .filter(|s| step_views_skill(s, name))
-        .take(cap)
-        .map(|s| SkillInvocation {
-            run_id: s.run_id,
-            seq: s.seq,
-            started_at: s.started_at,
-            ok: s.ok,
-        })
-        .collect()
 }
 
 /// Pairings (backs `shion pair list`). A hash-free view — the salted code hash
 /// and per-row salt are never serialized off the host.
 async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let now = now();
-    let pairings: Vec<PairingView> = state
-        .pairings
-        .list()
-        .await?
-        .into_iter()
-        .map(|p| {
-            let status = match p.status {
-                PairingStatus::Approved => "approved",
-                PairingStatus::Pending if p.is_expired(now) => "expired",
-                PairingStatus::Pending => "pending",
-            };
-            PairingView {
-                id: p.id,
-                status: status.to_string(),
-                created_at: p.created_at,
-            }
-        })
-        .collect();
+    let pairings = pairing_views(state.pairings.list().await?, now());
     Ok(Json(json!({ "pairings": pairings })))
 }
 
 /// The dreaming dry-run classification (backs `shion dream`, no `--apply`):
 /// which candidates would promote / archive, with their scores. Read-only.
 async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let now = now();
-    let memories = state.memories.list().await?;
-    let mut promote: Vec<DreamItem> = Vec::new();
-    let mut archive: Vec<DreamItem> = Vec::new();
-    for m in &memories {
-        let item = DreamItem {
-            id: m.id.clone(),
-            recall_count: m.recall_count,
-            unique_queries: m.recall_query_hashes.len(),
-            score: dream_score(m, now),
-            content: m.content.clone(),
-        };
-        match dream_verdict(m, now) {
-            DreamVerdict::Promote => promote.push(item),
-            DreamVerdict::Archive => archive.push(item),
-            DreamVerdict::Keep => {}
-        }
-    }
-    promote.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(Json(json!({ "promote": promote, "archive": archive })))
-}
-
-// ---- shared control-plane view types ---------------------------------------
-// Serialized by the endpoints above and deserialized by the CLI gateway client
-// (`cli::gateway_client`), so they live here as the single source of truth.
-
-/// A session list row (full transcripts are never dumped in a list view).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionSummary {
-    pub id: String,
-    pub created_at: i64,
-    pub messages: usize,
-    pub user_turns: usize,
-}
-
-/// A pairing row without the salted code hash / salt (never leaves the host).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairingView {
-    pub id: String,
-    /// `pending` | `approved` | `expired`.
-    pub status: String,
-    pub created_at: i64,
-}
-
-/// One `skill view` step from the run ledger (backs `shion skill audit`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInvocation {
-    pub run_id: String,
-    pub seq: i64,
-    pub started_at: i64,
-    pub ok: bool,
-}
-
-/// The result of `POST /api/runs/{id}/resume`, consumed by `shion run resume`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResumeOutcome {
-    pub run_id: String,
-    pub session_id: String,
-    /// How many completed steps the priming digest handed to the model.
-    pub steps: usize,
-    pub reply: String,
-}
-
-/// One candidate in the dreaming preview, with the score that drove its verdict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DreamItem {
-    pub id: String,
-    pub recall_count: i64,
-    /// Distinct recall-query fingerprints (the diversity half of the promote
-    /// gate). `default` so a payload from an older gateway still parses.
-    #[serde(default)]
-    pub unique_queries: usize,
-    pub score: f64,
-    pub content: String,
+    let report = dream_classify(&state.memories.list().await?, now());
+    Ok(Json(
+        json!({ "promote": report.promote, "archive": report.archive }),
+    ))
 }
 
 /// Unix seconds, for OpenAI `created` fields.

@@ -8,8 +8,9 @@
 
 use crate::{
     cli::gateway_client::{GatewayClient, PairApprove},
-    domain::pairing::{ApproveOutcome, PairingRepository, PairingStatus},
-    infra::{messaging::api::PairingView, persistence::db::Db},
+    domain::pairing::{ApproveOutcome, PairingRepository},
+    infra::persistence::db::Db,
+    services::operator_control::{PairingView, actions::pairing_views},
 };
 
 fn local_time(unix: i64) -> String {
@@ -27,22 +28,7 @@ pub async fn list(db_url: &str) -> anyhow::Result<()> {
         None => {
             let db = Db::connect(db_url).await?;
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            PairingRepository::list(&db)
-                .await?
-                .into_iter()
-                .map(|p| {
-                    let status = match p.status {
-                        PairingStatus::Approved => "approved",
-                        PairingStatus::Pending if p.is_expired(now) => "expired",
-                        PairingStatus::Pending => "pending",
-                    };
-                    PairingView {
-                        id: p.id,
-                        status: status.to_string(),
-                        created_at: p.created_at,
-                    }
-                })
-                .collect()
+            pairing_views(PairingRepository::list(&db).await?, now)
         }
     };
 

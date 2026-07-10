@@ -9,9 +9,8 @@
 use crate::{
     cli::{gateway_client::GatewayClient, inspect::local_time},
     domain::run::RunRepository,
-    infra::{
-        messaging::api::skill_invocations_from_steps, persistence::db::Db, skills::FsSkillStore,
-    },
+    infra::{persistence::db::Db, skills::FsSkillStore},
+    services::operator_control::actions::skill_invocations,
 };
 
 fn store() -> FsSkillStore {
@@ -137,7 +136,7 @@ pub async fn audit(db_url: &str, name: &str) -> anyhow::Result<()> {
         None => {
             let db = Db::connect(db_url).await?;
             let steps = RunRepository::steps_by_tool(&db, "skill", SCAN).await?;
-            skill_invocations_from_steps(steps, name, CAP)
+            skill_invocations(steps, name, CAP)
         }
     };
     if invocations.is_empty() {

@@ -22,10 +22,10 @@ use crate::domain::{
     run::{Run, RunStep},
     task::Task,
 };
-use crate::infra::messaging::api::{
+use crate::infra::rendezvous::{self, GatewayInfo};
+use crate::services::operator_control::{
     DreamItem, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
 };
-use crate::infra::rendezvous::{self, GatewayInfo};
 
 /// How long to wait for the gateway to answer a request (a turn can take a
 /// while — chat goes through the full agent loop server-side).

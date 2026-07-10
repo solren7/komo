@@ -11,10 +11,8 @@ use crate::{
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
-    infra::{
-        messaging::api::SessionSummary,
-        persistence::{db::Db, kanban::KanbanDb},
-    },
+    infra::persistence::{db::Db, kanban::KanbanDb},
+    services::operator_control::{SessionSummary, actions::session_summaries},
 };
 
 pub(crate) fn local_time(unix: i64) -> String {
@@ -258,16 +256,7 @@ pub fn skill_list() -> anyhow::Result<()> {
 pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
     let sessions: Vec<SessionSummary> = match GatewayClient::try_connect().await {
         Some(gw) => gw.sessions().await?,
-        None => SessionRepository::list(&Db::connect(db_url).await?)
-            .await?
-            .into_iter()
-            .map(|s| SessionSummary {
-                created_at: s.created_at,
-                messages: s.messages.len(),
-                user_turns: s.user_turns(),
-                id: s.id,
-            })
-            .collect(),
+        None => session_summaries(SessionRepository::list(&Db::connect(db_url).await?).await?),
     };
 
     if sessions.is_empty() {

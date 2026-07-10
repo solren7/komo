@@ -973,11 +973,14 @@ mod tests {
         assert_eq!(summary.tasks_notified, 1);
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
         assert_eq!(notifier.calls.lock().unwrap()[0].0, "Shion task due");
-        // Task stays open; only the guard flips.
-        let tasks = repo.tasks.lock().unwrap();
-        assert_eq!(tasks[0].status, TaskStatus::Todo);
-        assert!(tasks[0].due_notified_at.is_some());
-        drop(tasks);
+        // Task stays open; only the guard flips. (Scoped so the guard is
+        // provably released before the next await — clippy's
+        // await_holding_lock doesn't credit an explicit drop().)
+        {
+            let tasks = repo.tasks.lock().unwrap();
+            assert_eq!(tasks[0].status, TaskStatus::Todo);
+            assert!(tasks[0].due_notified_at.is_some());
+        }
 
         // Second sweep: nothing new.
         let summary = sweep.run().await.unwrap();

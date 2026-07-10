@@ -819,7 +819,7 @@ mod tests {
             MemoryScope::Session("feishu:oc_x".into()),
         ];
         for scope in scopes {
-            let rebuilt = MemoryScope::from_parts(&scope.type_str(), &scope.key());
+            let rebuilt = MemoryScope::from_parts(scope.type_str(), &scope.key());
             assert_eq!(rebuilt, scope);
         }
     }

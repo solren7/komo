@@ -11,6 +11,7 @@ use crate::{
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
     },
     cli::wiring,
+    config::{ConfigSnapshot, IssueSeverity},
     domain::{
         approval::Approver,
         gateway::{MessageHandler, WeChatLogin},
@@ -40,21 +41,33 @@ use crate::{
 };
 
 /// Run the always-on gateway: a persistent process hosting the maintenance
-/// scheduler. Ingress channels will be declared in ~/.shion/config.toml and
-/// wired here. Runs until Ctrl-C.
-pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
+/// scheduler and the config-declared ingress channels. Runs until Ctrl-C.
+/// Everything is read from the caller's one resolved `config` snapshot.
+pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    // The gateway hosts every surface, so any fatal config issue (unusable
+    // model, enabled-but-credential-less channel) stops startup here, before
+    // the db is opened. Warnings are logged and tolerated.
+    config.validate_gateway()?;
+    for issue in &config.report.issues {
+        if issue.severity == IssueSeverity::Warning {
+            tracing::warn!(path = issue.path, "{}", issue.message);
+        }
+    }
+    let rt = &config.runtime;
+
     // Fail fast on a bad schedule before opening the db.
+    let schedule_expr = rt.maintenance_schedule.as_str();
     let review_schedule = Schedule::parse(schedule_expr)?;
     let reminder_schedule = Schedule::parse("* * * * *")?;
     // Opt-in daily briefing: parse its schedule now so a typo fails at startup.
-    let briefing_expr = crate::config::briefing_schedule();
+    let briefing_expr = &rt.briefing_schedule;
     let briefing_schedule = briefing_expr.as_deref().map(Schedule::parse).transpose()?;
-    // Opt-in usage-driven memory consolidation ("dreaming"); parse now so a typo
-    // fails at startup.
-    let dream_expr = crate::config::dream_schedule();
+    // Usage-driven memory consolidation ("dreaming", on by default); parse now
+    // so a typo fails at startup.
+    let dream_expr = &rt.dream_schedule;
     let dream_schedule = dream_expr.as_deref().map(Schedule::parse).transpose()?;
 
-    let db = Arc::new(Db::connect(db_url).await?);
+    let db = Arc::new(Db::connect(&rt.db_url).await?);
     // Reconcile runs left `Running` by a crashed earlier process (launchd
     // restarts the gateway): flip them to failed/"interrupted" so the ledger is
     // truthful. Best-effort — a reconciliation failure must not block startup.
@@ -65,42 +78,43 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         Err(error) => tracing::warn!(%error, "failed to reconcile interrupted runs"),
     }
     // Durable tasks in their own file, separate from disposable session state.
-    let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
+    let kanban = Arc::new(KanbanDb::connect(&rt.kanban_db_url).await?);
 
     // Tool actions that need approval are gated over the chat channel: the
     // agent sends an approval prompt and waits for the user's `/approve` (or
     // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
     let approvals = Arc::new(ApprovalState::new());
     let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
-    let wired = wiring::build(db.clone(), kanban.clone(), approver).await?;
+    let wired = wiring::build(config, db.clone(), kanban.clone(), approver).await?;
 
     let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
         sessions: wired.sessions.clone(),
         reviewer: wired.reviewer.clone(),
     });
 
-    // Ingress channels, declared in ~/.shion/config.toml. Resolved before
-    // the reminder sweep because a channel `home_chat` takes over reminder
-    // delivery from the local macOS notifier (feishu wins if both set one).
-    let feishu = crate::config::feishu_config()?;
-    let feishu_sender = feishu.as_ref().map(|cfg| {
+    // Ingress channels, from the snapshot (validate_gateway above already
+    // refused any enabled-but-misconfigured one). Resolved before the reminder
+    // sweep because a channel `home_chat` takes over reminder delivery from
+    // the local macOS notifier (feishu wins if both set one).
+    let feishu = rt.feishu.ready();
+    let feishu_sender = feishu.map(|cfg| {
         Arc::new(FeishuSender::new(
             cfg.app_id.clone(),
             cfg.app_secret.clone(),
         ))
     });
-    let telegram = crate::config::telegram_config()?;
-    let telegram_sender = telegram
-        .as_ref()
-        .map(|cfg| Arc::new(TelegramSender::new(cfg.bot_token.clone())));
+    let telegram = rt.telegram.ready();
+    let telegram_sender = telegram.map(|cfg| Arc::new(TelegramSender::new(cfg.bot_token.clone())));
     // WeChat shares one bot instance between its sender and channel so the
     // channel's poll loop populates the context-token map the sender reads.
-    let wechat = crate::config::wechat_config()?;
+    let wechat = rt.wechat.ready();
     let wechat_cred_path = crate::config::wechat_cred_path();
-    // HTTP API channel (OpenAI-compatible + dashboard). Resolved early so a
-    // missing API_SERVER_KEY fails at startup, not on first request.
-    let api = crate::config::api_config()?;
-    let wechat_bot = wechat.as_ref().map(|_| build_bot(&wechat_cred_path));
+    // HTTP API channel (OpenAI-compatible + dashboard); always on.
+    let api = rt
+        .api
+        .ready()
+        .ok_or_else(|| anyhow::anyhow!("api channel misconfigured"))?;
+    let wechat_bot = wechat.map(|_| build_bot(&wechat_cred_path));
     let wechat_sender = wechat_bot
         .as_ref()
         .map(|bot| Arc::new(WeChatSender::new(bot.clone())));
@@ -134,18 +148,15 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         senders.insert("wechat".to_string(), sender.clone());
     }
     let config_home = feishu
-        .as_ref()
         .and_then(|cfg| cfg.home_chat.clone())
         .map(|chat| format!("feishu:{chat}"))
         .or_else(|| {
             telegram
-                .as_ref()
                 .and_then(|cfg| cfg.home_chat.clone())
                 .map(|chat| format!("telegram:{chat}"))
         })
         .or_else(|| {
             wechat
-                .as_ref()
                 .and_then(|cfg| cfg.home_chat.clone())
                 .map(|chat| format!("wechat:{chat}"))
         });
@@ -207,7 +218,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         // Opt-in: only fire on Chinese working days (statutory holidays and
         // 调休-adjusted weekends respected). The calendar is built only when
         // gating is on, so the holiday API is never touched otherwise.
-        if crate::config::briefing_workdays_only() {
+        if rt.briefing_workdays_only {
             let calendar = Arc::new(HolidayCalendar::new(crate::config::workday_cache_dir()));
             briefing_sweep = Arc::new(WorkdayGated {
                 inner: briefing_sweep,
@@ -237,7 +248,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // pairing store is shared with the `shion pair` CLI via the same db.
     let pairings: Arc<dyn PairingRepository> = db.clone();
     let mut channels = Vec::new();
-    if let (Some(cfg), Some(sender)) = (&feishu, &feishu_sender) {
+    if let (Some(cfg), Some(sender)) = (feishu, &feishu_sender) {
         gateway = gateway.add_channel(Box::new(FeishuChannel::new(
             sender.clone(),
             cfg,
@@ -245,7 +256,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         )));
         channels.push("feishu");
     }
-    if let (Some(cfg), Some(sender)) = (&telegram, &telegram_sender) {
+    if let (Some(cfg), Some(sender)) = (telegram, &telegram_sender) {
         gateway = gateway.add_channel(Box::new(TelegramChannel::new(
             sender.clone(),
             cfg,
@@ -253,7 +264,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         )));
         channels.push("telegram");
     }
-    if let (Some(cfg), Some(bot)) = (&wechat, &wechat_bot) {
+    if let (Some(cfg), Some(bot)) = (wechat, &wechat_bot) {
         gateway = gateway.add_channel(Box::new(WeChatChannel::new(
             bot.clone(),
             cfg,
@@ -271,8 +282,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // Home Assistant event ingress: forwards filtered `state_changed` events to
     // the agent. No pairing — it is a trusted local integration keyed by
     // HASS_TOKEN, not a chat with arbitrary senders.
-    let ha_channel = crate::config::homeassistant_channel_config()?;
-    if let Some(cfg) = &ha_channel {
+    if let Some(cfg) = rt.homeassistant_channel.ready() {
         gateway = gateway.add_channel(Box::new(HomeAssistantChannel::new(cfg)));
         channels.push("homeassistant");
     }
@@ -298,7 +308,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         let reminders: Arc<dyn ReminderRepository> = db.clone();
         let skills: Arc<dyn SkillRepository> = wired.skills.clone();
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
-            &api,
+            api,
             handler.clone(),
             db.clone(),
             messages,
@@ -330,8 +340,8 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     println!(
         "Shion gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
-        fmt_opt(&briefing_expr),
-        fmt_opt(&dream_expr),
+        fmt_opt(briefing_expr),
+        fmt_opt(dream_expr),
         if channels.is_empty() {
             "none".to_string()
         } else {

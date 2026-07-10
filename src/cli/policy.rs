@@ -9,23 +9,23 @@
 
 use std::path::PathBuf;
 
-use crate::config::{self, PolicyReport};
+use crate::config::{ConfigSnapshot, PolicyReport};
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
 use crate::domain::policy::{Access, Category, Effect, Matcher, Rule, Verdict};
 
 /// Render the resolved policy: defaults, rules in evaluation order, and any
 /// config entries that failed to parse.
-pub fn list() -> anyhow::Result<()> {
+pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let PolicyReport {
         policy,
         invalid,
         configured,
-    } = config::policy_report();
+    } = &config.runtime.policy;
 
     if !configured {
         println!(
             "No [policy] table in {} — every Normal/Dangerous action asks interactively.",
-            config::shion_home().join("config.toml").display()
+            config.runtime.home.join("config.toml").display()
         );
         return Ok(());
     }
@@ -59,6 +59,7 @@ pub fn list() -> anyhow::Result<()> {
 
 /// Dry-run one action through the policy and explain the outcome.
 pub fn check(
+    config: &ConfigSnapshot,
     category: &str,
     target: &str,
     channel: Option<&str>,
@@ -114,7 +115,7 @@ pub fn check(
     request.risk = risk;
     let request = request.with_action(action);
 
-    let policy = config::policy_config();
+    let policy = &config.runtime.policy.policy;
     let decision = policy.decide(&request, channel);
 
     let risk_str = match risk {

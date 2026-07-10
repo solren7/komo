@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use crate::{
     agent::runtime::AgentRuntime,
     cli::{gateway_client::GatewayClient, wiring},
+    config::ConfigSnapshot,
     domain::{approval::Approver, repository::SessionRepository, session::Session},
     infra::persistence::{db::Db, kanban::KanbanDb},
 };
@@ -56,17 +57,17 @@ impl Backend {
     }
 }
 
-/// Start the TUI on a fresh session. Mirrors `cli::chat::run`: a running
-/// gateway holds the db lock, so route turns to it; otherwise run in-process.
-pub async fn run(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {
-    let Connected { backend, approvals } = connect(db_url, kanban_url).await?;
+/// Start the TUI on a fresh session: a running gateway holds the db lock, so
+/// route turns to it; otherwise run in-process.
+pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    let Connected { backend, approvals } = connect(config).await?;
     drive(backend, approvals, new_session_id(), false).await
 }
 
 /// Continue an existing session (`shion session resume <id>` on a TTY). Errors
 /// if the session doesn't exist — resume never creates one.
-pub async fn resume(db_url: &str, kanban_url: &str, session_id: &str) -> anyhow::Result<()> {
-    let Connected { backend, approvals } = connect(db_url, kanban_url).await?;
+pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result<()> {
+    let Connected { backend, approvals } = connect(config).await?;
     match &backend {
         Backend::Remote(gw) => {
             let known = gw.sessions().await?.iter().any(|s| s.id == session_id);
@@ -94,7 +95,7 @@ struct Connected {
     ),
 }
 
-async fn connect(db_url: &str, kanban_url: &str) -> anyhow::Result<Connected> {
+async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
     let (tx, rx) = mpsc::unbounded_channel();
     if let Some(gw) = GatewayClient::try_connect().await {
         return Ok(Connected {
@@ -102,10 +103,14 @@ async fn connect(db_url: &str, kanban_url: &str) -> anyhow::Result<Connected> {
             approvals: (tx, rx),
         });
     }
-    let db = Arc::new(Db::connect(db_url).await?);
-    let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
+    let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
+    let kanban = Arc::new(KanbanDb::connect(&config.runtime.kanban_db_url).await?);
     let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(tx.clone()));
-    let runtime = Arc::new(wiring::build(db.clone(), kanban, approver).await?.runtime);
+    let runtime = Arc::new(
+        wiring::build(config, db.clone(), kanban, approver)
+            .await?
+            .runtime,
+    );
     Ok(Connected {
         backend: Backend::Local { runtime, db },
         approvals: (tx, rx),

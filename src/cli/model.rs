@@ -1,32 +1,29 @@
 //! Model inspection and switching (`shion model list`, `shion model set`).
 //!
-//! `list` shows the resolved provider/model and where each value comes from
-//! (env var > config.toml > built-in default), plus every available provider.
-//! `set` persists a new selection into `~/.shion/config.toml`. Neither touches
-//! the database or requires the API key to be present.
+//! `list` shows the resolved provider/model and where each value comes from —
+//! straight from the shared `ConfigSnapshot`'s provenance report, so it can
+//! never disagree with what the agent actually resolves — plus every available
+//! provider. `set` persists a new selection into `~/.shion/config.toml`.
+//! Neither touches the database or requires the API key to be present.
 
 use crate::{
-    config::{self, FileConfig, Provider, Secrets, ShionEnv},
+    config::{ConfigReport, ConfigSnapshot, Origin, Provider, write_model_selection},
     infra::codex::{self, CodexAuth},
 };
 
-fn key_present(keys: &Secrets, provider: Provider) -> bool {
-    keys.key(provider).is_some()
-}
-
-fn auth_present(provider: Provider, keys: &Secrets) -> bool {
+fn auth_present(provider: Provider, report: &ConfigReport) -> bool {
     match provider {
         Provider::Codex => CodexAuth::load().is_ok(),
-        _ => key_present(keys, provider),
+        _ => report.key_present(provider),
     }
 }
 
-fn credential_line(provider: Provider, keys: &Secrets) -> String {
+fn credential_line(provider: Provider, report: &ConfigReport) -> String {
     match provider {
         Provider::Codex => format!(
             "Codex OAuth {}  {}",
             codex::codex_auth_file_path().display(),
-            if auth_present(provider, keys) {
+            if auth_present(provider, report) {
                 "✓ logged in"
             } else {
                 "✗ missing"
@@ -35,12 +32,21 @@ fn credential_line(provider: Provider, keys: &Secrets) -> String {
         _ => format!(
             "{}  {}",
             provider.api_key_var(),
-            if key_present(keys, provider) {
+            if report.key_present(provider) {
                 "✓ set"
             } else {
                 "✗ missing"
             }
         ),
+    }
+}
+
+/// Human label for a value's provenance.
+fn origin_label(origin: Origin, env_var: &str, default_label: &'static str) -> String {
+    match origin {
+        Origin::Env => format!("env {env_var}"),
+        Origin::File => "config.toml".to_string(),
+        Origin::Default => default_label.to_string(),
     }
 }
 
@@ -73,43 +79,30 @@ async fn preferred_codex_model() -> String {
 }
 
 /// Show the current provider/model (with its source) and list all providers.
-pub async fn list() -> anyhow::Result<()> {
-    let home = config::ensure_shion_home();
-    let file = FileConfig::load(&home);
-    let env = ShionEnv::load_lenient();
-    let keys = Secrets::load();
-
-    let provider_str = env
-        .provider
-        .clone()
-        .or_else(|| file.provider.clone())
-        .unwrap_or_else(|| "deepseek".to_string());
-    let provider = Provider::parse(&provider_str)?;
-    let provider_source = if env.provider.is_some() {
-        "env SHION_PROVIDER"
-    } else if file.provider.is_some() {
-        "config.toml"
-    } else {
-        "default"
-    };
-
-    let model = env
-        .model
-        .clone()
-        .or_else(|| file.model.clone())
-        .unwrap_or_else(|| provider.default_model().to_string());
-    let model_source = if env.model.is_some() {
-        "env SHION_MODEL"
-    } else if file.model.is_some() {
-        "config.toml"
-    } else {
-        "provider default"
-    };
+pub async fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    // A provider that failed to parse resolved to a fallback — surface the
+    // problem instead of presenting the fallback as the configuration.
+    if let Some(issue) = config
+        .report
+        .issues
+        .iter()
+        .find(|i| i.path == "model.provider")
+    {
+        anyhow::bail!("{}", issue.message);
+    }
+    let provider = config.runtime.model.provider;
+    let model = &config.runtime.model.model;
+    let provider_source = origin_label(config.report.provider_origin, "SHION_PROVIDER", "default");
+    let model_source = origin_label(
+        config.report.model_origin,
+        "SHION_MODEL",
+        "provider default",
+    );
 
     println!("Current");
     println!("  provider  {}  ({provider_source})", provider.name());
     println!("  model     {model}  ({model_source})");
-    println!("  auth      {}", credential_line(provider, &keys));
+    println!("  auth      {}", credential_line(provider, &config.report));
 
     if provider == Provider::Codex {
         let token = match CodexAuth::load() {
@@ -138,7 +131,11 @@ pub async fn list() -> anyhow::Result<()> {
             if p == provider { "*" } else { " " },
             p.name(),
             p.default_model(),
-            if auth_present(p, &keys) { "✓" } else { "·" },
+            if auth_present(p, &config.report) {
+                "✓"
+            } else {
+                "·"
+            },
         );
     }
 
@@ -149,14 +146,18 @@ pub async fn list() -> anyhow::Result<()> {
 }
 
 /// Switch the provider (and optionally the model), persisting to config.toml.
-pub async fn set(provider_str: &str, model: Option<String>) -> anyhow::Result<()> {
-    let home = config::ensure_shion_home();
+pub async fn set(
+    config: &ConfigSnapshot,
+    provider_str: &str,
+    model: Option<String>,
+) -> anyhow::Result<()> {
+    let home = &config.runtime.home;
     let (provider, model, inferred_provider) = resolve_set_args(provider_str, model)?;
     let resolved_model = match (provider, model) {
         (Provider::Codex, None) => Some(preferred_codex_model().await),
         (_, model) => model,
     };
-    let path = config::write_model_selection(&home, provider, resolved_model.as_deref())?;
+    let path = write_model_selection(home, provider, resolved_model.as_deref())?;
 
     let effective = resolved_model
         .clone()
@@ -171,15 +172,15 @@ pub async fn set(provider_str: &str, model: Option<String>) -> anyhow::Result<()
     }
     println!("wrote {}", path.display());
 
-    let env = ShionEnv::load_lenient();
-    if env.provider.is_some() || env.model.is_some() {
+    // Env overrides beat the file at resolve time — provenance from the
+    // pre-write snapshot still tells us whether any are set.
+    if config.report.provider_origin == Origin::Env || config.report.model_origin == Origin::Env {
         eprintln!(
             "note: SHION_PROVIDER/SHION_MODEL are set and override config.toml; \
              unset them for this change to take effect"
         );
     }
-    let keys = Secrets::load();
-    if !auth_present(provider, &keys) {
+    if !auth_present(provider, &config.report) {
         match provider {
             Provider::Codex => eprintln!(
                 "note: Codex OAuth credentials are missing at {}; run `codex` to log in before using codex",

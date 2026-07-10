@@ -11,7 +11,7 @@ use crate::{
     agent::{
         reviewer::ReflectiveReviewer, runtime::AgentRuntime, system_prompt::SystemPromptBuilder,
     },
-    config::ModelConfig,
+    config::ConfigSnapshot,
     domain::{
         approval::Approver,
         llm::LlmClient,
@@ -52,12 +52,19 @@ pub struct Wiring {
 
 /// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
 /// tasks, a separate file), gating side-effecting tools through `approver`.
+/// Every setting comes from the caller's one resolved `config` snapshot —
+/// wiring never re-reads config.toml, the env, or `.env`.
 pub async fn build(
+    config: &ConfigSnapshot,
     db: Arc<Db>,
     kanban: Arc<KanbanDb>,
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
-    let model_config = ModelConfig::from_env()?;
+    // An unusable model selection (bad SHION_* value, unknown provider,
+    // missing API key) can't produce a working agent — fail here like the old
+    // strict resolver did.
+    config.validate_agent()?;
+    let model_config = &config.runtime.model;
     // Install the process-wide tool-result byte cap (the global backstop in
     // `execute_isolated`). Resolved like every other setting; first call wins,
     // which is fine — chat and gateway each build once.
@@ -68,7 +75,7 @@ pub async fn build(
     // only escalates to `approver` when it says "ask". With no `[policy]` table
     // this is the empty policy — identical to the bare interactive approver.
     let approver = crate::agent::policy_approver::PolicyApprover::wrap(
-        crate::config::policy_config(),
+        config.runtime.policy.policy.clone(),
         approver,
     );
 
@@ -91,10 +98,10 @@ pub async fn build(
 
     // Home Assistant tool, only when configured (HASS_TOKEN set; HASS_URL
     // optional, defaults to homeassistant.local:8123).
-    if let Some(ha) = crate::config::homeassistant_config() {
+    if let Some(ha) = &config.runtime.homeassistant_tool {
         tools.register(Arc::new(HomeAssistantTool::new(
-            ha.base_url,
-            ha.token,
+            ha.base_url.clone(),
+            ha.token.clone(),
             approver.clone(),
         )));
     }
@@ -103,9 +110,9 @@ pub async fn build(
     // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
     // briefing sweep. On first run it seeds itself from any legacy markdown
     // memories under ~/.shion/memory/ (a one-time, no-op-once-populated import).
-    let memory_db = MemoryDb::connect(&crate::config::default_memory_db_url()).await?;
+    let memory_db = MemoryDb::connect(&config.runtime.memory_db_url).await?;
     let imported = memory_db
-        .import_legacy_markdown(&crate::config::shion_home().join("memory"))
+        .import_legacy_markdown(&config.runtime.home.join("memory"))
         .await
         .unwrap_or(0);
     if imported > 0 {
@@ -145,17 +152,8 @@ pub async fn build(
     //   <workspace>/.claude/skills, the governed ~/.shion/skills store, and the
     //   user-global ~/.claude/skills shared by general agents (Claude Agent
     //   Skills `SKILL.md` format).
-    let env = crate::config::ShionEnv::load()?;
     let root = workspace.roots().first().cloned().unwrap_or_default();
-    let mut skill_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(extra) = &env.skills_path {
-        skill_dirs.extend(
-            extra
-                .split(':')
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from),
-        );
-    }
+    let mut skill_dirs: Vec<PathBuf> = config.runtime.skills_path.clone();
     skill_dirs.push(root.join("skills"));
     skill_dirs.push(root.join(".claude/skills"));
     skill_dirs.push(skill_store.root().to_path_buf());
@@ -188,7 +186,7 @@ pub async fn build(
     // freezing the date at process start — important for the long-lived gateway.
     let tool_names = tools.tools().iter().map(|t| t.name().to_string()).collect();
     let prompt_builder = Arc::new(
-        SystemPromptBuilder::new(&model_config)
+        SystemPromptBuilder::new(model_config)
             .tools(tool_names)
             .skills_note(skills_note)
             .workspace_root(Some(root.clone())),
@@ -199,7 +197,7 @@ pub async fn build(
     // the memory store for L1 pinned injection and the aux agent for recall
     // screening (main agent only).
     let llm = build_llm(
-        &model_config,
+        model_config,
         tools.tools(),
         preamble,
         Some(memory_repo.clone()),
@@ -226,7 +224,7 @@ pub async fn build(
         // model will replay (no full-transcript read on long chat sessions).
         history_window: model_config.max_history_messages,
         reviewer: Some(reviewer.clone()),
-        review_interval: env.review_interval.filter(|v| *v > 0).unwrap_or(10),
+        review_interval: config.runtime.review_interval,
     };
 
     Ok(Wiring {

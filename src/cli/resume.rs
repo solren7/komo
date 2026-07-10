@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::{
     cli::{approver::CliApprover, gateway_client::GatewayClient, wiring},
+    config::ConfigSnapshot,
     domain::{
         approval::Approver,
         run::{Run, RunRepository, resume_prompt},
@@ -24,7 +25,7 @@ const RESUME_SCAN_LIMIT: usize = 100;
 /// most recent recoverable run. A running gateway holds the db lock, so the
 /// whole action routes to it (`POST /api/runs/{id}/resume`, trusted); otherwise
 /// the turn runs in-process, exactly like `shion chat`.
-pub async fn run(db_url: &str, kanban_url: &str, id: Option<String>) -> anyhow::Result<()> {
+pub async fn run(config: &ConfigSnapshot, id: Option<String>) -> anyhow::Result<()> {
     if let Some(gw) = GatewayClient::try_connect().await {
         let target_id = match id {
             Some(id) => id,
@@ -46,7 +47,7 @@ pub async fn run(db_url: &str, kanban_url: &str, id: Option<String>) -> anyhow::
         return Ok(());
     }
 
-    let db = Arc::new(Db::connect(db_url).await?);
+    let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
     let target = resolve_target(&*db, id).await?;
     let steps = RunRepository::steps(&*db, &target.id).await?;
     let input = resume_prompt(&target, &steps);
@@ -57,10 +58,13 @@ pub async fn run(db_url: &str, kanban_url: &str, id: Option<String>) -> anyhow::
         steps.len()
     );
 
-    // Same construction as the chat REPL: interactive approval at the TTY.
-    let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
+    // Same construction as the chat TUI's local mode: interactive approval at
+    // the TTY.
+    let kanban = Arc::new(KanbanDb::connect(&config.runtime.kanban_db_url).await?);
     let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
-    let runtime = wiring::build(db.clone(), kanban, approver).await?.runtime;
+    let runtime = wiring::build(config, db.clone(), kanban, approver)
+        .await?
+        .runtime;
 
     let reply = runtime.handle_input(&target.session_id, input).await?;
     // Clear the flag only after a turn was actually dispatched; best-effort,

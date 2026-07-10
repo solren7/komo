@@ -368,22 +368,23 @@ fn require_terminal() -> anyhow::Result<()> {
 
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // The database always lives in the config directory; use SHION_HOME to
-    // point at a different home (e.g. for tests or a second instance).
-    let db = crate::config::default_db_url();
+    // One resolved snapshot for the whole invocation: every source (config.toml,
+    // SHION_* env, .env secrets) is read exactly once. All paths live under the
+    // config home; use SHION_HOME to point at a different one (e.g. for tests
+    // or a second instance).
+    let config = crate::config::ConfigSnapshot::load();
+    let db = config.runtime.db_url.clone();
     // Durable tasks live in a separate file so resetting `shion.db` (disposable
     // dev state) never wipes them.
-    let kanban = crate::config::default_kanban_db_url();
+    let kanban = config.runtime.kanban_db_url.clone();
+    let memory = config.runtime.memory_db_url.clone();
     match cli.command {
         Commands::Chat => {
             require_terminal()?;
-            crate::tui::run(&db, &kanban).await
+            crate::tui::run(&config).await
         }
         Commands::Gateway { action } => match action {
-            None => {
-                let schedule = crate::config::maintenance_schedule();
-                gateway::run(&db, &kanban, &schedule).await
-            }
+            None => gateway::run(&config).await,
             Some(GatewayAction::Start) => service::start(),
             Some(GatewayAction::Stop) => service::stop(),
             Some(GatewayAction::Restart) => service::restart(),
@@ -397,7 +398,7 @@ pub async fn run() -> anyhow::Result<()> {
             SessionAction::List => inspect::session_list(&db).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
-                crate::tui::resume(&db, &kanban, &id).await
+                crate::tui::resume(&config, &id).await
             }
             SessionAction::Clean => inspect::session_clean(&db).await,
         },
@@ -407,24 +408,19 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Run { action } => match action {
             RunAction::List { limit } => inspect::run_list(&db, limit).await,
             RunAction::Inspect { id } => inspect::run_inspect(&db, &id).await,
-            RunAction::Resume { id } => resume::run(&db, &kanban, id).await,
+            RunAction::Resume { id } => resume::run(&config, id).await,
             RunAction::Prune { before, keep } => run_prune(&db, before, keep).await,
         },
-        Commands::Memory { action } => {
-            let url = crate::config::default_memory_db_url();
-            match action {
-                MemoryAction::List { status } => memory::list(&url, status).await,
-                MemoryAction::Search { query } => memory::search(&url, &query).await,
-                MemoryAction::Promote { ids } => memory::promote(&url, &ids).await,
-                MemoryAction::Reject { ids } => memory::reject(&url, &ids).await,
-                MemoryAction::Pin { id } => memory::pin(&url, &id).await,
-                MemoryAction::Triage => memory::triage(&url).await,
-                MemoryAction::Report => memory::report(&url).await,
-            }
-        }
-        Commands::Dream { apply } => {
-            dream::run(&crate::config::default_memory_db_url(), apply).await
-        }
+        Commands::Memory { action } => match action {
+            MemoryAction::List { status } => memory::list(&memory, status).await,
+            MemoryAction::Search { query } => memory::search(&memory, &query).await,
+            MemoryAction::Promote { ids } => memory::promote(&memory, &ids).await,
+            MemoryAction::Reject { ids } => memory::reject(&memory, &ids).await,
+            MemoryAction::Pin { id } => memory::pin(&memory, &id).await,
+            MemoryAction::Triage => memory::triage(&memory).await,
+            MemoryAction::Report => memory::report(&memory).await,
+        },
+        Commands::Dream { apply } => dream::run(&memory, apply).await,
         Commands::Skill { action } => match action {
             SkillAction::List => inspect::skill_list(),
             SkillAction::Install { source } => skill::install(&source).await,
@@ -437,28 +433,33 @@ pub async fn run() -> anyhow::Result<()> {
             SkillAction::Inspect { name } => skill::inspect(&name),
             SkillAction::Audit { name } => skill::audit(&db, &name).await,
         },
-        Commands::Journey { limit, since } => {
-            journey::journey(&crate::config::default_memory_db_url(), limit, since).await
-        }
-        Commands::Doctor => doctor::doctor(&crate::config::ConfigSnapshot::load()).await,
+        Commands::Journey { limit, since } => journey::journey(&memory, limit, since).await,
+        Commands::Doctor => doctor::doctor(&config).await,
         Commands::Pair { action } => match action {
             PairAction::List => pair::list(&db).await,
             PairAction::Approve { code } => pair::approve(&db, &code).await,
             PairAction::Revoke { id } => pair::revoke(&db, &id).await,
         },
         Commands::Policy { action } => match action {
-            PolicyAction::List => policy::list(),
+            PolicyAction::List => policy::list(&config),
             PolicyAction::Check {
                 category,
                 target,
                 channel,
                 dangerous,
                 write,
-            } => policy::check(&category, &target, channel.as_deref(), dangerous, write),
+            } => policy::check(
+                &config,
+                &category,
+                &target,
+                channel.as_deref(),
+                dangerous,
+                write,
+            ),
         },
         Commands::Model { action } => match action {
-            ModelAction::List => model::list().await,
-            ModelAction::Set { provider, model } => model::set(&provider, model).await,
+            ModelAction::List => model::list(&config).await,
+            ModelAction::Set { provider, model } => model::set(&config, &provider, model).await,
         },
         Commands::Channel { action } => match action {
             ChannelAction::Wechat { action } => match action {

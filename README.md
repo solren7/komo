@@ -196,19 +196,47 @@ from an already-working chat channel.
 DDD-style layers with domain traits at the center:
 
 ```
-CLI/channel → AgentRuntime → LlmClient/rig → ToolRegistry → tool
-                         ↘ repositories + run ledger → Response
+CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn → TurnDriver (one rig completion / round)
+                                             └→ ToolExecutor::execute_round → tools   (loop until Step::Final)
+                          ↘ MessageRepository · RunRepository (ledger) → Response
 ```
 
-- `domain/` — pure traits and value types, no I/O
-- `agent/` — runtime, gateway, maintenance daemon, reviewer, system prompt
-- `infra/` — SQLite via toasty, LLM via rig, messaging channels, notifiers
-- `tools/` — built-in tools; `services/` — tool registry
-- `cli/` — subcommand wiring
+shion owns the tool loop: `AgentRuntime::run_agent_loop` drives the model one
+round at a time and hands each round of requested tool calls to the
+`ToolExecutor`, where every call is isolated, retried on transient failures,
+traced, and recorded in the run ledger.
 
-The LLM owns tool dispatch through rig's function-calling loop. Every tool call
-funnels through `execute_isolated`, where it is isolated, traced, and recorded
-in the run ledger when a turn is active.
+### Project layout
+
+```
+src/
+├── main.rs                # entry point + tracing setup
+├── domain/                # pure traits and value types — no I/O, no external crates
+│   ├── repository.rs · tool.rs · llm.rs      # the core trait seams
+│   ├── message.rs · session.rs · run.rs      # value types + run-ledger model
+│   ├── memory.rs · task.rs · todo.rs · skill.rs
+│   └── policy.rs · approval.rs · pairing.rs · gateway.rs · …
+├── agent/                 # application logic
+│   ├── runtime.rs         # AgentRuntime: the in-house tool loop (run_agent_loop)
+│   ├── gateway.rs · daemon.rs      # always-on gateway + scheduled sweeps
+│   ├── interaction.rs     # GatewayDispatcher + chat approval
+│   └── review_coordinator.rs · reviewer.rs · policy_approver.rs · system_prompt.rs
+├── services/              # cross-cutting services
+│   ├── tool_execution/    # ToolExecutor: retry / ledger / truncation pipeline
+│   ├── operator_control/  # CLI operator actions, gateway/direct dual backend
+│   ├── memory_enrichment.rs        # pinned + recall memory injection
+│   └── skill_registry.rs  # live runtime view over the skill dirs
+├── infra/                 # I/O implementations
+│   ├── llm.rs · codex.rs · rig_tool.rs       # rig backend + Codex OAuth provider
+│   ├── persistence/       # toasty/Turso: shion.db + kanban.db
+│   ├── memory/            # memory.db (+ legacy markdown import)
+│   ├── messaging/         # feishu · telegram · wechat · homeassistant · api · notifiers
+│   └── skills.rs · skill_install.rs · gateway_client.rs · rendezvous.rs · workday.rs
+├── tools/                 # built-in tools (shell, file, web, task, memory, skill, …)
+├── cli/                   # subcommands; wiring.rs assembles the AgentRuntime
+├── config/                # one-shot resolution into ConfigSnapshot (sources → resolved → report)
+└── tui/                   # full-screen chat TUI (ratatui): app · ui · markdown · approver
+```
 
 ## Development
 

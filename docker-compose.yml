@@ -19,9 +19,14 @@
 services:
   shion:
     image: ghcr.io/solren7/shion:${SHION_TAG:-latest}
+    # For a local-CI deployment that builds on the Docker host instead of
+    # pulling from ghcr (e.g. a Dockhand git stack on the NAS), set
+    # SHION_PULL_POLICY=build and a non-clashing SHION_TAG such as `local`.
+    # See docs/nas-ci.md. The default remains pull-from-registry.
+    build: .
     container_name: shion
     restart: unless-stopped
-    pull_policy: always
+    pull_policy: ${SHION_PULL_POLICY:-always}
     init: true
     environment:
       TZ: ${TZ:-Asia/Shanghai}

@@ -49,6 +49,14 @@ services:
     ports:
       - "3000:3000"   # web + http git
       - "2222:22"     # ssh git (22 belongs to the NAS's own sshd)
+    networks:
+      - common
+
+# Shared pre-existing network, so other stacks (Dockhand itself, a reverse
+# proxy) reach Forgejo by container name instead of the published ports.
+networks:
+  common:
+    external: true
 ```
 
 Open `http://<nas>:3000`, finish the installer (SQLite is fine; create the

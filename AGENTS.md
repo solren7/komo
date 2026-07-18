@@ -8,6 +8,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 ```bash
 cargo check                        # fast compile check
 cargo build                        # build
+shion init                         # bootstrap ~/.shion: default config.toml + .env template (never overwrites)
 cargo run -- chat                  # interactive chat: full-screen TUI (needs a terminal; scripts use the api channel) (db at ~/.shion/shion.db)
 cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram, wechat)
 cargo test                         # run all tests
@@ -177,7 +178,12 @@ aborts**: problems become `ConfigIssue`s in the report (with per-value
 provenance, secrets redacted to presence-only), and startup paths fail fast via
 `validate_agent` (env/model issues — wiring calls it) or `validate_gateway`
 (any fatal issue, e.g. an enabled channel missing its credential —
-`gateway::run` calls it). `cli/app.rs` loads the snapshot once per invocation
+`gateway::run` calls it). One deliberate exception: a **missing model API key
+is a warning, not fatal** — a fresh install (first Docker boot, before `shion
+init` + a key exists) must boot rather than crash-loop, so `build_llm` degrades
+to an `UnconfiguredLlm` whose every call errors with the fix, and that message
+reaches the user as the turn's reply. `shion init` scaffolds `config.toml` +
+`.env` (`cli/init.rs`, pure file ops, never overwrites). `cli/app.rs` loads the snapshot once per invocation
 and threads `&ConfigSnapshot` to chat/gateway/doctor/model/policy; channel
 tri-state (disabled / ready / misconfigured) is `ChannelState<T>`. Never
 re-read config.toml or call `std::env::var` in callers — the only exception is

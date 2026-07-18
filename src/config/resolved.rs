@@ -272,15 +272,21 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
 
     // Codex authenticates from `~/.codex/auth.json`, not an env key — its
     // `api_key` stays empty and is resolved in `infra/codex.rs`.
+    //
+    // A missing key is a *warning*, not a fatal issue: a fresh install (first
+    // gateway boot in Docker, `shion init` before any credential exists) must
+    // come up rather than crash-loop. `build_llm` degrades to a client whose
+    // every call reports this same fix, so turns fail with guidance instead.
     let api_key = if provider.uses_api_key() {
         match secrets.key(provider) {
             Some(key) => key.to_string(),
             None => {
                 issues.push(ConfigIssue {
                     path: "model.api_key",
-                    severity: IssueSeverity::Fatal,
+                    severity: IssueSeverity::Warning,
                     message: format!(
-                        "{} is not set (required for {provider:?})",
+                        "{} is not set (required for {provider:?}) — agent turns will \
+                         fail until it is added to ~/.shion/.env (see `shion init`)",
                         provider.api_key_var()
                     ),
                 });
@@ -679,14 +685,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_api_key_is_fatal_but_still_resolves() {
+    fn missing_api_key_warns_but_does_not_block_startup() {
         let snap = ConfigSnapshot::from_sources(sources());
         assert_eq!(snap.runtime.model.api_key, "");
-        let fatal = snap.report.fatal().expect("missing key is fatal");
-        assert_eq!(fatal.path, "model.api_key");
-        assert!(fatal.message.contains("DEEPSEEK_API_KEY"));
-        assert!(snap.validate_gateway().is_err());
-        assert!(snap.validate_agent().is_err());
+        // Degraded, not dead: a fresh install must boot (build_llm degrades to
+        // an every-call-errors client), so the issue is a warning.
+        assert!(snap.report.fatal().is_none());
+        let issue = snap
+            .report
+            .issues
+            .iter()
+            .find(|i| i.path == "model.api_key")
+            .expect("missing key is reported");
+        assert_eq!(issue.severity, IssueSeverity::Warning);
+        assert!(issue.message.contains("DEEPSEEK_API_KEY"));
+        assert!(snap.validate_gateway().is_ok());
+        assert!(snap.validate_agent().is_ok());
     }
 
     #[test]

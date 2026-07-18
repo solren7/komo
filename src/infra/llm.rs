@@ -37,6 +37,21 @@ use crate::{
 /// warm) and self-heals across midnight.
 pub type PreambleFn = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Stand-in for a provider whose API key is missing (see [`build_llm`]):
+/// construction always succeeds so a fresh install boots, and every call —
+/// `begin_turn` inherits the default one-shot driver over `complete` — fails
+/// with the fix. The error text reaches the user as the turn's reply.
+struct UnconfiguredLlm {
+    message: String,
+}
+
+#[async_trait]
+impl LlmClient for UnconfiguredLlm {
+    async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
+        anyhow::bail!("{}", self.message)
+    }
+}
+
 /// Generic [`LlmClient`] over any `rig` completion model. The concrete provider
 /// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
 pub struct RigLlm<M: CompletionModel> {
@@ -324,6 +339,21 @@ pub fn build_llm(
     preamble: PreambleFn,
     enricher: Option<Arc<MemoryEnricher>>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
+    // A missing API key degrades instead of failing construction: a fresh
+    // install (first Docker boot, pre-`shion init`) must still bring the
+    // gateway up — channels serve, pairing works — while every LLM call
+    // reports the fix. Config resolution records the matching warning.
+    if config.provider.uses_api_key() && config.api_key.is_empty() {
+        return Ok(Arc::new(UnconfiguredLlm {
+            message: format!(
+                "{} is not set (required for {:?}). Add it to ~/.shion/.env \
+                 (run `shion init` to scaffold one) or the container \
+                 environment, then restart the gateway.",
+                config.provider.api_key_var(),
+                config.provider
+            ),
+        }));
+    }
     // Each RigTool shares the executor's core, so the trait-required fallback
     // path carries the same retry/ledger/cap semantics as the runtime's loop.
     let adapters: Vec<Box<dyn ToolDyn>> = tools

@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    doctor, dream, gateway, inspect, journey, logs, memory, model, pair, policy, resume, service,
-    skill, upgrade, wechat, workday,
+    doctor, dream, gateway, init, inspect, journey, logs, memory, model, pair, policy, resume,
+    service, skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -14,6 +14,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Bootstrap ~/.shion: write a commented default config.toml and a .env
+    /// credential template. Existing files are never overwritten.
+    Init,
     /// Start an interactive chat session (full-screen TUI; needs a terminal)
     Chat,
     /// Run the always-on gateway: maintenance scheduler (and, later,
@@ -374,6 +377,7 @@ pub async fn run() -> anyhow::Result<()> {
     // or a second instance).
     let config = crate::config::ConfigSnapshot::load();
     match cli.command {
+        Commands::Init => init::run(),
         Commands::Chat => {
             require_terminal()?;
             crate::tui::run(&config).await

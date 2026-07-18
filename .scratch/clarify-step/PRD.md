@@ -1,6 +1,6 @@
 # PRD: 澄清而不是盲干——ask_user 哨兵工具(roadmap §7 剩余项)
 
-Status: draft (needs-triage)
+Status: shipped (implemented 2026-07-18; see git log)
 
 ## 背景与现状
 

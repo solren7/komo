@@ -127,7 +127,7 @@ pub fn check(
         "action:  {category} {target}  [risk: {risk_str}{}]",
         channel
             .map(|c| format!(", channel: {c}"))
-            .unwrap_or_default()
+            .unwrap_or_else(|| ", no session (unattended context)".to_string())
     );
 
     match (decision.verdict, decision.rule) {
@@ -202,6 +202,9 @@ fn rule_str(r: &Rule) -> String {
     }
     if r.include_dangerous {
         parts.push("include_dangerous".to_string());
+    }
+    if r.unattended {
+        parts.push("unattended".to_string());
     }
     parts.join("  ")
 }

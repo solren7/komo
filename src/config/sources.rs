@@ -266,6 +266,10 @@ pub struct PolicyRuleFileConfig {
     pub channels: Option<Vec<String>>,
     /// Let an `allow` rule grant `Risk::Dangerous` actions too (default false).
     pub include_dangerous: Option<bool>,
+    /// Let an `allow` rule grant in no-session contexts too — the briefing
+    /// sweep's tool-capable turn (default false). Deny rules apply everywhere
+    /// regardless.
+    pub unattended: Option<bool>,
 }
 
 /// `[channels]` namespace in config.toml: one optional table per transport.

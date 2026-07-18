@@ -68,16 +68,15 @@ impl Approver for PolicyApprover {
                       "policy: denied");
                 false
             }
-            // Auto-allow only within a real session turn. With no session in
-            // scope (maintenance sweep, aux sub-agent) there is no human and no
-            // channel to scope to, so we never grant unattended — fall through to
-            // the inner approver, which denies in that case.
-            Verdict::Allow if channel.is_some() => {
+            // The engine already gates no-session grants: with `channel = None`
+            // only an explicitly `unattended` allow rule (never a default)
+            // produces `Allow`, so an Allow here is safe to honor as-is.
+            Verdict::Allow => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: auto-allowed");
                 true
             }
-            Verdict::Allow | Verdict::Ask => self.inner.approve(request).await,
+            Verdict::Ask => self.inner.approve(request).await,
         }
     }
 }
@@ -111,6 +110,7 @@ mod tests {
             access: None,
             effect: Effect::Allow,
             include_dangerous: false,
+            unattended: false,
         }
     }
 
@@ -150,6 +150,21 @@ mod tests {
         let allowed = approver.approve(&shell_req()).await;
         assert!(!allowed);
         assert!(*inner.asked.lock().unwrap(), "inner should be consulted");
+    }
+
+    #[tokio::test]
+    async fn unattended_rule_auto_allows_without_a_session() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let mut rule = allow_rule("cargo ");
+        rule.unattended = true;
+        let approver = PolicyApprover::wrap(Policy::new(vec![rule], Verdict::Ask), inner.clone());
+        // No `with_session`: the sweep context. The explicit opt-in grants.
+        let allowed = approver.approve(&shell_req()).await;
+        assert!(allowed);
+        assert!(!*inner.asked.lock().unwrap(), "inner must not be consulted");
     }
 
     #[tokio::test]

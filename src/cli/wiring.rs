@@ -54,6 +54,10 @@ pub struct Wiring {
     /// Mid-turn clarify state: the `ask_user` tool waits on it; the gateway
     /// dispatcher (and the TUI) resolve an inbound message into it.
     pub clarify: Arc<ClarifyState>,
+    /// The briefing sweep's tool-capable agent (roadmap §2): aux model over a
+    /// read-only tool set, policy-gated with a deny-all inner approver — only
+    /// explicit `unattended` policy rules can grant a `Risk::Normal` action.
+    pub briefing_runtime: Arc<AgentRuntime>,
 }
 
 /// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
@@ -204,7 +208,7 @@ pub async fn build(
     let prompt_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
-            .skills_note(skills_note)
+            .skills_note(skills_note.clone())
             .workspace_root(Some(root.clone())),
     );
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
@@ -249,6 +253,61 @@ pub async fn build(
         review: Some(review.clone()),
     };
 
+    // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
+    // A second, deliberately small agent the BriefingSweep drives: aux model,
+    // read-only tool set (no shell/file/task/memory writes), and a policy
+    // approver whose inner is deny-all — there is never a human to prompt, so
+    // a `Risk::Normal` action passes only through an explicit `unattended`
+    // policy rule. Safe reads (web_fetch, skill view) work out of the box.
+    // Sharing the run ledger (`runs: db`) makes every briefing execution
+    // auditable via `shion run list`.
+    let briefing_approver = crate::agent::policy_approver::PolicyApprover::wrap(
+        config.runtime.policy.policy.clone(),
+        Arc::new(UnattendedDeny),
+    );
+    let mut briefing_tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
+        model_config.max_tool_result_bytes,
+    ));
+    briefing_tools.register(Arc::new(TimeTool));
+    briefing_tools.register(Arc::new(WebFetchTool::new(briefing_approver.clone())));
+    briefing_tools.register(Arc::new(WebSearchTool::new()));
+    briefing_tools.register(Arc::new(SkillTool::new(
+        skills.clone(),
+        skill_store.clone(),
+        briefing_approver.clone(),
+    )));
+    if let Some(ha) = &config.runtime.homeassistant_tool {
+        briefing_tools.register(Arc::new(HomeAssistantTool::new(
+            ha.base_url.clone(),
+            ha.token.clone(),
+            briefing_approver.clone(),
+        )));
+    }
+    let briefing_tool_names = briefing_tools
+        .definitions()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    let briefing_builder = Arc::new(
+        SystemPromptBuilder::new(&aux_config)
+            .tools(briefing_tool_names)
+            .skills_note(skills_note),
+    );
+    let briefing_preamble: PreambleFn = Arc::new(move || briefing_builder.build());
+    // No memory enricher: sweeps must not be fed the user's memory library.
+    let briefing_llm = build_llm(&aux_config, Some(&briefing_tools), briefing_preamble, None)?;
+    let briefing_runtime = Arc::new(AgentRuntime {
+        llm: briefing_llm,
+        sessions: db.clone(),
+        messages: db.clone(),
+        runs: db.clone(),
+        tool_executor: briefing_tools,
+        // A briefing is an aggregation read, not a long-running job.
+        max_turns: BRIEFING_MAX_TURNS,
+        history_window: model_config.max_history_messages,
+        review: None,
+    });
+
     Ok(Wiring {
         runtime,
         review,
@@ -256,5 +315,23 @@ pub async fn build(
         memories: memory_repo,
         skills: skill_store,
         clarify,
+        briefing_runtime,
     })
+}
+
+/// Round budget for the briefing runtime: enough for "list skills → load one →
+/// fetch its data → compose", never a long-running loop.
+const BRIEFING_MAX_TURNS: usize = 4;
+
+/// Inner approver for the unattended briefing runtime: there is never a human
+/// watching, so anything the policy didn't explicitly grant is denied.
+struct UnattendedDeny;
+
+#[async_trait::async_trait]
+impl Approver for UnattendedDeny {
+    async fn approve(&self, request: &crate::domain::approval::ApprovalRequest) -> bool {
+        tracing::warn!(summary = %request.summary,
+            "briefing: denied (unattended; add an `unattended = true` policy rule to grant)");
+        false
+    }
 }

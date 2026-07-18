@@ -23,6 +23,7 @@ use croner::Cron;
 use tracing::{error, info, warn};
 
 use crate::domain::{
+    gateway::MessageHandler,
     llm::LlmClient,
     memory::{Memory, MemoryRepository},
     message::Message,
@@ -355,6 +356,24 @@ pub struct BriefingSweep {
     pub memories: Arc<dyn MemoryRepository>,
     pub llm: Arc<dyn LlmClient>,
     pub notifier: Arc<dyn Notifier>,
+    /// The tool-capable briefing agent (wiring's `briefing_runtime`): when set,
+    /// the briefing runs as a real agent turn — read-only tools, so a briefing
+    /// skill can pull external data (calendar, weather) — and falls back to the
+    /// tool-less `llm.complete` path on any error, so the briefing always goes
+    /// out. `None` keeps the plain compose (tests, minimal wiring).
+    pub runtime: Option<Arc<dyn MessageHandler>>,
+}
+
+impl BriefingSweep {
+    /// The original tool-less compose: one synthetic user turn on the aux LLM.
+    async fn compose_plain(&self, prompt: &str, now: i64) -> anyhow::Result<String> {
+        let session = Session {
+            id: "briefing".to_string(),
+            messages: vec![Message::user(prompt.to_string())],
+            created_at: now,
+        };
+        self.llm.complete(&session).await
+    }
 }
 
 #[async_trait]
@@ -370,13 +389,26 @@ impl Maintenance for BriefingSweep {
             return Ok(summary);
         };
 
-        // Same synthetic-session trick the reviewer uses: one user turn, no tools.
-        let session = Session {
-            id: "briefing".to_string(),
-            messages: vec![Message::user(prompt)],
-            created_at: now,
+        // Prefer the tool-capable agent turn (one per-day session, so each
+        // briefing is one clean transcript + run-ledger entry); degrade to the
+        // plain compose on any error — a broken skill or a denied tool call
+        // must never cost the user their briefing.
+        let text = match &self.runtime {
+            Some(handler) => {
+                let session_id = format!("briefing:{}", chrono::Local::now().format("%Y-%m-%d"));
+                match handler
+                    .handle(&session_id, agentic_briefing_prompt(&prompt))
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(error) => {
+                        warn!(%error, "briefing agent turn failed; using tool-less compose");
+                        self.compose_plain(&prompt, now).await?
+                    }
+                }
+            }
+            None => self.compose_plain(&prompt, now).await?,
         };
-        let text = self.llm.complete(&session).await?;
         let text = text.trim();
         if text.is_empty() {
             return Ok(summary);
@@ -388,6 +420,21 @@ impl Maintenance for BriefingSweep {
         summary.briefings_sent = 1;
         Ok(summary)
     }
+}
+
+/// Wrap the digest prompt with the agent-turn instructions: how to use the
+/// read-only tools to enrich the briefing, and how to degrade. Pure, so the
+/// wording is testable.
+fn agentic_briefing_prompt(digest_prompt: &str) -> String {
+    format!(
+        "{digest_prompt}\n\n\
+         You have read-only tools. Before composing, check `skill` (action=list) \
+         for briefing-related skills (calendar, weather, mail, …); load any that \
+         apply with action=view and follow them to fetch external data. If a \
+         source is unreachable or a tool call is denied, skip that section \
+         silently — never block the briefing on it. Reply with ONLY the final \
+         briefing text."
+    )
 }
 
 /// Wraps a `Maintenance` so it only runs on Chinese working days: a holiday or
@@ -1031,8 +1078,68 @@ mod tests {
             memories: Arc::new(FakeMemories(Mutex::new(memories))),
             llm: Arc::new(FixedLlm(reply.to_string())),
             notifier: notifier.clone(),
+            runtime: None,
         };
         (sweep, notifier)
+    }
+
+    /// A MessageHandler that either answers fixedly or errors, recording calls.
+    struct FakeHandler {
+        reply: Result<String, String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::gateway::MessageHandler for FakeHandler {
+        async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
+            self.calls.lock().unwrap().push(input);
+            match &self.reply {
+                Ok(t) => Ok(t.clone()),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn briefing_prefers_the_agent_turn_with_tool_instructions() {
+        let (mut sweep, notifier) = briefing_with(
+            vec![Task::new("write report".into())],
+            vec![],
+            "plain compose (must not be used)",
+        );
+        let handler = Arc::new(FakeHandler {
+            reply: Ok("agentic briefing".into()),
+            calls: Mutex::new(Vec::new()),
+        });
+        sweep.runtime = Some(handler.clone());
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.briefings_sent, 1);
+        assert_eq!(notifier.calls.lock().unwrap()[0].1, "agentic briefing");
+        let calls = handler.calls.lock().unwrap();
+        assert!(calls[0].contains("write report"), "digest is embedded");
+        assert!(
+            calls[0].contains("read-only tools"),
+            "agent-turn instructions appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn briefing_falls_back_to_plain_compose_when_the_agent_turn_fails() {
+        let (mut sweep, notifier) = briefing_with(
+            vec![Task::new("write report".into())],
+            vec![],
+            "plain fallback briefing",
+        );
+        sweep.runtime = Some(Arc::new(FakeHandler {
+            reply: Err("tool exploded".into()),
+            calls: Mutex::new(Vec::new()),
+        }));
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.briefings_sent, 1, "briefing still goes out");
+        assert_eq!(
+            notifier.calls.lock().unwrap()[0].1,
+            "plain fallback briefing"
+        );
     }
 
     #[test]

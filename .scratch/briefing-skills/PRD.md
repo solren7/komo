@@ -1,6 +1,6 @@
 # PRD: briefing 接入真实数据——工具化 sweep + policy 的 unattended 窄通道(roadmap §2 + §3 收尾)
 
-Status: draft (needs-triage)
+Status: shipped except D3 weekly (implemented 2026-07-18) — weekly deferred: TaskRepository has no completed-since query yet, needs a repo method first
 
 ## 背景与现状
 

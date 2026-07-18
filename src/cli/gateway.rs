@@ -214,6 +214,9 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             memories: wired.memories.clone(),
             llm: wired.aux_llm.clone(),
             notifier: notifier.clone(),
+            // Tool-capable agent turn (read-only tools + unattended policy
+            // gating); the sweep degrades to the plain compose on error.
+            runtime: Some(wired.briefing_runtime.clone()),
         });
         // Opt-in: only fire on Chinese working days (statutory holidays and
         // 调休-adjusted weekends respected). The calendar is built only when

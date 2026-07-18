@@ -610,6 +610,7 @@ fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {
         },
         effect: Effect::parse(&r.effect)?,
         include_dangerous: r.include_dangerous.unwrap_or(false),
+        unattended: r.unattended.unwrap_or(false),
     })
 }
 

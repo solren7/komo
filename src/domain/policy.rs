@@ -138,6 +138,11 @@ pub struct Rule {
     pub effect: Effect,
     /// Allow rules don't grant `Risk::Dangerous` actions unless this is set.
     pub include_dangerous: bool,
+    /// Allow rules apply only within a real session turn unless this is set:
+    /// an `unattended = true` allow also grants in no-session contexts (the
+    /// briefing sweep's tool-capable turn). Deny rules ignore this — they are
+    /// unconditional everywhere. The narrow channel of roadmap §3.
+    pub unattended: bool,
 }
 
 impl Rule {
@@ -244,10 +249,15 @@ impl Policy {
     /// read-only action (network fetch, file read), but nothing ever escalates
     /// it to a prompt — an unmatched safe action stays allowed. Allow rules are
     /// meaningless for safe actions and are skipped.
+    ///
+    /// **Unattended contexts** (`channel = None`) only grant through an allow
+    /// rule explicitly marked `unattended`; a `default_normal = allow` fallback
+    /// degrades to [`Verdict::Ask`] there — no-session grants are always an
+    /// explicit opt-in, never a default.
     pub fn decide(&self, request: &ApprovalRequest, channel: Option<&str>) -> Decision {
         let Some(action) = request.action.as_ref() else {
             // No structured resource to match on; risk-only fallback.
-            return Decision::fallback(self.default_for(request.risk));
+            return Decision::fallback(self.default_for(request.risk, channel));
         };
 
         for (i, rule) in self.rules.iter().enumerate() {
@@ -269,18 +279,27 @@ impl Policy {
                 if request.risk == Risk::Dangerous && !rule.include_dangerous {
                     continue;
                 }
+                // No session in scope: only explicitly-unattended allows grant.
+                if channel.is_none() && !rule.unattended {
+                    continue;
+                }
                 return Decision {
                     verdict: Verdict::Allow,
                     rule: Some(i),
                 };
             }
         }
-        Decision::fallback(self.default_for(request.risk))
+        Decision::fallback(self.default_for(request.risk, channel))
     }
 
-    fn default_for(&self, risk: Risk) -> Verdict {
+    fn default_for(&self, risk: Risk, channel: Option<&str>) -> Verdict {
         match risk {
             Risk::Safe => Verdict::Allow,
+            // A default can never grant unattended (channel = None) — only an
+            // explicit `unattended` rule does; degrade a would-be Allow to Ask.
+            Risk::Normal if channel.is_none() && self.default_normal == Verdict::Allow => {
+                Verdict::Ask
+            }
             Risk::Normal => self.default_normal,
             Risk::Dangerous => Verdict::Ask,
         }
@@ -344,7 +363,46 @@ mod tests {
             access: None,
             effect,
             include_dangerous: false,
+            unattended: false,
         }
+    }
+
+    #[test]
+    fn unattended_grants_only_through_an_explicit_unattended_rule() {
+        let mut r = rule(Category::Shell, Matcher::Prefix, "curl ", Effect::Allow);
+        // Plain allow: grants in a session, not unattended.
+        let p = Policy::new(vec![r.clone()], Verdict::Ask);
+        assert_eq!(
+            p.decide(&shell("curl http://x", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.decide(&shell("curl http://x", Risk::Normal), None)
+                .verdict,
+            Verdict::Ask,
+            "non-unattended allow must not grant without a session"
+        );
+        // Opt-in: grants unattended too.
+        r.unattended = true;
+        let p = Policy::new(vec![r], Verdict::Ask);
+        let d = p.decide(&shell("curl http://x", Risk::Normal), None);
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert_eq!(d.rule, Some(0));
+    }
+
+    #[test]
+    fn default_allow_never_grants_unattended() {
+        let p = Policy::new(Vec::new(), Verdict::Allow);
+        assert_eq!(
+            p.decide(&shell("ls", Risk::Normal), Some("cli")).verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.decide(&shell("ls", Risk::Normal), None).verdict,
+            Verdict::Ask,
+            "a default can never be an unattended grant"
+        );
     }
 
     #[test]

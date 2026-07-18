@@ -22,13 +22,16 @@ cargo build --release
 ## Quick start
 
 ```bash
-# put an API key in ~/.shion/.env (created on first run)
-echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.shion/.env
+shion init                       # scaffold ~/.shion/config.toml + .env (never overwrites)
+# then fill the DEEPSEEK_API_KEY= line in ~/.shion/.env
 
 shion chat                       # interactive chat (full-screen TUI; needs a terminal)
 shion model list                 # show current provider/model
 shion model set anthropic        # switch provider (persists to config.toml)
 ```
+
+Everything boots without a key — the gateway starts and channels serve — but
+agent turns reply with a "key not set" pointer until one is configured.
 
 Inside chat, `/new` (or `/clear` / `/reset`) starts a fresh session. History and
 the run ledger are stored in `~/.shion/shion.db`.

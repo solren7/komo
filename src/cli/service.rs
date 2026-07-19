@@ -216,14 +216,14 @@ mod launchd {
     /// Write the plist and bootstrap it into the user's gui domain.
     pub fn start() -> anyhow::Result<()> {
         let domain = gui_domain()?;
+        if unload(&domain, LEGACY_LABEL)? {
+            println!("migrated legacy launchd gateway to {LABEL}");
+        }
         if is_label_loaded(&domain, LABEL) {
             println!(
                 "komo gateway is already running under launchd. Use `komo gateway restart` to restart it."
             );
             return Ok(());
-        }
-        if unload(&domain, LEGACY_LABEL)? {
-            println!("migrated legacy launchd gateway to {LABEL}");
         }
 
         let exe = std::env::current_exe()?;

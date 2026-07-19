@@ -73,11 +73,25 @@ impl KomoEnv {
     /// Strict load: a malformed value (e.g. non-numeric `KOMO_MAX_TURNS`)
     /// is an error. Use on paths that should fail fast at startup.
     pub fn load() -> anyhow::Result<Self> {
+        Self::load_from_iter(std::env::vars().collect())
+    }
+
+    fn load_from_iter(vars: Vec<(String, String)>) -> anyhow::Result<Self> {
+        let current_keys = vars
+            .iter()
+            .filter(|(key, _)| key.starts_with("KOMO_"))
+            .map(|(key, _)| key.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let legacy_vars = vars.iter().filter_map(|(key, value)| {
+            let suffix = key.strip_prefix("SHION_")?;
+            (!current_keys.contains(&format!("KOMO_{suffix}")))
+                .then(|| (key.clone(), value.clone()))
+        });
         let legacy: KomoEnv = envy::prefixed("SHION_")
-            .from_env()
+            .from_iter(legacy_vars)
             .map_err(|e| anyhow::anyhow!("invalid legacy SHION_* environment variable: {e}"))?;
         let current: KomoEnv = envy::prefixed("KOMO_")
-            .from_env()
+            .from_iter(vars)
             .map_err(|e| anyhow::anyhow!("invalid KOMO_* environment variable: {e}"))?;
         Ok(legacy.normalized().overlay(current.normalized()))
     }
@@ -571,6 +585,16 @@ mod tests {
         assert_eq!(merged.provider.as_deref(), Some("openai"));
         assert_eq!(merged.model.as_deref(), Some("legacy-model"));
         assert_eq!(merged.max_turns, Some(30));
+    }
+
+    #[test]
+    fn current_env_shadows_a_malformed_legacy_value_before_parsing() {
+        let env = KomoEnv::load_from_iter(vec![
+            ("SHION_MAX_TURNS".into(), "not-a-number".into()),
+            ("KOMO_MAX_TURNS".into(), "30".into()),
+        ])
+        .unwrap();
+        assert_eq!(env.max_turns, Some(30));
     }
 
     #[test]

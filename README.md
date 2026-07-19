@@ -1,9 +1,22 @@
-# komo
+# Komo
 
 A personal agent framework in Rust. One binary gives you interactive LLM chat,
 local tools, durable tasks and memories, scheduled reminders, and an always-on
 gateway for chat channels and proactive background work. State lives locally
 under `~/.komo`.
+
+## Brand
+
+**Komo** is inspired by the Japanese word *komorebi* (木漏れ日): sunlight
+filtering through leaves. The image feels warm and clear, while suggesting how
+small moments gather into something lasting—a natural fit for a personal agent
+built around memory accumulating over time.
+
+- **Slogan:** 「记住每一缕光」 / 「陪你把日子攒成光」 / *Light through your days*
+- **Visual language:** soft green, cream white, and sunlight yellow, with
+  dappled-light shapes inspired by gaps between leaves
+- **Personality:** a quiet friend beside you in the shade—warm and
+  unobtrusive, attentive without being noisy, and able to remember what matters
 
 ## Install
 

@@ -92,6 +92,12 @@ The agent can call these during a chat turn:
 ## Data Layout
 
 Everything lives in `~/.komo/` by default, or under `KOMO_HOME` when set.
+During upgrades from the former `shion` name, an existing `~/.shion` directory
+and `SHION_HOME` / `SHION_*` overrides remain compatibility fallbacks; any
+`komo`-named path or variable takes precedence. `komo gateway start/restart`
+also unloads the former launchd job before installing `com.komo.gateway`.
+Source installs retain a deprecated `shion` forwarding command solely so an
+older `shion upgrade` can cross the rename safely; new usage should call `komo`.
 
 | File | Purpose |
 |---|---|
@@ -191,7 +197,7 @@ HASS_TOKEN=xxx
 HASS_URL=http://homeassistant.local:8123
 ```
 
-WeChat is QR-based: run `komo wechat login` on the host, or send `/wechat login`
+WeChat is QR-based: run `komo channel wechat login` on the host, or send `/wechat login`
 from an already-working chat channel.
 
 ## Architecture

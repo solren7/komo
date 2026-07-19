@@ -89,6 +89,7 @@ mod launchd {
     use std::process::Command;
 
     const LABEL: &str = "com.komo.gateway";
+    const LEGACY_LABEL: &str = "com.shion.gateway";
 
     /// Render the LaunchAgent plist. Pure so the XML is unit-testable.
     /// `exe` is the absolute komo binary path; `log_dir` holds stdout/stderr logs;
@@ -134,12 +135,16 @@ mod launchd {
             .replace('>', "&gt;")
     }
 
-    fn plist_path() -> anyhow::Result<PathBuf> {
+    fn plist_path_for(label: &str) -> anyhow::Result<PathBuf> {
         let home =
             dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
         Ok(home
             .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist")))
+            .join(format!("{label}.plist")))
+    }
+
+    fn plist_path() -> anyhow::Result<PathBuf> {
+        plist_path_for(LABEL)
     }
 
     /// `gui/<uid>` launchd domain for the current user.
@@ -159,35 +164,66 @@ mod launchd {
             .map_err(|e| anyhow::anyhow!("failed to run launchctl: {e}"))
     }
 
-    pub(super) fn is_loaded(domain: &str) -> bool {
-        launchctl(&["print", &format!("{domain}/{LABEL}")])
+    fn is_label_loaded(domain: &str, label: &str) -> bool {
+        launchctl(&["print", &format!("{domain}/{label}")])
             .map(|out| out.status.success())
             .unwrap_or(false)
+    }
+
+    pub(super) fn is_loaded(domain: &str) -> bool {
+        is_label_loaded(domain, LABEL) || is_label_loaded(domain, LEGACY_LABEL)
     }
 
     /// Poll until launchd has fully unloaded the service, returning whether it did
     /// within the timeout. `bootout` returns before launchd reaps the job, so a
     /// follow-up `start` (which guards on `is_loaded`) would otherwise see it still
     /// present and skip bootstrapping — the restart race.
-    fn wait_until_unloaded(domain: &str) -> bool {
+    fn wait_until_unloaded(domain: &str, label: &str) -> bool {
         // ~5s budget: launchd usually unloads within a few hundred ms.
         for _ in 0..50 {
-            if !is_loaded(domain) {
+            if !is_label_loaded(domain, label) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        !is_loaded(domain)
+        !is_label_loaded(domain, label)
+    }
+
+    fn unload(domain: &str, label: &str) -> anyhow::Result<bool> {
+        if !is_label_loaded(domain, label) {
+            return Ok(false);
+        }
+        let out = launchctl(&["bootout", &format!("{domain}/{label}")])?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "launchctl bootout failed for {label}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        if !wait_until_unloaded(domain, label) {
+            anyhow::bail!("gateway {label} did not unload after bootout");
+        }
+        if let Ok(path) = plist_path_for(label) {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error = %e, label, "could not remove launchd plist"),
+            }
+        }
+        Ok(true)
     }
 
     /// Write the plist and bootstrap it into the user's gui domain.
     pub fn start() -> anyhow::Result<()> {
         let domain = gui_domain()?;
-        if is_loaded(&domain) {
+        if is_label_loaded(&domain, LABEL) {
             println!(
                 "komo gateway is already running under launchd. Use `komo gateway restart` to restart it."
             );
             return Ok(());
+        }
+        if unload(&domain, LEGACY_LABEL)? {
+            println!("migrated legacy launchd gateway to {LABEL}");
         }
 
         let exe = std::env::current_exe()?;
@@ -227,20 +263,12 @@ mod launchd {
     /// Remove the service from launchd (stops the process and disables auto-restart).
     pub fn stop() -> anyhow::Result<()> {
         let domain = gui_domain()?;
-        if !is_loaded(&domain) {
+        let current = unload(&domain, LABEL)?;
+        let legacy = unload(&domain, LEGACY_LABEL)?;
+        if !current && !legacy {
             println!("komo gateway is not running under launchd.");
             return Ok(());
         }
-        let out = launchctl(&["bootout", &format!("{domain}/{LABEL}")])?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootout failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        // Wait for the job to actually unload so the "stopped" report is truthful
-        // and an immediate `start` afterwards isn't blocked by the stale job.
-        wait_until_unloaded(&domain);
         println!("komo gateway stopped.");
         Ok(())
     }
@@ -249,22 +277,8 @@ mod launchd {
     /// a rebuilt/reinstalled binary or moved log dir is picked up on restart.
     pub fn restart() -> anyhow::Result<()> {
         let domain = gui_domain()?;
-        if is_loaded(&domain) {
-            let out = launchctl(&["bootout", &format!("{domain}/{LABEL}")])?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "launchctl bootout failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            // bootout is async; wait for the unload to land before `start`, whose
-            // `is_loaded` guard would otherwise see the stale job and no-op.
-            if !wait_until_unloaded(&domain) {
-                anyhow::bail!(
-                    "gateway did not unload after bootout; wait a moment and run `komo gateway start`"
-                );
-            }
-        }
+        unload(&domain, LABEL)?;
+        unload(&domain, LEGACY_LABEL)?;
         start()
     }
 
@@ -273,6 +287,12 @@ mod launchd {
         let domain = gui_domain()?;
         let out = launchctl(&["print", &format!("{domain}/{LABEL}")])?;
         if !out.status.success() {
+            if is_label_loaded(&domain, LEGACY_LABEL) {
+                println!(
+                    "komo gateway: legacy launchd job is loaded; run `komo gateway restart` to migrate it."
+                );
+                return Ok(());
+            }
             println!("komo gateway: not loaded (run `komo gateway start`).");
             return Ok(());
         }

@@ -22,9 +22,9 @@ pub struct ConfigSources {
     pub file: FileConfig,
     pub env: KomoEnv,
     pub secrets: Secrets,
-    /// Set when the `KOMO_*` environment failed strict parsing; its overrides
-    /// are then dropped (mirroring the old lenient path) and resolution records
-    /// a fatal issue.
+    /// Set when the `KOMO_*` environment (or a legacy `SHION_*` fallback)
+    /// failed strict parsing; its overrides are then dropped and resolution
+    /// records a fatal issue.
     pub env_error: Option<String>,
 }
 
@@ -73,10 +73,13 @@ impl KomoEnv {
     /// Strict load: a malformed value (e.g. non-numeric `KOMO_MAX_TURNS`)
     /// is an error. Use on paths that should fail fast at startup.
     pub fn load() -> anyhow::Result<Self> {
-        let env: KomoEnv = envy::prefixed("KOMO_")
+        let legacy: KomoEnv = envy::prefixed("SHION_")
+            .from_env()
+            .map_err(|e| anyhow::anyhow!("invalid legacy SHION_* environment variable: {e}"))?;
+        let current: KomoEnv = envy::prefixed("KOMO_")
             .from_env()
             .map_err(|e| anyhow::anyhow!("invalid KOMO_* environment variable: {e}"))?;
-        Ok(env.normalized())
+        Ok(legacy.normalized().overlay(current.normalized()))
     }
 
     /// Treat empty strings as unset, so `KOMO_MODEL=` behaves like an
@@ -96,6 +99,33 @@ impl KomoEnv {
                 *slot = None;
             }
         }
+        self
+    }
+
+    /// Overlay explicitly configured current-name values on legacy fallbacks.
+    fn overlay(mut self, current: Self) -> Self {
+        macro_rules! take_current {
+            ($($field:ident),+ $(,)?) => {
+                $(if current.$field.is_some() {
+                    self.$field = current.$field;
+                })+
+            };
+        }
+        take_current!(
+            provider,
+            model,
+            base_url,
+            aux_model,
+            schedule,
+            briefing_schedule,
+            briefing_workdays_only,
+            dream_schedule,
+            max_turns,
+            max_tool_result_bytes,
+            max_history_messages,
+            review_interval,
+            skills_path,
+        );
         self
     }
 }
@@ -522,6 +552,25 @@ mod tests {
         .normalized();
         assert_eq!(env.provider.as_deref(), Some("openai"));
         assert_eq!(env.model, None);
+    }
+
+    #[test]
+    fn komo_env_values_override_legacy_fallbacks() {
+        let legacy = KomoEnv {
+            provider: Some("deepseek".into()),
+            model: Some("legacy-model".into()),
+            max_turns: Some(10),
+            ..Default::default()
+        };
+        let current = KomoEnv {
+            provider: Some("openai".into()),
+            max_turns: Some(30),
+            ..Default::default()
+        };
+        let merged = legacy.overlay(current);
+        assert_eq!(merged.provider.as_deref(), Some("openai"));
+        assert_eq!(merged.model.as_deref(), Some("legacy-model"));
+        assert_eq!(merged.max_turns, Some(30));
     }
 
     #[test]

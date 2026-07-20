@@ -2253,6 +2253,7 @@ dependencies = [
  "futures-util",
  "http",
  "image",
+ "libc",
  "open-lark",
  "pulldown-cmark",
  "qrcode",

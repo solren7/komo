@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair, policy,
-    resume, service, skill, upgrade, wechat, workday,
+    channel, doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair,
+    policy, resume, service, skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -131,6 +131,22 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ChannelAction {
+    /// List configured channels and whether the running gateway has loaded them
+    List {
+        /// Emit machine-readable channel summaries
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check credentials and connectivity without sending a message
+    Probe {
+        /// Channel: feishu | telegram | wechat | homeassistant | api
+        channel: String,
+    },
+    /// Interactively configure an ingress channel and its credentials
+    Setup {
+        /// Channel: feishu | telegram | wechat | homeassistant
+        channel: String,
+    },
     /// WeChat (微信) channel operator commands
     Wechat {
         #[command(subcommand)]
@@ -475,6 +491,9 @@ pub async fn run() -> anyhow::Result<()> {
             ModelAction::Set { provider, model } => model::set(&config, &provider, model).await,
         },
         Commands::Channel { action } => match action {
+            ChannelAction::List { json } => channel::list(&config, json).await,
+            ChannelAction::Probe { channel: name } => channel::probe(&config, &name).await,
+            ChannelAction::Setup { channel: name } => channel::setup(&config, &name).await,
             ChannelAction::Wechat { action } => match action {
                 WechatAction::Login => wechat::login().await,
             },
@@ -545,5 +564,16 @@ mod tests {
     fn skills_is_the_cli_command_name() {
         assert!(Cli::try_parse_from(["komo", "skills", "list"]).is_ok());
         assert!(Cli::try_parse_from(["komo", "skill", "list"]).is_err());
+    }
+
+    #[test]
+    fn channel_list_accepts_json_output() {
+        assert!(Cli::try_parse_from(["komo", "channel", "list", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn channel_probe_and_setup_accept_supported_channel_names() {
+        assert!(Cli::try_parse_from(["komo", "channel", "probe", "telegram"]).is_ok());
+        assert!(Cli::try_parse_from(["komo", "channel", "setup", "telegram"]).is_ok());
     }
 }

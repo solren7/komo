@@ -215,6 +215,13 @@ HASS_TOKEN=xxx
 HASS_URL=http://homeassistant.local:8123
 ```
 
+Use `komo channel list` to see resolved configuration and the channels loaded by
+the running gateway; add `--json` for scripts. `komo channel probe <channel>`
+validates a configured provider without sending a message, and `komo channel
+setup <channel>` interactively writes credentials and the corresponding channel
+table for Feishu, Telegram, WeChat, or Home Assistant. The API channel remains
+loopback-only by default and must be exposed manually in `config.toml`.
+
 WeChat is QR-based: run `komo channel wechat login` on the host, or send `/wechat login`
 from an already-working chat channel.
 

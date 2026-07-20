@@ -64,6 +64,7 @@ unicode-width = "0.2.2"
 # Markdown rendering for agent replies in the chat TUI.
 pulldown-cmark = { version = "0.13", default-features = false }
 tracing-appender = "0.2.5"
+libc = "0.2"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,

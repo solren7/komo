@@ -1,5 +1,6 @@
 mod app;
 mod approver;
+mod channel;
 mod doctor;
 mod dream;
 mod gateway;

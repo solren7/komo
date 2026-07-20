@@ -40,6 +40,14 @@ pub struct GatewayClient {
     http: reqwest::Client,
 }
 
+/// The lightweight live snapshot published by the gateway. It deliberately
+/// reports mounted channels rather than claiming provider connectivity.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GatewayStatus {
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
 /// Result of a gateway-routed `pair approve`, mirroring the db path's
 /// `ApproveOutcome` so the CLI prints the same message either way.
 pub enum PairApprove {
@@ -104,6 +112,12 @@ impl GatewayClient {
 
     pub async fn memories(&self) -> anyhow::Result<Vec<Memory>> {
         self.get_field("/api/memories", "memories").await
+    }
+
+    pub async fn status(&self) -> anyhow::Result<GatewayStatus> {
+        self.get_field("/api/status", "channels")
+            .await
+            .map(|channels| GatewayStatus { channels })
     }
 
     pub async fn tasks(&self) -> anyhow::Result<Vec<Task>> {

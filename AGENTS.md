@@ -49,6 +49,9 @@ komo policy check <cat> <target>  # dry-run one action: verdict + deciding rule 
 komo doctor                       # config & gateway health: model+key, schedules, policy, channels, home, recent failures
 komo health                       # one-line gateway liveness probe (exit 0 = healthy; the Docker HEALTHCHECK command)
 
+komo channel list [--json]              # resolved channel inventory + gateway mounted state
+komo channel probe <channel>            # verify one configured channel without sending a message
+komo channel setup <channel>            # interactive setup: feishu | telegram | wechat | homeassistant
 komo channel wechat login               # provision WeChat iLink creds by scanning a QR (run on the host)
 
 komo workday [YYYY-MM-DD]          # is a date a Chinese working day? (statutory holidays + 调休); defaults to today

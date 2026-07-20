@@ -2,10 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use rig::{
-    completion::ToolDefinition,
-    tool::{ToolDyn, ToolError},
-};
+use rig::tool::{ToolDyn, ToolError};
 
 use crate::domain::tool::Tool;
 use crate::services::tool_execution::ToolExecutionCore;
@@ -35,20 +32,12 @@ impl ToolDyn for RigTool {
         self.tool.name().to_string()
     }
 
-    fn definition(
-        &self,
-        _prompt: String,
-    ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + '_>> {
-        let name = self.tool.name().to_string();
-        let description = self.tool.description().to_string();
-        let parameters = self.tool.parameters_schema();
-        Box::pin(async move {
-            ToolDefinition {
-                name,
-                description,
-                parameters,
-            }
-        })
+    fn description(&self) -> String {
+        self.tool.description().to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.tool.parameters_schema()
     }
 
     fn call(

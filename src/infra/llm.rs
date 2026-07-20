@@ -168,7 +168,7 @@ where
         }
         let reply = agent
             .prompt(prompt)
-            .with_history(history)
+            .history(history)
             .max_turns(self.max_turns)
             .await
             .context("LLM completion failed")?;

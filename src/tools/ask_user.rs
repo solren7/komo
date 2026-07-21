@@ -114,8 +114,10 @@ impl Tool for AskUserTool {
         }
 
         // Register BEFORE sending, so an instant reply can't race the window
-        // between the prompt landing and the waiter existing.
-        let rx = self.clarify.register(&sc.session_id);
+        // between the prompt landing and the waiter existing. The prompt text is
+        // stored too, so a non-sink surface (the GUI's interactions poll) can
+        // render the question.
+        let rx = self.clarify.register(&sc.session_id, &prompt);
         if let Err(error) = sc.sink.send(&prompt).await {
             self.clarify.forget_pending(&sc.session_id);
             return Ok(ToolOutput::text(format!(

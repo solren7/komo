@@ -1,0 +1,28 @@
+[package]
+name = "komo-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Dioxus desktop client for komo (chat + dashboard over the gateway's HTTP api channel)"
+
+[[bin]]
+name = "komo-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Native desktop window (system webview). Navigation is a signal-driven view
+# switch (two top-level views), so no router feature is needed.
+dioxus = { version = "0.7", features = ["desktop"] }
+komo-core = { path = "../komo-core" }
+# Desktop brings its own tokio runtime; we only need timers + the async client.
+tokio = { version = "1", features = ["time", "sync"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+# Markdown → HTML for agent replies. `html` feature provides `push_html`
+# (komo's TUI parses events by hand and so disables it; the GUI renders HTML).
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

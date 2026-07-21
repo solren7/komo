@@ -66,6 +66,22 @@ impl SessionContext {
             auto_approve: true,
         }
     }
+
+    /// An interactive HTTP context: `interactive` so approval / clarify prompts
+    /// suspend the turn (rather than auto-denying), but the sink is a no-op — the
+    /// prompt is surfaced out-of-band. Used for the GUI's turns over the
+    /// gateway's **loopback** api channel (`X-Komo-Interactive`): it polls
+    /// `GET /api/interactions/{session}` for the pending prompt and resolves it
+    /// with a `POST`, so no reply sink is read. The api channel builds this only
+    /// for loopback callers; a publicly-bound api keeps using `detached`.
+    pub fn interactive_http(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            sink: Arc::new(NoopSink),
+            interactive: true,
+            auto_approve: false,
+        }
+    }
 }
 
 /// A [`ReplySink`] that drops everything — see [`SessionContext::detached`].

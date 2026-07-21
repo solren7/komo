@@ -55,12 +55,39 @@ pub enum Decision {
     Deny,
 }
 
+/// The human-facing description of a pending approval, stored alongside the
+/// reply channel so an out-of-band surface — the HTTP
+/// `GET /api/interactions/{session}` the GUI polls — can render the prompt
+/// without reading the chat reply sink. Chat channels still see the prompt text
+/// via the sink; this is the structured mirror.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PendingApproval {
+    pub summary: String,
+    pub detail: Option<String>,
+    /// `"normal"` | `"dangerous"` (a `Risk::Safe` action never prompts).
+    pub risk: String,
+}
+
+impl PendingApproval {
+    fn from_request(request: &ApprovalRequest) -> Self {
+        Self {
+            summary: request.summary.clone(),
+            detail: request.detail.clone(),
+            risk: match request.risk {
+                Risk::Dangerous => "dangerous",
+                _ => "normal",
+            }
+            .to_string(),
+        }
+    }
+}
+
 /// Shared approval state, keyed by session: the pending prompt's reply channel
 /// plus the set of scope keys the user has approved "for this session". Shared
 /// between [`ChatApprover`] (registers/awaits) and [`GatewayDispatcher`]
 /// (resolves on `/approve`, clears on `/new`).
 pub struct ApprovalState {
-    pending: Mutex<HashMap<String, oneshot::Sender<Decision>>>,
+    pending: Mutex<HashMap<String, (oneshot::Sender<Decision>, PendingApproval)>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session serialization gate. A round's tool calls now run
     /// concurrently (`AgentRuntime::run_agent_loop`), so two side-effecting
@@ -97,10 +124,14 @@ impl ApprovalState {
 
     /// Register a pending approval for `session`, returning the receiver the
     /// approver awaits. Replaces any prior pending approval (its sender drops,
-    /// which the old waiter reads as a denial).
-    fn register(&self, session: &str) -> oneshot::Receiver<Decision> {
+    /// which the old waiter reads as a denial). `info` is the structured prompt
+    /// stored for the interactions poll.
+    fn register(&self, session: &str, info: PendingApproval) -> oneshot::Receiver<Decision> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(session.to_string(), tx);
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), (tx, info));
         rx
     }
 
@@ -109,9 +140,20 @@ impl ApprovalState {
     /// nothing to approve).
     pub fn resolve(&self, session: &str, decision: Decision) -> bool {
         match self.pending.lock().unwrap().remove(session) {
-            Some(tx) => tx.send(decision).is_ok(),
+            Some((tx, _info)) => tx.send(decision).is_ok(),
             None => false,
         }
+    }
+
+    /// The structured description of the approval pending for `session`, if any.
+    /// Backs the HTTP `GET /api/interactions/{session}` poll the GUI uses to
+    /// render an approval modal (chat channels instead see it via the sink).
+    pub fn pending_info(&self, session: &str) -> Option<PendingApproval> {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|(_, info)| info.clone())
     }
 
     /// Drop any pending approval for `session` without resolving it (the waiter
@@ -228,7 +270,9 @@ impl Approver for ChatApprover {
             return false;
         }
 
-        let rx = self.state.register(&ctx.session_id);
+        let rx = self
+            .state
+            .register(&ctx.session_id, PendingApproval::from_request(request));
         match tokio::time::timeout(self.state.timeout, rx).await {
             Ok(Ok(Decision::Once)) => true,
             Ok(Ok(Decision::Session)) => {
@@ -765,18 +809,33 @@ mod tests {
         assert!(!state.resolve("s1", Decision::Once));
     }
 
+    fn sample_pending() -> PendingApproval {
+        PendingApproval {
+            summary: "run shell command: ls".to_string(),
+            detail: None,
+            risk: "normal".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn register_then_resolve_delivers_the_decision() {
         let state = ApprovalState::new();
-        let rx = state.register("s1");
+        let rx = state.register("s1", sample_pending());
+        // The structured prompt is visible to the interactions poll while pending.
+        assert_eq!(
+            state.pending_info("s1").map(|p| p.summary),
+            Some("run shell command: ls".to_string())
+        );
         assert!(state.resolve("s1", Decision::Session));
         assert_eq!(rx.await.unwrap(), Decision::Session);
+        // Cleared once resolved.
+        assert!(state.pending_info("s1").is_none());
     }
 
     #[tokio::test]
     async fn clear_cancels_a_pending_wait() {
         let state = ApprovalState::new();
-        let rx = state.register("s1");
+        let rx = state.register("s1", sample_pending());
         state.clear("s1");
         // Sender dropped → receiver errors → treated as denial.
         assert!(rx.await.is_err());
@@ -948,7 +1007,7 @@ mod tests {
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
         // A turn is suspended on a question.
-        let rx = clarify.register("s1");
+        let rx = clarify.register("s1", "什么颜色？");
         dispatcher.handle("s1", "蓝色的".into(), sink.clone()).await;
         assert_eq!(rx.await.unwrap(), "蓝色的", "message became the answer");
         assert!(
@@ -976,7 +1035,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
-        let _rx = clarify.register("s1");
+        let _rx = clarify.register("s1", "问题？");
         dispatcher.handle("s1", "/deny".into(), sink.clone()).await;
         assert!(
             clarify.has_pending("s1"),

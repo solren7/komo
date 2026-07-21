@@ -32,7 +32,10 @@ pub const CLARIFY_BUDGET_PER_TURN: u32 = 2;
 
 /// Shared clarify state, keyed by session id.
 pub struct ClarifyState {
-    pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    /// The pending question's answer channel plus the question text itself, so
+    /// an out-of-band surface (the HTTP `GET /api/interactions/{session}` the
+    /// GUI polls) can render what is being asked without reading the reply sink.
+    pending: Mutex<HashMap<String, (oneshot::Sender<String>, String)>>,
     /// Questions asked in the session's current turn (reset at turn start).
     asked: Mutex<HashMap<String, u32>>,
     pub timeout: Duration,
@@ -59,12 +62,15 @@ impl ClarifyState {
         true
     }
 
-    /// Register a pending question for `session`, returning the receiver the
+    /// Register a pending `question` for `session`, returning the receiver the
     /// tool awaits. Supersedes any prior pending question (its sender drops,
     /// which the old waiter reads as "no answer").
-    pub fn register(&self, session: &str) -> oneshot::Receiver<String> {
+    pub fn register(&self, session: &str, question: &str) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(session.to_string(), tx);
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), (tx, question.to_string()));
         rx
     }
 
@@ -74,7 +80,7 @@ impl ClarifyState {
     /// new turn / queues".
     pub fn resolve(&self, session: &str, answer: &str) -> bool {
         match self.pending.lock().unwrap().remove(session) {
-            Some(tx) => tx.send(answer.to_string()).is_ok(),
+            Some((tx, _question)) => tx.send(answer.to_string()).is_ok(),
             None => false,
         }
     }
@@ -83,6 +89,17 @@ impl ClarifyState {
     /// mid-turn submit through as an answer).
     pub fn has_pending(&self, session: &str) -> bool {
         self.pending.lock().unwrap().contains_key(session)
+    }
+
+    /// The text of the question pending for `session`, if any. Backs the HTTP
+    /// `GET /api/interactions/{session}` poll the GUI uses to render a mid-turn
+    /// clarify prompt (the chat channels instead see it via the reply sink).
+    pub fn pending_question(&self, session: &str) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|(_, question)| question.clone())
     }
 
     /// Drop a pending question without answering (waiter reads "no answer").
@@ -116,11 +133,13 @@ mod tests {
     #[tokio::test]
     async fn answer_reaches_the_waiter() {
         let state = ClarifyState::new();
-        let rx = state.register("s1");
+        let rx = state.register("s1", "which one?");
         assert!(state.has_pending("s1"));
+        assert_eq!(state.pending_question("s1").as_deref(), Some("which one?"));
         assert!(state.resolve("s1", "the blue one"));
         assert_eq!(rx.await.unwrap(), "the blue one");
         assert!(!state.has_pending("s1"));
+        assert_eq!(state.pending_question("s1"), None);
     }
 
     #[tokio::test]
@@ -132,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn clear_drops_the_waiter_as_no_answer() {
         let state = ClarifyState::new();
-        let rx = state.register("s1");
+        let rx = state.register("s1", "q");
         state.clear("s1");
         assert!(rx.await.is_err(), "dropped sender reads as no answer");
     }
@@ -153,8 +172,8 @@ mod tests {
     #[tokio::test]
     async fn superseding_register_drops_the_first_waiter() {
         let state = ClarifyState::new();
-        let rx1 = state.register("s1");
-        let rx2 = state.register("s1");
+        let rx1 = state.register("s1", "first?");
+        let rx2 = state.register("s1", "second?");
         assert!(rx1.await.is_err(), "superseded waiter reads no answer");
         assert!(state.resolve("s1", "answer"));
         assert_eq!(rx2.await.unwrap(), "answer");

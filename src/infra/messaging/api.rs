@@ -42,7 +42,11 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
-    agent::{daemon::DreamSweep, gateway::Channel, interaction::GatewayDispatcher},
+    agent::{
+        daemon::DreamSweep,
+        gateway::Channel,
+        interaction::{ApprovalState, Decision, GatewayDispatcher},
+    },
     config::ApiConfig,
     domain::{
         gateway::MessageHandler,
@@ -50,6 +54,7 @@ use crate::{
         pairing::ApproveOutcome,
     },
     services::{
+        clarify::ClarifyState,
         operator_control::{
             MemoryTransitionAction, ResumeOutcome,
             actions::{
@@ -74,6 +79,12 @@ struct AppState {
     channels: Arc<Vec<String>>,
     /// Resolved config `home_chat` fallback, if any (for `/api/status`).
     home: Option<String>,
+    /// Shared with the gateway dispatcher and the `ChatApprover`: lets a
+    /// loopback interactive HTTP turn (the GUI) surface a pending approval over
+    /// `GET /api/interactions/{session}` and resolve it over `POST`.
+    approvals: Arc<ApprovalState>,
+    /// Shared with the `ask_user` tool: same, for mid-turn clarify questions.
+    clarify: Arc<ClarifyState>,
 }
 
 /// The HTTP API channel. Holds the listen config and the shared handler state.
@@ -84,12 +95,15 @@ pub struct ApiChannel {
 }
 
 impl ApiChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &ApiConfig,
         handler: Arc<dyn MessageHandler>,
         actions: Arc<OperatorActions>,
         channels: Vec<String>,
         home: Option<String>,
+        approvals: Arc<ApprovalState>,
+        clarify: Arc<ClarifyState>,
     ) -> Self {
         Self {
             bind: config.bind.clone(),
@@ -100,6 +114,8 @@ impl ApiChannel {
                 actions,
                 channels: Arc::new(channels),
                 home,
+                approvals,
+                clarify,
             },
         }
     }
@@ -167,6 +183,8 @@ fn build_router(state: AppState) -> Router {
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
+        .route("/api/interactions/{session}/approval", post(resolve_approval))
+        .route("/api/interactions/{session}/answer", post(answer_question))
         .route_layer(middleware::from_fn(require_loopback));
 
     let protected = Router::new()
@@ -186,6 +204,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/skills/{name}/audit", get(skill_audit))
         .route("/api/pairings", get(list_pairings))
         .route("/api/dream", get(dream_preview))
+        .route("/api/interactions/{session}", get(get_interactions))
         .merge(operator_writes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -317,13 +336,23 @@ async fn chat_completions(
         req.model.clone()
     };
 
-    // A **trusted** turn — `komo chat` routed over the gateway's loopback api
-    // channel — auto-approves side-effecting tools (the CLI user is the host
-    // operator). Gated to loopback callers so a publicly-bound api can never
-    // reach it; everyone else gets the detached (auto-deny) context.
-    let trusted = peer.ip().is_loopback() && headers.contains_key("x-komo-trusted");
+    // Loopback callers may opt into one of two richer contexts (both ignored on
+    // an external bind, where there is no host operator behind the socket):
+    //   - `X-Komo-Trusted`: auto-approve side-effecting tools (the CLI user is
+    //     the host operator — this is what `komo chat` uses).
+    //   - `X-Komo-Interactive`: prompt for approval / clarify and suspend the
+    //     turn, exactly like a chat channel, but resolved out-of-band over the
+    //     `/api/interactions/*` endpoints (this is what the GUI uses). The reply
+    //     sink is a no-op — the GUI reads the pending prompt by polling.
+    // Trusted wins over interactive if a caller somehow sets both; anyone else
+    // gets the detached (auto-deny) context.
+    let is_loopback = peer.ip().is_loopback();
+    let trusted = is_loopback && headers.contains_key("x-komo-trusted");
+    let interactive = is_loopback && headers.contains_key("x-komo-interactive");
     let ctx = if trusted {
         SessionContext::trusted(&session_id)
+    } else if interactive {
+        SessionContext::interactive_http(&session_id)
     } else {
         SessionContext::detached(&session_id)
     };
@@ -731,6 +760,72 @@ async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, Api
     ))
 }
 
+// ---- interactive approval / clarify (for the GUI) --------------------------
+//
+// A loopback interactive HTTP turn (`X-Komo-Interactive`) suspends on approval
+// and clarify prompts just like a chat channel, but there is no reply sink a
+// human reads — the GUI polls `GET /api/interactions/{session}` for the pending
+// prompt and resolves it with a `POST`. The GET is an ordinary protected read;
+// the two POSTs are host-operator writes, so they sit behind `require_loopback`.
+
+/// The prompt(s) a suspended interactive turn is currently waiting on. Either
+/// field is `null` when nothing of that kind is pending.
+async fn get_interactions(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+) -> Json<Value> {
+    let approval = state.approvals.pending_info(&session);
+    let question = state.clarify.pending_question(&session);
+    Json(json!({ "approval": approval, "question": question }))
+}
+
+#[derive(Deserialize)]
+struct ApprovalDecisionBody {
+    /// `"once"` | `"session"` | `"deny"`.
+    decision: String,
+}
+
+/// Map the wire decision string to a [`Decision`]. `None` = unrecognized.
+fn parse_decision(s: &str) -> Option<Decision> {
+    match s {
+        "once" => Some(Decision::Once),
+        "session" => Some(Decision::Session),
+        "deny" => Some(Decision::Deny),
+        _ => None,
+    }
+}
+
+/// Resolve a pending approval for `session` (the GUI's approval modal).
+async fn resolve_approval(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    Json(body): Json<ApprovalDecisionBody>,
+) -> Result<Json<Value>, ApiError> {
+    let decision = parse_decision(&body.decision).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown decision `{}` (want once|session|deny)",
+            body.decision
+        )
+    })?;
+    let resolved = state.approvals.resolve(&session, decision);
+    Ok(Json(json!({ "resolved": resolved })))
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    text: String,
+}
+
+/// Answer a pending clarify question for `session` (the GUI's inline reply).
+async fn answer_question(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    Json(body): Json<AnswerBody>,
+) -> Result<Json<Value>, ApiError> {
+    let resolved = state.clarify.resolve(&session, &body.text);
+    Ok(Json(json!({ "resolved": resolved })))
+}
+
 /// Unix seconds, for OpenAI `created` fields.
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -793,4 +888,19 @@ mod tests {
         assert_eq!(id, "api:panel-1");
         assert!(stateful);
     }
+
+    #[test]
+    fn parse_decision_maps_known_strings_and_rejects_others() {
+        assert_eq!(parse_decision("once"), Some(Decision::Once));
+        assert_eq!(parse_decision("session"), Some(Decision::Session));
+        assert_eq!(parse_decision("deny"), Some(Decision::Deny));
+        assert_eq!(parse_decision("approve"), None);
+        assert_eq!(parse_decision(""), None);
+    }
+
+    // The interactions state round-trip (register → pending_info/pending_question
+    // visible → resolve delivers the decision/answer) is covered at the state
+    // layer in `agent::interaction` and `services::clarify`; the handlers here
+    // are thin wrappers over those, and `require_loopback` (shared with every
+    // operator write) gates the two POST routes by construction.
 }

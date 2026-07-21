@@ -1,0 +1,16 @@
+[package]
+name = "komo-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }

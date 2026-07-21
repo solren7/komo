@@ -182,7 +182,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
     let dispatcher = Arc::new(GatewayDispatcher::new(
         handler.clone(),
-        approvals,
+        approvals.clone(),
         wired.clarify.clone(),
         sessions,
         home_repo,
@@ -324,6 +324,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             actions,
             enabled,
             config_home.clone(),
+            approvals.clone(),
+            wired.clarify.clone(),
         )));
         channels.push("api");
     }

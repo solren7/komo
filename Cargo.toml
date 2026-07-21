@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+komo-core = { path = "crates/komo-core" }
 clap = { version = "4.6.1", features = ["derive"] }
 tokio = { version = "1.52.0", features = ["full"] }
 toasty = { version = "0.8.0", features = ["sqlite", "turso"] }
@@ -15,15 +16,15 @@ toasty-driver-turso = "0.8.0"
 # a second turso version both duplicates the engine over the same db files and
 # drags in a second `#[global_allocator]` (mimalloc), which fails to link.
 turso = "0.6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1.0.103"
-thiserror = "2"
-async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
 dotenvy = "0.15"
 envy = "0.4"
 toml = "1.1"
-dirs = "6"
+dirs = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "charset",
@@ -36,11 +37,11 @@ open-lark = { version = "0.14", default-features = false, features = [
     "im",
 ] }
 rig = { package = "rig-core", version = "0.40" }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-time = { version = "0.3.53", features = ["formatting", "macros"] }
-uuid = { version = "1.23.4", features = ["v4", "v7"] }
-sha2 = "0.11"
+time = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
 # Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
 # (no signature verification — we only inspect the payload). See `infra/codex.rs`.
 base64 = "0.22"
@@ -49,7 +50,7 @@ base64 = "0.22"
 http = "1"
 bytes = "1"
 croner = "3"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 wechatbot = "=0.4.0"
@@ -70,3 +71,29 @@ libc = "0.2"
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
 # which auto-advances virtual time so retry-backoff tests don't sleep for real.
 tokio = { version = "1.52.0", features = ["full", "test-util"] }
+
+[workspace]
+members = ["crates/komo-core", "crates/komo-gui"]
+resolver = "3"
+
+# Shared across the workspace so komo, komo-core, and komo-gui pin one version
+# each. Crate-unique / heavy deps (toasty, rig, axum, ratatui, dioxus, …) stay
+# in their own manifests.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0.103"
+thiserror = "2"
+async-trait = "0.1"
+dirs = "6"
+sha2 = "0.11"
+tracing = "0.1"
+time = { version = "0.3.53", features = ["formatting", "macros"] }
+uuid = { version = "1.23.4", features = ["v4", "v7"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "charset",
+    "query",
+    "json",
+] }

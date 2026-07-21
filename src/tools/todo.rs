@@ -12,14 +12,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status},
-        tool::Tool,
-    },
-    services::tool_execution::current_session,
+use crate::domain::{
+    context::ToolContext,
+    todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status},
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 #[derive(Deserialize)]
@@ -120,27 +118,28 @@ impl Tool for TodoTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let Some(ctx) = current_session() else {
-            return Ok(
-                "The todo tool is only available inside a conversation; nothing to track here."
-                    .to_string(),
-            );
-        };
-        let session_id = ctx.session_id;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let session_id = ctx.session.session_id.clone();
+        // No session (aux sub-agents, maintenance sweeps carry an empty id):
+        // the working list is a per-conversation concept, so stay inert.
+        if session_id.is_empty() {
+            return Ok(ToolOutput::text(
+                "The todo tool is only available inside a conversation; nothing to track here.",
+            ));
+        }
 
-        // Empty input (argument-less call) and `{}` both mean read.
-        let args: TodoArgs = if input.trim().is_empty() {
+        // The no-arg call arrives as JSON null; `{}` and a real list parse
+        // normally. Both an absent `todos` field and null mean read.
+        let args: TodoArgs = if input.is_null() {
             TodoArgs { todos: None }
         } else {
-            serde_json::from_str(&input)
-                .map_err(|e| anyhow::anyhow!("invalid todo arguments: {e}"))?
+            parse_args(&input)?
         };
 
         let Some(inputs) = args.todos else {
             // Read.
             let items = self.todos.get(&session_id).await?;
-            return Ok(render(&items));
+            return Ok(ToolOutput::text(render(&items)));
         };
 
         // Write: build the new list, validating as we go.
@@ -162,21 +161,41 @@ impl Tool for TodoTool {
             .filter(|t| t.status == TodoStatus::InProgress)
             .count();
         if in_progress > 1 {
-            return Err(anyhow::anyhow!(
+            return Err(ToolError::InvalidInput(format!(
                 "only one todo item can be in_progress at a time (got {in_progress})"
-            ));
+            )));
         }
 
         self.todos.set(&session_id, &items).await?;
-        Ok(render(&items))
+        Ok(ToolOutput::text(render(&items)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::tool_execution::{SessionContext, with_session};
+    use crate::domain::approval::{ApprovalRequest, Approver};
+    use crate::domain::context::{SessionContext, ToolContext};
+    use std::sync::Arc;
     use std::sync::Mutex;
+
+    struct DenyAll;
+    #[async_trait]
+    impl Approver for DenyAll {
+        async fn approve(&self, _r: &ApprovalRequest) -> bool {
+            false
+        }
+    }
+
+    /// A `ToolContext` bound to `session`, with a never-consulted approver
+    /// (`todo` requests no approval).
+    fn ctx(session: &str) -> ToolContext {
+        ToolContext::new(SessionContext::detached(session), None, Arc::new(DenyAll))
+    }
+
+    fn v(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
 
     #[derive(Default)]
     struct MemTodos(Mutex<std::collections::HashMap<String, Vec<TodoItem>>>);
@@ -205,56 +224,48 @@ mod tests {
         }
     }
 
-    fn ctx(session: &str) -> SessionContext {
-        SessionContext::detached(session)
-    }
-
     #[tokio::test]
     async fn write_then_read_roundtrips_in_session() {
         let repo = Arc::new(MemTodos::default());
         let tool = TodoTool::new(repo.clone());
-        with_session(ctx("s1"), async {
-            let out = tool
-                .execute(
-                    r#"{"todos":[{"content":"step one","status":"in_progress"},{"content":"step two"}]}"#
-                        .to_string(),
-                )
-                .await
-                .unwrap();
-            assert!(out.contains("step one"), "{out}");
-            let read = tool.execute(String::new()).await.unwrap();
-            assert!(read.contains("step two"), "{read}");
-            assert!(read.contains("1 in progress"), "{read}");
-        })
-        .await;
+        let ctx = ctx("s1");
+        let out = tool
+            .call(
+                v(r#"{"todos":[{"content":"step one","status":"in_progress"},{"content":"step two"}]}"#),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("step one"), "{}", out.text);
+        let read = tool.call(Value::Null, &ctx).await.unwrap();
+        assert!(read.text.contains("step two"), "{}", read.text);
+        assert!(read.text.contains("1 in progress"), "{}", read.text);
     }
 
     #[tokio::test]
     async fn rejects_two_in_progress() {
         let repo = Arc::new(MemTodos::default());
         let tool = TodoTool::new(repo);
-        with_session(ctx("s1"), async {
-            let err = tool
-                .execute(
-                    r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}"#
-                        .to_string(),
-                )
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("one todo item"), "{err}");
-        })
-        .await;
+        let err = tool
+            .call(
+                v(r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}"#),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("one todo item"), "{err}");
     }
 
     #[tokio::test]
     async fn inert_without_session_context() {
         let repo = Arc::new(MemTodos::default());
         let tool = TodoTool::new(repo);
-        // No `with_session` wrapper → current_session() is None.
-        let out = tool.execute(String::new()).await.unwrap();
+        // Empty session id (aux sub-agents / sweeps) → the tool stays inert.
+        let out = tool.call(Value::Null, &ctx("")).await.unwrap();
         assert!(
-            out.contains("only available inside a conversation"),
-            "{out}"
+            out.text.contains("only available inside a conversation"),
+            "{}",
+            out.text
         );
     }
 
@@ -262,17 +273,18 @@ mod tests {
     async fn write_replaces_whole_list() {
         let repo = Arc::new(MemTodos::default());
         let tool = TodoTool::new(repo.clone());
-        with_session(ctx("s1"), async {
-            tool.execute(r#"{"todos":[{"content":"a"},{"content":"b"}]}"#.to_string())
-                .await
-                .unwrap();
-            tool.execute(r#"{"todos":[{"content":"c","status":"completed"}]}"#.to_string())
-                .await
-                .unwrap();
-            let items = repo.get("s1").await.unwrap();
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].content, "c");
-        })
-        .await;
+        let ctx = ctx("s1");
+        tool.call(v(r#"{"todos":[{"content":"a"},{"content":"b"}]}"#), &ctx)
+            .await
+            .unwrap();
+        tool.call(
+            v(r#"{"todos":[{"content":"c","status":"completed"}]}"#),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let items = repo.get("s1").await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "c");
     }
 }

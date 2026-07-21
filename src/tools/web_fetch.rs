@@ -1,12 +1,11 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::domain::{
-    approval::{ActionRef, ApprovalRequest, Approver},
-    tool::Tool,
+    approval::{ActionRef, ApprovalRequest},
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 const MAX_BYTES: usize = 8 * 1024;
@@ -36,15 +35,19 @@ struct FetchArgs {
 /// URL proceeds without any prompt (safe actions never escalate).
 pub struct WebFetchTool {
     client: reqwest::Client,
-    approver: Arc<dyn Approver>,
 }
 
 impl WebFetchTool {
-    pub fn new(approver: Arc<dyn Approver>) -> Self {
+    pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
-            approver,
         }
+    }
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,26 +99,25 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: FetchArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid web_fetch arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: FetchArgs = parse_args(&input)?;
         if args.headers.len() > MAX_HEADERS {
-            anyhow::bail!(
+            return Err(ToolError::InvalidInput(format!(
                 "too many headers ({}, max {MAX_HEADERS})",
                 args.headers.len()
-            );
+            )));
         }
 
         let request =
             ApprovalRequest::safe(format!("fetch {}", args.url)).with_action(ActionRef::Network {
                 url: args.url.clone(),
             });
-        if !self.approver.approve(&request).await {
-            return Ok(format!(
+        if !ctx.approve(&request).await {
+            return Ok(ToolOutput::text(format!(
                 "URL blocked by the permission policy (a `network` deny rule matches {}); \
                  nothing was fetched.",
                 args.url
-            ));
+            )));
         }
 
         let mut request = self
@@ -137,7 +139,7 @@ impl Tool for WebFetchTool {
 
         let mut text = strip_html(&body);
         truncate_to_char_boundary(&mut text, MAX_BYTES);
-        Ok(format!("HTTP {status}\n\n{text}"))
+        Ok(ToolOutput::text(format!("HTTP {status}\n\n{text}")))
     }
 }
 
@@ -200,6 +202,9 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::approval::Approver;
+    use crate::domain::context::{SessionContext, ToolContext};
+    use std::sync::Arc;
 
     struct DenyAll;
     #[async_trait]
@@ -209,15 +214,26 @@ mod tests {
         }
     }
 
+    fn deny_ctx() -> ToolContext {
+        ToolContext::new(
+            SessionContext::detached("cli:test"),
+            None,
+            Arc::new(DenyAll),
+        )
+    }
+
     #[tokio::test]
     async fn denied_fetch_reports_the_block_and_sends_nothing() {
-        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let tool = WebFetchTool::new();
         let out = tool
-            .execute(json!({ "url": "https://blocked.example.com/x" }).to_string())
+            .call(
+                json!({ "url": "https://blocked.example.com/x" }),
+                &deny_ctx(),
+            )
             .await
             .unwrap();
-        assert!(out.contains("blocked by the permission policy"));
-        assert!(out.contains("blocked.example.com"));
+        assert!(out.text.contains("blocked by the permission policy"));
+        assert!(out.text.contains("blocked.example.com"));
     }
 
     #[test]
@@ -239,7 +255,7 @@ mod tests {
 
     #[test]
     fn redact_masks_header_values_but_keeps_names_and_url() {
-        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let tool = WebFetchTool::new();
         let args = json!({
             "url": "http://miniflux:8080/v1/entries",
             "headers": { "X-Auth-Token": "super-secret-token" }
@@ -253,12 +269,15 @@ mod tests {
 
     #[tokio::test]
     async fn too_many_headers_is_an_error() {
-        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let tool = WebFetchTool::new();
         let headers: std::collections::HashMap<String, String> = (0..9)
             .map(|i| (format!("H-{i}"), "v".to_string()))
             .collect();
         let err = tool
-            .execute(json!({ "url": "https://example.com", "headers": headers }).to_string())
+            .call(
+                json!({ "url": "https://example.com", "headers": headers }),
+                &deny_ctx(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too many headers"));

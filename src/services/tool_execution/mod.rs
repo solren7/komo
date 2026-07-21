@@ -23,11 +23,14 @@ use std::sync::Arc;
 
 use tracing::{Instrument, info, info_span, warn};
 
-pub use context::{RunContext, SessionContext, ToolTurnContext, current_session, with_session};
+pub use context::{
+    RunContext, SessionContext, ToolContext, ToolTurnContext, current_session, with_session,
+};
 
+use crate::domain::approval::{ApprovalRequest, Approver};
 use crate::domain::llm::{ToolCallReq, ToolOutcome};
 use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
-use crate::domain::tool::Tool;
+use crate::domain::tool::{Tool, ToolError};
 
 use context::SESSION;
 use result::cap_tool_result;
@@ -78,12 +81,17 @@ pub struct ToolExecutor {
     core: Arc<ToolExecutionCore>,
 }
 
-/// The shared implementation: the immutable catalog plus the execution policy.
-/// Holds only tools and config — never the adapters wrapping it — so there is
-/// no reference cycle with `RigTool`.
+/// The shared implementation: the immutable catalog plus the execution policy
+/// and the approver every migrated tool reaches through its [`ToolContext`].
+/// Holds only tools, config, and the approver — never the adapters wrapping it —
+/// so there is no reference cycle with `RigTool`.
 pub struct ToolExecutionCore {
     tools: HashMap<String, Arc<dyn Tool>>,
     config: ToolExecutionConfig,
+    /// The approver placed into each call's [`ToolContext`]. Defaults to
+    /// deny-all; wiring installs the real (policy-wrapped) approver via
+    /// [`ToolExecutor::with_approver`].
+    approver: Arc<dyn Approver>,
 }
 
 impl ToolExecutor {
@@ -92,8 +100,18 @@ impl ToolExecutor {
             core: Arc::new(ToolExecutionCore {
                 tools: HashMap::new(),
                 config,
+                approver: Arc::new(DenyAllApprover),
             }),
         }
+    }
+
+    /// Install the approver handed to every tool via its [`ToolContext`]. Called
+    /// during wiring before the executor is shared (like [`register`]).
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("set the approver during wiring, before the executor is shared");
+        core.approver = approver;
+        self
     }
 
     /// Add a tool to the catalog. Registration happens during wiring, before
@@ -183,10 +201,19 @@ impl ToolExecutionCore {
         let started_instant = std::time::Instant::now();
         let seq_field = ledger.as_ref().map(|(_, s)| *s).unwrap_or(-1);
 
+        // Parse the model's JSON arguments once, here, so every tool sees a
+        // typed `Value` (and `parse_args` can produce the canonical
+        // `InvalidInput` error). Non-JSON args and the empty (no-arg) call are
+        // preserved: an unparseable string is wrapped as `Value::String` so the
+        // legacy bridge in `Tool::call` can hand the original text back to an
+        // unmigrated tool; migrated tools reject it via `parse_args`.
+        let value = serde_json::from_str::<serde_json::Value>(&input)
+            .unwrap_or_else(|_| serde_json::Value::String(input.clone()));
+
         // Soft tool-call budget (backstop): once this turn has reached the cap,
         // refuse further calls with an error the model sees instead of
         // executing them. Inactive without a run ledger (seq_field = -1).
-        let result = if seq_field >= self.config.max_calls_per_turn {
+        let result: anyhow::Result<String> = if seq_field >= self.config.max_calls_per_turn {
             warn!(
                 tool = name,
                 seq = seq_field,
@@ -200,45 +227,54 @@ impl ToolExecutionCore {
             ))
         } else {
             let mut attempt: usize = 0;
-            loop {
+            let outcome: Result<crate::domain::tool::ToolOutput, ToolError> = loop {
                 // Span so the tool's own logs carry the run's `seq`/`name`.
                 // Spans don't cross `tokio::spawn` on their own — instrument
                 // the spawned future. A fresh span per attempt keeps each
                 // retry's logs distinct.
                 let span = info_span!("tool", name, seq = seq_field, attempt);
                 let tool_attempt = tool.clone();
-                let input_attempt = input.clone();
-                // Install the turn's session context in the spawned task:
-                // session-scoped tools and the approvers read it ambiently
-                // (rig's call signature can't thread it), and a fresh task
-                // doesn't inherit task-locals.
-                let ctx = context.session.clone();
+                let value_attempt = value.clone();
+                // Build the explicit per-call context, and also install the
+                // turn's session as the ambient scope for the spawned task —
+                // the approvers still read it (they don't take a context
+                // parameter), and a fresh task doesn't inherit task-locals.
+                let ctx = ToolContext::new(
+                    context.session.clone(),
+                    context.run.clone(),
+                    self.approver.clone(),
+                );
+                let scope = context.session.clone();
                 let join = tokio::spawn(
                     SESSION
-                        .scope(
-                            ctx,
-                            async move { tool_attempt.execute(input_attempt).await },
-                        )
+                        .scope(scope, async move {
+                            tool_attempt.call(value_attempt, &ctx).await
+                        })
                         .instrument(span),
                 );
-                let attempt_result = match join.await {
-                    Ok(result) => result,
-                    Err(join_err) if join_err.is_panic() => {
-                        let panic = join_err.into_panic();
-                        let msg = panic
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
-                        Err(anyhow::anyhow!("tool `{name}` panicked: {msg}"))
-                    }
-                    Err(join_err) => {
-                        Err(anyhow::anyhow!("tool `{name}` was cancelled: {join_err}"))
-                    }
-                };
+                let attempt_result: Result<crate::domain::tool::ToolOutput, ToolError> =
+                    match join.await {
+                        Ok(result) => result,
+                        Err(join_err) if join_err.is_panic() => {
+                            let panic = join_err.into_panic();
+                            let msg = panic
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| panic.downcast_ref::<&str>().copied())
+                                .unwrap_or("unknown panic");
+                            Err(ToolError::Failed(anyhow::anyhow!(
+                                "tool `{name}` panicked: {msg}"
+                            )))
+                        }
+                        Err(join_err) => Err(ToolError::Failed(anyhow::anyhow!(
+                            "tool `{name}` was cancelled: {join_err}"
+                        ))),
+                    };
 
                 match &attempt_result {
-                    Err(error)
+                    // Only genuine failures retry; InvalidInput/Denied are
+                    // recoverable and terminal.
+                    Err(ToolError::Failed(error))
                         if attempt + 1 < TOOL_RETRY_MAX_ATTEMPTS
                             && should_retry(error, tool.idempotent()) =>
                     {
@@ -257,6 +293,20 @@ impl ToolExecutionCore {
                     }
                     _ => break attempt_result,
                 }
+            };
+
+            // Classify into the ledger-facing `anyhow::Result<String>`:
+            // recoverable errors become model-facing content (never retried);
+            // a genuine failure stays an `Err` so the ledger marks the step
+            // failed and `execute_round` surfaces it.
+            match outcome {
+                Ok(out) => Ok(out.text),
+                Err(ToolError::InvalidInput(m)) => Ok(format!(
+                    "invalid input for tool `{name}`: {m}. \
+                     Rewrite the arguments to match the tool's schema."
+                )),
+                Err(ToolError::Denied(m)) => Ok(m),
+                Err(ToolError::Failed(e)) => Err(e),
             }
         };
 
@@ -317,6 +367,19 @@ impl ToolExecutionCore {
             run: None,
         };
         self.execute(tool, input, &context).await
+    }
+}
+
+/// The executor's default approver until wiring installs the real one
+/// (`ToolExecutor::with_approver`): deny everything. A tool that reaches
+/// `ctx.approve(..)` before an approver is set is refused rather than silently
+/// allowed — matters only in tests that don't exercise a migrated gated tool.
+struct DenyAllApprover;
+
+#[async_trait::async_trait]
+impl Approver for DenyAllApprover {
+    async fn approve(&self, _request: &ApprovalRequest) -> bool {
+        false
     }
 }
 

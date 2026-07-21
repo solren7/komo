@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::domain::tool::Tool;
+use crate::domain::{
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
+};
 
 const MAX_RESULTS: usize = 6;
 const USER_AGENT: &str =
@@ -57,9 +60,8 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: SearchArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid web_search arguments: {e}"))?;
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: SearchArgs = parse_args(&input)?;
 
         let body = self
             .client
@@ -75,11 +77,11 @@ impl Tool for WebSearchTool {
 
         let results = parse_results(&body);
         if results.is_empty() {
-            return Ok(format!(
+            return Ok(ToolOutput::text(format!(
                 "No parseable results for `{}`. The search endpoint may have \
                  changed or rate-limited this request.",
                 args.query
-            ));
+            )));
         }
 
         let rendered = results
@@ -95,7 +97,7 @@ impl Tool for WebSearchTool {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        Ok(rendered)
+        Ok(ToolOutput::text(rendered))
     }
 }
 

@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::domain::{
-    approval::{ActionRef, ApprovalRequest, Approver},
-    tool::Tool,
+    approval::{ActionRef, ApprovalRequest},
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
 
@@ -167,15 +168,11 @@ fn redact_secrets(command: &str) -> String {
 /// with the working directory set to the workspace root.
 pub struct ShellTool {
     workspace: Arc<Workspace>,
-    approver: Arc<dyn Approver>,
 }
 
 impl ShellTool {
-    pub fn new(workspace: Arc<Workspace>, approver: Arc<dyn Approver>) -> Self {
-        Self {
-            workspace,
-            approver,
-        }
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -219,17 +216,16 @@ impl Tool for ShellTool {
         }
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: ShellArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid shell arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: ShellArgs = parse_args(&input)?;
 
         // Hardline floor: catastrophic commands are refused outright — no
         // approval can unlock them.
         if let Some(pattern) = hardline_pattern(&args.command) {
-            return Ok(format!(
+            return Ok(ToolOutput::text(format!(
                 "Command refused: matched hardline pattern `{pattern}`. \
                  This command is never run, even with approval. Do not retry it."
-            ));
+            )));
         }
 
         // Approval gate (hermes-style): commands matching a dangerous pattern
@@ -248,8 +244,10 @@ impl Tool for ShellTool {
             .with_action(action),
             None => ApprovalRequest::safe(summary).with_action(action),
         };
-        if !self.approver.approve(&request).await {
-            return Ok("Command rejected by user; nothing was run.".to_string());
+        if !ctx.approve(&request).await {
+            return Ok(ToolOutput::text(
+                "Command rejected by user; nothing was run.",
+            ));
         }
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -260,7 +258,7 @@ impl Tool for ShellTool {
         let output = cmd
             .output()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to spawn command: {e}"))?;
+            .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to spawn command: {e}")))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -277,15 +275,20 @@ impl Tool for ShellTool {
         if !stderr.trim().is_empty() {
             result.push_str(&format!("\n--- stderr ---\n{}", stderr.trim_end()));
         }
-        Ok(result)
+        Ok(ToolOutput::text(result).with_title(format!("shell: {}", args.command)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::Risk;
+    use crate::domain::approval::{Approver, Risk};
+    use crate::domain::context::{SessionContext, ToolContext};
     use std::sync::Mutex;
+
+    fn ctx_with(approver: Arc<dyn Approver>) -> ToolContext {
+        ToolContext::new(SessionContext::detached("cli:test"), None, approver)
+    }
 
     struct AlwaysApprove;
     #[async_trait::async_trait]
@@ -323,24 +326,30 @@ mod tests {
 
     #[tokio::test]
     async fn approved_command_runs() {
-        let tool = ShellTool::new(workspace(), Arc::new(AlwaysApprove));
+        let tool = ShellTool::new(workspace());
         let out = tool
-            .execute(json!({ "command": "echo hello" }).to_string())
+            .call(
+                json!({ "command": "echo hello" }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
             .await
             .unwrap();
-        assert!(out.contains("hello"));
-        assert!(out.contains("exit status: 0"));
+        assert!(out.text.contains("hello"));
+        assert!(out.text.contains("exit status: 0"));
     }
 
     #[tokio::test]
     async fn rejected_command_does_not_run() {
-        let tool = ShellTool::new(workspace(), Arc::new(AlwaysReject));
+        let tool = ShellTool::new(workspace());
         let out = tool
-            .execute(json!({ "command": "rm -r should_not_appear" }).to_string())
+            .call(
+                json!({ "command": "rm -r should_not_appear" }),
+                &ctx_with(Arc::new(AlwaysReject)),
+            )
             .await
             .unwrap();
-        assert!(out.contains("rejected"));
-        assert!(!out.contains("--- stdout ---"));
+        assert!(out.text.contains("rejected"));
+        assert!(!out.text.contains("--- stdout ---"));
     }
 
     #[tokio::test]
@@ -349,12 +358,15 @@ mod tests {
             risk: Mutex::new(None),
             approve: true,
         });
-        let tool = ShellTool::new(workspace(), rec.clone());
+        let tool = ShellTool::new(workspace());
         let out = tool
-            .execute(json!({ "command": "sudo rm -rf / --no-preserve-root" }).to_string())
+            .call(
+                json!({ "command": "sudo rm -rf / --no-preserve-root" }),
+                &ctx_with(rec.clone()),
+            )
             .await
             .unwrap();
-        assert!(out.contains("refused"));
+        assert!(out.text.contains("refused"));
         // The approver was never asked: hardline sits above the approval gate.
         assert_eq!(*rec.risk.lock().unwrap(), None);
     }
@@ -366,8 +378,10 @@ mod tests {
                 risk: Mutex::new(None),
                 approve: false,
             });
-            let tool = ShellTool::new(workspace(), rec.clone());
-            let _ = tool.execute(json!({ "command": cmd }).to_string()).await;
+            let tool = ShellTool::new(workspace());
+            let _ = tool
+                .call(json!({ "command": cmd }), &ctx_with(rec.clone()))
+                .await;
             assert_eq!(
                 *rec.risk.lock().unwrap(),
                 Some(Risk::Dangerous),
@@ -418,7 +432,7 @@ mod tests {
 
     #[test]
     fn redact_args_scrubs_command_value() {
-        let tool = ShellTool::new(workspace(), Arc::new(AlwaysApprove));
+        let tool = ShellTool::new(workspace());
         let args = json!({ "command": "x token=supersecretvalue123456" }).to_string();
         let redacted = tool.redact_args(&args);
         assert!(!redacted.contains("supersecretvalue123456"));
@@ -430,9 +444,9 @@ mod tests {
             risk: Mutex::new(None),
             approve: true,
         });
-        let tool = ShellTool::new(workspace(), rec.clone());
+        let tool = ShellTool::new(workspace());
         let _ = tool
-            .execute(json!({ "command": "echo hi" }).to_string())
+            .call(json!({ "command": "echo hi" }), &ctx_with(rec.clone()))
             .await;
         assert_eq!(*rec.risk.lock().unwrap(), Some(Risk::Safe));
     }

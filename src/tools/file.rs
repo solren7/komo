@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::domain::{
-    approval::{ActionRef, ApprovalRequest, Approver},
-    tool::Tool,
+    approval::{ActionRef, ApprovalRequest},
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
 
@@ -23,18 +24,14 @@ struct FileArgs {
 }
 
 /// Reads and writes local files, confined to a [`Workspace`]. Writes require
-/// user approval.
+/// user approval, requested through the call's [`ToolContext`].
 pub struct FileTool {
     workspace: Arc<Workspace>,
-    approver: Arc<dyn Approver>,
 }
 
 impl FileTool {
-    pub fn new(workspace: Arc<Workspace>, approver: Arc<dyn Approver>) -> Self {
-        Self {
-            workspace,
-            approver,
-        }
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -89,16 +86,15 @@ impl Tool for FileTool {
         }
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: FileArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid file arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: FileArgs = parse_args(&input)?;
 
         // Workspace whitelist: reject any path outside the allowed roots.
         if !self.workspace.contains(Path::new(&args.path)) {
-            return Err(anyhow::anyhow!(
+            return Err(ToolError::Failed(anyhow::anyhow!(
                 "path `{}` is outside the workspace and was blocked",
                 args.path
-            ));
+            )));
         }
 
         match args.action.as_str() {
@@ -112,12 +108,12 @@ impl Tool for FileTool {
                         write: false,
                     },
                 );
-                if !self.approver.approve(&request).await {
-                    return Ok(format!(
+                if !ctx.approve(&request).await {
+                    return Ok(ToolOutput::text(format!(
                         "Read blocked by the permission policy (a `file` deny rule matches {}); \
                          nothing was read.",
                         args.path
-                    ));
+                    )));
                 }
 
                 let mut text = tokio::fs::read_to_string(&args.path)
@@ -127,7 +123,7 @@ impl Tool for FileTool {
                     text.truncate(MAX_READ_BYTES);
                     text.push_str("\n…[truncated]");
                 }
-                Ok(text)
+                Ok(ToolOutput::text(text).with_title(format!("read {}", args.path)))
             }
             "write" => {
                 let content = args
@@ -146,18 +142,23 @@ impl Tool for FileTool {
                     path: Path::new(&args.path).to_path_buf(),
                     write: true,
                 });
-                if !self.approver.approve(&request).await {
-                    return Ok("Write rejected by user; nothing was changed.".to_string());
+                if !ctx.approve(&request).await {
+                    return Ok(ToolOutput::text(
+                        "Write rejected by user; nothing was changed.",
+                    ));
                 }
 
                 tokio::fs::write(&args.path, &content)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", args.path))?;
-                Ok(format!("Wrote {} bytes to {}", content.len(), args.path))
+                Ok(
+                    ToolOutput::text(format!("Wrote {} bytes to {}", content.len(), args.path))
+                        .with_title(format!("write {}", args.path)),
+                )
             }
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected \"read\" or \"write\")"
-            )),
+            ))),
         }
     }
 }
@@ -165,7 +166,8 @@ impl Tool for FileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::ApprovalRequest;
+    use crate::domain::approval::{ApprovalRequest, Approver};
+    use crate::domain::context::SessionContext;
     use std::path::PathBuf;
 
     struct AlwaysApprove;
@@ -176,8 +178,12 @@ mod tests {
         }
     }
 
+    fn ctx_with(approver: Arc<dyn Approver>) -> ToolContext {
+        ToolContext::new(SessionContext::detached("cli:test"), None, approver)
+    }
+
     fn tool_rooted_at(dir: PathBuf) -> FileTool {
-        FileTool::new(Arc::new(Workspace::new(vec![dir])), Arc::new(AlwaysApprove))
+        FileTool::new(Arc::new(Workspace::new(vec![dir])))
     }
 
     #[tokio::test]
@@ -186,14 +192,15 @@ mod tests {
         let path = dir.join("komo_file_tool_test.txt");
         let path_str = path.to_string_lossy().to_string();
         let tool = tool_rooted_at(dir);
+        let ctx = ctx_with(Arc::new(AlwaysApprove));
 
         let write_args = json!({ "action": "write", "path": path_str, "content": "hello" });
-        let out = tool.execute(write_args.to_string()).await.unwrap();
-        assert!(out.contains("Wrote 5 bytes"));
+        let out = tool.call(write_args, &ctx).await.unwrap();
+        assert!(out.text.contains("Wrote 5 bytes"));
 
         let read_args = json!({ "action": "read", "path": path_str });
-        let content = tool.execute(read_args.to_string()).await.unwrap();
-        assert_eq!(content, "hello");
+        let content = tool.call(read_args, &ctx).await.unwrap();
+        assert_eq!(content.text, "hello");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -206,8 +213,9 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let tool = tool_rooted_at(dir);
+        let ctx = ctx_with(Arc::new(AlwaysApprove));
         let args = json!({ "action": "write", "path": path });
-        assert!(tool.execute(args.to_string()).await.is_err());
+        assert!(tool.call(args, &ctx).await.is_err());
     }
 
     #[tokio::test]
@@ -232,19 +240,21 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("komo_denied_read.txt");
         std::fs::write(&path, "secret").unwrap();
-        let tool = FileTool::new(Arc::new(Workspace::new(vec![dir])), Arc::new(DenyAll));
+        let tool = FileTool::new(Arc::new(Workspace::new(vec![dir])));
+        let ctx = ctx_with(Arc::new(DenyAll));
         let args = json!({ "action": "read", "path": path.to_string_lossy() });
-        let out = tool.execute(args.to_string()).await.unwrap();
-        assert!(out.contains("blocked by the permission policy"));
-        assert!(!out.contains("secret"));
+        let out = tool.call(args, &ctx).await.unwrap();
+        assert!(out.text.contains("blocked by the permission policy"));
+        assert!(!out.text.contains("secret"));
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn path_outside_workspace_is_blocked() {
         let tool = tool_rooted_at(PathBuf::from("/home/user/project"));
+        let ctx = ctx_with(Arc::new(AlwaysApprove));
         let args = json!({ "action": "read", "path": "/etc/passwd" });
-        let err = tool.execute(args.to_string()).await.unwrap_err();
+        let err = tool.call(args, &ctx).await.unwrap_err();
         assert!(err.to_string().contains("outside the workspace"));
     }
 }

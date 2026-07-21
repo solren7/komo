@@ -92,14 +92,12 @@ pub async fn build(
     // instance config — no process globals.
     let mut tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
         model_config.max_tool_result_bytes,
-    ));
+    ))
+    .with_approver(approver.clone());
     tools.register(Arc::new(TimeTool));
-    tools.register(Arc::new(FileTool::new(workspace.clone(), approver.clone())));
-    tools.register(Arc::new(ShellTool::new(
-        workspace.clone(),
-        approver.clone(),
-    )));
-    tools.register(Arc::new(WebFetchTool::new(approver.clone())));
+    tools.register(Arc::new(FileTool::new(workspace.clone())));
+    tools.register(Arc::new(ShellTool::new(workspace.clone())));
+    tools.register(Arc::new(WebFetchTool::new()));
     tools.register(Arc::new(WebSearchTool::new()));
     tools.register(Arc::new(SessionTool::new(db.clone())));
     tools.register(Arc::new(ReminderTool::new(db.clone())));
@@ -272,9 +270,10 @@ pub async fn build(
     );
     let mut briefing_tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
         model_config.max_tool_result_bytes,
-    ));
+    ))
+    .with_approver(briefing_approver.clone());
     briefing_tools.register(Arc::new(TimeTool));
-    briefing_tools.register(Arc::new(WebFetchTool::new(briefing_approver.clone())));
+    briefing_tools.register(Arc::new(WebFetchTool::new()));
     briefing_tools.register(Arc::new(WebSearchTool::new()));
     briefing_tools.register(Arc::new(SkillTool::new(
         skills.clone(),

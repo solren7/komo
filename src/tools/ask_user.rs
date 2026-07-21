@@ -19,11 +19,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
-    domain::tool::Tool,
-    services::{clarify::ClarifyState, tool_execution::current_session},
+    domain::{
+        context::ToolContext,
+        tool::{Tool, ToolError, ToolOutput, parse_args},
+    },
+    services::clarify::ClarifyState,
 };
 
 #[derive(Deserialize)]
@@ -84,25 +87,22 @@ impl Tool for AskUserTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: AskArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid ask_user arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: AskArgs = parse_args(&input)?;
 
         // Someone must be able to answer: a real chat session with a human
         // watching. Sweeps, aux sub-agents, the HTTP API, and detached
-        // contexts get the degrade text instead of a dead wait.
-        let Some(ctx) = current_session() else {
-            return Ok(NO_ANSWER.to_string());
-        };
-        if !ctx.interactive {
-            return Ok(NO_ANSWER.to_string());
+        // contexts are non-interactive and get the degrade text instead of a
+        // dead wait.
+        let sc = &ctx.session;
+        if !sc.interactive {
+            return Ok(ToolOutput::text(NO_ANSWER));
         }
-        if !self.clarify.try_claim_budget(&ctx.session_id) {
-            return Ok(
+        if !self.clarify.try_claim_budget(&sc.session_id) {
+            return Ok(ToolOutput::text(
                 "Clarify budget exhausted for this turn (2 questions max). Proceed with \
-                 your best assumption, stating it explicitly, or conclude the turn."
-                    .to_string(),
-            );
+                 your best assumption, stating it explicitly, or conclude the turn.",
+            ));
         }
 
         let mut prompt = format!("❓ {}", args.question.trim());
@@ -115,12 +115,12 @@ impl Tool for AskUserTool {
 
         // Register BEFORE sending, so an instant reply can't race the window
         // between the prompt landing and the waiter existing.
-        let rx = self.clarify.register(&ctx.session_id);
-        if let Err(error) = ctx.sink.send(&prompt).await {
-            self.clarify.forget_pending(&ctx.session_id);
-            return Ok(format!(
+        let rx = self.clarify.register(&sc.session_id);
+        if let Err(error) = sc.sink.send(&prompt).await {
+            self.clarify.forget_pending(&sc.session_id);
+            return Ok(ToolOutput::text(format!(
                 "Could not deliver the question ({error}). {NO_ANSWER}"
-            ));
+            )));
         }
 
         match tokio::time::timeout(self.clarify.timeout, rx).await {
@@ -134,13 +134,13 @@ impl Tool for AskUserTool {
                     .find(|(i, _)| answer.trim() == (i + 1).to_string())
                     .map(|(_, opt)| opt.clone())
                     .unwrap_or(answer);
-                Ok(format!("User answered: {answer}"))
+                Ok(ToolOutput::text(format!("User answered: {answer}")))
             }
             // Superseded or cleared (e.g. `/new`): treat as no answer.
-            Ok(Err(_)) => Ok(NO_ANSWER.to_string()),
+            Ok(Err(_)) => Ok(ToolOutput::text(NO_ANSWER)),
             Err(_) => {
-                self.clarify.forget_pending(&ctx.session_id);
-                Ok(NO_ANSWER.to_string())
+                self.clarify.forget_pending(&sc.session_id);
+                Ok(ToolOutput::text(NO_ANSWER))
             }
         }
     }
@@ -149,8 +149,9 @@ impl Tool for AskUserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::approval::{ApprovalRequest, Approver};
+    use crate::domain::context::{SessionContext, ToolContext};
     use crate::domain::gateway::ReplySink;
-    use crate::services::tool_execution::{SessionContext, with_session};
     use std::sync::Mutex;
 
     struct RecordingSink {
@@ -165,23 +166,39 @@ mod tests {
         }
     }
 
-    fn interactive_ctx(session: &str, sent: Arc<Mutex<Vec<String>>>) -> SessionContext {
-        SessionContext {
+    struct DenyAll;
+    #[async_trait]
+    impl Approver for DenyAll {
+        async fn approve(&self, _r: &ApprovalRequest) -> bool {
+            false
+        }
+    }
+
+    /// An interactive `ToolContext` whose sink records what was sent.
+    fn interactive_ctx(session: &str, sent: Arc<Mutex<Vec<String>>>) -> ToolContext {
+        let session = SessionContext {
             session_id: session.to_string(),
             sink: Arc::new(RecordingSink { sent }),
             interactive: true,
             auto_approve: false,
-        }
+        };
+        ToolContext::new(session, None, Arc::new(DenyAll))
+    }
+
+    fn v(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
     }
 
     #[tokio::test]
-    async fn no_session_degrades_to_guidance() {
+    async fn non_interactive_context_degrades_to_guidance() {
         let tool = AskUserTool::new(Arc::new(ClarifyState::new()));
+        // A detached context is non-interactive: nobody can answer.
+        let ctx = ToolContext::new(SessionContext::detached("s0"), None, Arc::new(DenyAll));
         let out = tool
-            .execute(r#"{"question":"which one?"}"#.to_string())
+            .call(v(r#"{"question":"which one?"}"#), &ctx)
             .await
             .unwrap();
-        assert!(out.contains("No answer from the user"));
+        assert!(out.text.contains("No answer from the user"));
     }
 
     #[tokio::test]
@@ -191,10 +208,7 @@ mod tests {
         let ctx = interactive_ctx("s1", sent.clone());
 
         let tool = AskUserTool::new(clarify.clone());
-        let fut = with_session(
-            ctx,
-            tool.execute(r#"{"question":"红的还是蓝的?"}"#.to_string()),
-        );
+        let fut = tool.call(v(r#"{"question":"红的还是蓝的?"}"#), &ctx);
         let answerer = {
             let clarify = clarify.clone();
             tokio::spawn(async move {
@@ -211,7 +225,7 @@ mod tests {
         };
         let out = fut.await.unwrap();
         answerer.await.unwrap();
-        assert_eq!(out, "User answered: 蓝的");
+        assert_eq!(out.text, "User answered: 蓝的");
         assert!(sent.lock().unwrap()[0].contains("红的还是蓝的"));
     }
 
@@ -221,9 +235,9 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let ctx = interactive_ctx("s2", sent.clone());
         let tool = AskUserTool::new(clarify.clone());
-        let fut = with_session(
-            ctx,
-            tool.execute(r#"{"question":"which?","options":["apple","banana"]}"#.to_string()),
+        let fut = tool.call(
+            v(r#"{"question":"which?","options":["apple","banana"]}"#),
+            &ctx,
         );
         let clarify2 = clarify.clone();
         let answerer = tokio::spawn(async move {
@@ -237,7 +251,7 @@ mod tests {
         });
         let out = fut.await.unwrap();
         answerer.await.unwrap();
-        assert_eq!(out, "User answered: banana");
+        assert_eq!(out.text, "User answered: banana");
         let prompt = &sent.lock().unwrap()[0];
         assert!(prompt.contains("1. apple") && prompt.contains("2. banana"));
     }
@@ -250,10 +264,8 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let ctx = interactive_ctx("s3", sent.clone());
         let tool = AskUserTool::new(clarify);
-        let out = with_session(ctx, tool.execute(r#"{"question":"?"}"#.to_string()))
-            .await
-            .unwrap();
-        assert!(out.contains("budget exhausted"));
+        let out = tool.call(v(r#"{"question":"?"}"#), &ctx).await.unwrap();
+        assert!(out.text.contains("budget exhausted"));
         assert!(sent.lock().unwrap().is_empty(), "no prompt sent");
     }
 }

@@ -500,7 +500,12 @@ impl SessionRepository for Db {
 impl MessageRepository for Db {
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
         let mut conn = self.inner.connection().await?;
-        let record = SessionRecord::get_by_id(&mut conn, session_id).await?;
+        // A session that was never created (e.g. the GUI loading history for a
+        // freshly-minted client-side session id) simply has no transcript —
+        // return empty rather than erroring, mirroring `find_windowed`.
+        let Ok(record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+            return Ok(Vec::new());
+        };
         let rows = record.messages().exec(&mut conn).await?;
         let mut messages: Vec<Message> = rows
             .into_iter()

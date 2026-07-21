@@ -16,6 +16,13 @@ use super::sources::{ConfigSources, KomoEnv, PolicyFileConfig, PolicyRuleFileCon
 /// config.toml sets one. Multi-file edits easily take 10+ round-trips.
 pub const DEFAULT_MAX_TURNS: usize = 30;
 
+/// Built-in per-completion timeout (seconds) when neither `KOMO_LLM_TIMEOUT_SECS`
+/// nor config.toml sets one. A backstop so a hung provider request (rig's
+/// default reqwest client sets no timeout) fails the turn cleanly instead of
+/// wedging it in `running` forever — long enough for a slow tool-using
+/// completion, short enough that a stalled request can't hang a turn all day.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 180;
+
 /// Built-in default byte cap on a tool result handed back to the LLM, when
 /// neither `KOMO_MAX_TOOL_RESULT_BYTES` nor config.toml sets one. Sized above
 /// the per-tool self-caps (web_fetch / homeassistant trim to 8 KB) so it only
@@ -135,6 +142,9 @@ pub struct ModelConfig {
     pub max_tool_result_bytes: usize,
     /// Max prior messages replayed as history per turn (`0` = unlimited).
     pub max_history_messages: usize,
+    /// Per-completion timeout in seconds — a hung provider request fails the
+    /// turn cleanly rather than wedging it forever (`0` = no timeout).
+    pub llm_timeout_secs: u64,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -148,6 +158,7 @@ impl fmt::Debug for ModelConfig {
             .field("max_turns", &self.max_turns)
             .field("max_tool_result_bytes", &self.max_tool_result_bytes)
             .field("max_history_messages", &self.max_history_messages)
+            .field("llm_timeout_secs", &self.llm_timeout_secs)
             .finish()
     }
 }
@@ -172,6 +183,7 @@ impl ModelConfig {
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
             max_history_messages: self.max_history_messages,
+            llm_timeout_secs: self.llm_timeout_secs,
         }
     }
 }
@@ -322,6 +334,10 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .max_history_messages
             .or(file.max_history_messages)
             .unwrap_or(DEFAULT_MAX_HISTORY_MESSAGES),
+        llm_timeout_secs: env
+            .llm_timeout_secs
+            .or(file.llm_timeout_secs)
+            .unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
     };
 
     let policy = match file.policy {

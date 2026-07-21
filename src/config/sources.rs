@@ -65,6 +65,7 @@ pub struct KomoEnv {
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
     pub max_history_messages: Option<usize>,
+    pub llm_timeout_secs: Option<u64>,
     pub review_interval: Option<usize>,
     pub skills_path: Option<String>,
 }
@@ -137,6 +138,7 @@ impl KomoEnv {
             max_turns,
             max_tool_result_bytes,
             max_history_messages,
+            llm_timeout_secs,
             review_interval,
             skills_path,
         );
@@ -241,6 +243,10 @@ pub struct FileConfig {
     /// model every turn (default: 50; `0` = unlimited). See
     /// `infra::llm::RigLlm::assemble`.
     pub max_history_messages: Option<usize>,
+    /// Per-completion timeout in seconds — a hung provider request fails the
+    /// turn cleanly instead of wedging it in `running` (default: 180; `0` =
+    /// no timeout). See `infra::llm::RigLlm`.
+    pub llm_timeout_secs: Option<u64>,
     /// Ingress channel declarations (`[channels.*]` tables), shaped after
     /// hermes-agent's per-platform config blocks.
     pub channels: Option<ChannelsFileConfig>,

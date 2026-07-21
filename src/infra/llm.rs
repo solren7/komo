@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -77,6 +79,32 @@ pub struct RigLlm<M: CompletionModel> {
     /// path. The streamed chunks are aggregated back into one assistant turn, so
     /// the rest of the loop is identical either way.
     stream: bool,
+    /// Per-completion timeout. rig's default reqwest client sets no request
+    /// timeout, so a hung provider request would await forever and wedge the
+    /// turn in `running`; this caps each completion so a stall fails the turn
+    /// cleanly instead. `None` = no timeout (config `llm_timeout_secs = 0`).
+    timeout: Option<Duration>,
+}
+
+/// Run `fut` under `timeout` (if set), turning a stall into a clean error rather
+/// than an indefinite await. Shared by the tool-less `complete` path and every
+/// tool-loop round.
+async fn with_timeout<F, T>(timeout: Option<Duration>, fut: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match timeout {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "LLM completion timed out after {}s (provider unresponsive; \
+                 failing the turn instead of leaving it running — raise \
+                 `llm_timeout_secs` / `KOMO_LLM_TIMEOUT_SECS` if this is too tight)",
+                d.as_secs()
+            ),
+        },
+        None => fut.await,
+    }
 }
 
 impl<M> RigLlm<M>
@@ -163,15 +191,22 @@ where
         if self.stream {
             // Codex: one streamed completion, aggregated to its text. (No tools
             // are exposed here, so a single round is the whole answer.)
-            let (choice, _) = stream_completion(&agent, RigMessage::user(prompt), history).await?;
+            let (choice, _) = with_timeout(
+                self.timeout,
+                stream_completion(&agent, RigMessage::user(prompt), history),
+            )
+            .await?;
             return Ok(choice_text(&choice));
         }
-        let reply = agent
-            .prompt(prompt)
-            .history(history)
-            .max_turns(self.max_turns)
-            .await
-            .context("LLM completion failed")?;
+        let reply = with_timeout(self.timeout, async {
+            agent
+                .prompt(prompt)
+                .history(history)
+                .max_turns(self.max_turns)
+                .await
+                .context("LLM completion failed")
+        })
+        .await?;
         Ok(reply)
     }
 
@@ -182,6 +217,7 @@ where
             history,
             pending: Some(RigMessage::user(prompt)),
             stream: self.stream,
+            timeout: self.timeout,
         }))
     }
 }
@@ -197,6 +233,8 @@ struct RigTurnDriver<M: CompletionModel> {
     pending: Option<RigMessage>,
     /// Stream each round instead of one-shot `send()` (see [`RigLlm::stream`]).
     stream: bool,
+    /// Per-round completion timeout (see [`RigLlm::timeout`]).
+    timeout: Option<Duration>,
 }
 
 impl<M> RigTurnDriver<M>
@@ -209,17 +247,24 @@ where
     /// transcript.
     async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
         let (choice, message_id) = if self.stream {
-            stream_completion(&self.agent, prompt.clone(), self.history.clone()).await?
+            with_timeout(
+                self.timeout,
+                stream_completion(&self.agent, prompt.clone(), self.history.clone()),
+            )
+            .await?
         } else {
-            let resp = self
-                .agent
-                .completion(prompt.clone(), self.history.clone())
-                .await
-                .context("failed to build completion request")?
-                .send()
-                .await
-                .context("LLM completion failed")?;
-            (resp.choice, resp.message_id)
+            with_timeout(self.timeout, async {
+                let resp = self
+                    .agent
+                    .completion(prompt.clone(), self.history.clone())
+                    .await
+                    .context("failed to build completion request")?
+                    .send()
+                    .await
+                    .context("LLM completion failed")?;
+                Ok::<_, anyhow::Error>((resp.choice, resp.message_id))
+            })
+            .await?
         };
         self.history.push(prompt);
         self.history.push(RigMessage::Assistant {
@@ -375,6 +420,9 @@ pub fn build_llm(
     // uses the simpler one-shot path. Declared before `rig_llm!` so the macro's
     // (hygienic) body can capture it alongside `max_turns`/`preamble`/`enricher`.
     let stream = matches!(config.provider, Provider::Codex);
+    // Cap each completion so a hung provider request fails the turn instead of
+    // wedging it in `running` (rig's client sets no request timeout). `0` = off.
+    let timeout = (config.llm_timeout_secs > 0).then(|| Duration::from_secs(config.llm_timeout_secs));
     // Seed the agent with an initial preamble; `complete` overrides it per turn.
     let initial = preamble();
 
@@ -397,6 +445,7 @@ pub fn build_llm(
                 max_history_messages,
                 enricher,
                 stream,
+                timeout,
             }) as Arc<dyn LlmClient>
         }};
     }

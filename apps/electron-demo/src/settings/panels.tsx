@@ -1,56 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { useConnection, useNav } from "../app-context";
 import { apiField, apiGet, apiPost, fmtTs } from "../lib/ipc";
-import type { Memory, Run, SessionSummary, StatusSnapshot, Task } from "../types";
-
-type Tab = "status" | "tasks" | "memories" | "runs" | "sessions";
-const TABS: [Tab, string][] = [
-  ["status", "状态"],
-  ["tasks", "任务"],
-  ["memories", "记忆"],
-  ["runs", "运行"],
-  ["sessions", "会话"],
-];
+import type { Memory, Run, StatusSnapshot, Task } from "../types";
 
 const POLL_MS = 6000;
-
-export function Dashboard() {
-  const [tab, setTab] = useState<Tab>("status");
-  const { connected } = useConnection();
-
-  return (
-    <div className="dashboard">
-      <div className="dash-tabs">
-        {TABS.map(([t, label]) => (
-          <button
-            key={t}
-            className={tab === t ? "dash-tab active" : "dash-tab"}
-            onClick={() => setTab(t)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-      <div className="dash-body">
-        {!connected ? (
-          <div className="empty">未连接到 gateway。</div>
-        ) : tab === "status" ? (
-          <StatusTab />
-        ) : tab === "tasks" ? (
-          <TasksTab />
-        ) : tab === "memories" ? (
-          <MemoriesTab />
-        ) : tab === "runs" ? (
-          <RunsTab />
-        ) : (
-          <SessionsTab />
-        )}
-      </div>
-    </div>
-  );
-}
 
 function useLoad<T>(key: string[], fn: () => Promise<T>) {
   return useQuery({ queryKey: key, queryFn: fn, refetchInterval: POLL_MS });
@@ -63,7 +17,7 @@ function ErrLine({ error }: { error: unknown }) {
   return <div className="err">{error instanceof Error ? error.message : String(error)}</div>;
 }
 
-function StatusTab() {
+export function StatusTab() {
   const q = useLoad(["status"], () => apiGet<StatusSnapshot>("/api/status"));
   if (q.isPending) return <Loading />;
   if (q.error) return <ErrLine error={q.error} />;
@@ -104,7 +58,7 @@ function StatusTab() {
   );
 }
 
-function TasksTab() {
+export function TasksTab() {
   const q = useLoad(["tasks"], () => apiField<Task[]>("/api/tasks", "tasks"));
   if (q.isPending) return <Loading />;
   if (q.error) return <ErrLine error={q.error} />;
@@ -124,7 +78,7 @@ function TasksTab() {
   );
 }
 
-function MemoriesTab() {
+export function MemoriesTab() {
   const [filter, setFilter] = useState("");
   const qc = useQueryClient();
   const q = useLoad(["memories", filter], () =>
@@ -181,7 +135,7 @@ function MemoriesTab() {
   );
 }
 
-function RunsTab() {
+export function RunsTab() {
   const [open, setOpen] = useState<string | null>(null);
   const q = useLoad(["runs"], () => apiField<Run[]>("/api/runs?limit=50", "runs"));
   if (q.isPending) return <Loading />;
@@ -192,10 +146,7 @@ function RunsTab() {
     <div className="panel">
       {runs.map((r) => (
         <div key={r.id}>
-          <div
-            className="row clickable"
-            onClick={() => setOpen(open === r.id ? null : r.id)}
-          >
+          <div className="row clickable" onClick={() => setOpen(open === r.id ? null : r.id)}>
             <span className="tag">{r.status}</span>
             <span className="row-main">{r.input}</span>
             {r.recoverable && (
@@ -240,34 +191,4 @@ interface RunStepLite {
   tool_name: string;
   args: string;
   ok: boolean;
-}
-
-function SessionsTab() {
-  const { setSession, setView } = useNav();
-  const q = useLoad(["sessions"], () => apiField<SessionSummary[]>("/api/sessions", "sessions"));
-  if (q.isPending) return <Loading />;
-  if (q.error) return <ErrLine error={q.error} />;
-  const sessions = q.data!;
-  if (sessions.length === 0) return <div className="empty">没有会话。</div>;
-  return (
-    <div className="panel">
-      {sessions.map((s) => (
-        <div className="row" key={s.id}>
-          <span className="row-main mono">{s.id}</span>
-          <span className="muted">
-            {s.user_turns} 轮 · {s.messages} 条 · {fmtTs(s.created_at)}
-          </span>
-          <button
-            className="small"
-            onClick={() => {
-              setSession(s.id);
-              setView("chat");
-            }}
-          >
-            在聊天中继续
-          </button>
-        </div>
-      ))}
-    </div>
-  );
 }

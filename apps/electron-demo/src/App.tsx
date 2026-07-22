@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
 
 import type { KomoConnectResponse } from "./global";
-import { ConnectionContext, NavContext, type View } from "./app-context";
+import { AppContext, ConnectionContext, type Mode } from "./app-context";
 import { ChatView } from "./chat/ChatView";
-import { Dashboard } from "./dashboard/Dashboard";
+import { Sidebar } from "./Sidebar";
+import { SettingsModal } from "./settings/SettingsModal";
 import { newSessionId } from "./lib/ipc";
 
 export function App() {
   const [conn, setConn] = useState<KomoConnectResponse>({ connected: false });
-  const [view, setView] = useState<View>("chat");
   const [session, setSession] = useState<string>(() => newSessionId());
+  const [mode, setMode] = useState<Mode>("interactive");
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Connection lifecycle: probe on mount, then every 3s — attach when the
   // gateway starts, show offline when it stops.
@@ -29,39 +31,20 @@ export function App() {
 
   return (
     <ConnectionContext.Provider value={conn}>
-      <NavContext.Provider value={{ view, setView, session, setSession }}>
+      <AppContext.Provider value={{ session, setSession, mode, setMode }}>
         <div className="app">
-          <nav className="navbar">
-            <span className="brand">komo</span>
-            <div className="tabs">
-              <button
-                className={view === "chat" ? "tab active" : "tab"}
-                onClick={() => setView("chat")}
-              >
-                聊天
-              </button>
-              <button
-                className={view === "dashboard" ? "tab active" : "tab"}
-                onClick={() => setView("dashboard")}
-              >
-                仪表盘
-              </button>
-            </div>
-            <span
-              className={conn.connected ? "dot online" : "dot offline"}
-              title={conn.connected ? "已连接" : "未连接"}
-            />
-          </nav>
+          <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
 
-          {!conn.connected && (
-            <div className="banner">{conn.error ?? "正在连接 komo gateway…"}</div>
-          )}
+          <div className="main">
+            {!conn.connected && (
+              <div className="banner">{conn.error ?? "正在连接 komo gateway…"}</div>
+            )}
+            <ChatView key={session} />
+          </div>
 
-          <main className="content">
-            {view === "chat" ? <ChatView key={session} /> : <Dashboard />}
-          </main>
+          {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
         </div>
-      </NavContext.Provider>
+      </AppContext.Provider>
     </ConnectionContext.Provider>
   );
 }

@@ -9,9 +9,9 @@ import {
   type ChatModelAdapter,
 } from "@assistant-ui/react";
 
-import { useNav } from "../app-context";
+import { useApp } from "../app-context";
 import type { Interactions, PendingApproval } from "../types";
-import { headerFor, newSessionId } from "../lib/ipc";
+import { headerFor } from "../lib/ipc";
 import { renderMarkdown } from "../lib/markdown";
 
 /** Assistant message text rendered as sanitized markdown. */
@@ -100,8 +100,7 @@ function ClarifyBar({ question, onAnswer }: { question: string; onAnswer: (text:
 }
 
 export function ChatView() {
-  const { session, setSession } = useNav();
-  const [mode, setMode] = useState<"interactive" | "trusted">("interactive");
+  const { session, mode } = useApp();
   const [approval, setApproval] = useState<PendingApproval | null>(null);
   const [question, setQuestion] = useState<string | null>(null);
 
@@ -178,22 +177,6 @@ export function ChatView() {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="chat">
-        <div className="chat-toolbar">
-          <button className="small" onClick={() => setSession(newSessionId())}>
-            新会话
-          </button>
-          <label className="mode">
-            <input
-              type="checkbox"
-              checked={mode === "trusted"}
-              onChange={(e) => setMode(e.target.checked ? "trusted" : "interactive")}
-            />
-            <span title="开启后副作用工具自动批准（等同 komo chat）；关闭则弹出审批">
-              信任模式（自动批准）
-            </span>
-          </label>
-        </div>
-
         <ThreadPrimitive.Root className="thread">
           <ThreadPrimitive.Viewport className="messages">
             <ThreadPrimitive.Empty>

@@ -13,6 +13,8 @@ import { useApp } from "../app-context";
 import type { Interactions, PendingApproval } from "../types";
 import { headerFor } from "../lib/ipc";
 import { renderMarkdown } from "../lib/markdown";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 /** Assistant message text rendered as sanitized markdown. */
 function MarkdownText() {
@@ -70,15 +72,15 @@ function ApprovalModal({
           </div>
         )}
         <div className="flex gap-2 justify-end mt-3.5">
-          <button className={btn("accent")} onClick={() => onDecide("once")}>
+          <Button variant="gradient" size="sm" onClick={() => onDecide("once")}>
             批准本次
-          </button>
-          <button className={btn()} onClick={() => onDecide("session")}>
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => onDecide("session")}>
             批准本会话
-          </button>
-          <button className={btn("danger")} onClick={() => onDecide("deny")}>
+          </Button>
+          <Button variant="destructive" size="sm" onClick={() => onDecide("deny")}>
             拒绝
-          </button>
+          </Button>
         </div>
       </div>
     </div>
@@ -104,22 +106,12 @@ function ClarifyBar({ question, onAnswer }: { question: string; onAnswer: (text:
             if (e.key === "Enter") submit();
           }}
         />
-        <button className={btn("accent")} onClick={submit}>
+        <Button variant="gradient" size="sm" onClick={submit}>
           回答
-        </button>
+        </Button>
       </div>
     </div>
   );
-}
-
-/** Shared button styles (accent / danger / neutral). */
-function btn(kind?: "accent" | "danger"): string {
-  const base = "px-3.5 py-1.5 rounded-[10px] text-[13px] cursor-pointer border transition-colors";
-  if (kind === "accent")
-    return `${base} border-transparent text-white hover:opacity-90 [background:var(--mc-accent-grad)]`;
-  if (kind === "danger")
-    return `${base} border-(--mc-border) bg-(--mc-surface-2) text-(--mc-danger) hover:border-(--mc-danger)`;
-  return `${base} border-(--mc-border) bg-(--mc-surface-2) text-(--mc-fg) hover:border-(--mc-accent)`;
 }
 
 export function ChatView() {
@@ -218,7 +210,9 @@ export function ChatView() {
               className="flex-1 resize-none min-h-[44px] max-h-[160px] px-3.5 py-3 rounded-[14px] border border-(--mc-border) bg-(--mc-surface-strong) text-(--mc-fg) outline-none focus:border-(--mc-accent) focus:shadow-(--mc-shadow-glow) transition-shadow font-[inherit]"
               placeholder="给 komo 发消息…"
             />
-            <ComposerPrimitive.Send className="shrink-0 h-11 px-5 rounded-[14px] cursor-pointer text-white font-medium hover:opacity-90 transition-opacity [background:var(--mc-accent-grad)]">
+            <ComposerPrimitive.Send
+              className={cn(buttonVariants({ variant: "gradient", size: "lg" }))}
+            >
               发送
             </ComposerPrimitive.Send>
           </ComposerPrimitive.Root>

@@ -68,3 +68,31 @@ html.dark {
   --mc-shadow-glow: 0 0 0 1px rgba(138, 114, 255, 0.35), 0 10px 40px -10px rgba(138, 114, 255, 0.55);
   --mc-shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 14px 40px -24px rgba(0, 0, 0, 0.6);
 }
+
+/* shadcn/ui semantic tokens, aliased onto the mineclaw palette above. They
+   reference the --mc-* variables, so light/dark flips for free — no separate
+   dark block needed. `@theme inline` in main.css registers them as Tailwind
+   color utilities (bg-primary, text-muted-foreground, border-input, …). */
+:root {
+  --radius: 0.625rem;
+
+  --background: var(--mc-bg);
+  --foreground: var(--mc-fg);
+  --card: var(--mc-bg-elev);
+  --card-foreground: var(--mc-fg);
+  --popover: var(--mc-bg-elev);
+  --popover-foreground: var(--mc-fg);
+  --primary: var(--mc-accent);
+  --primary-foreground: var(--mc-accent-fg);
+  --secondary: var(--mc-surface-2);
+  --secondary-foreground: var(--mc-fg);
+  --muted: var(--mc-surface-2);
+  --muted-foreground: var(--mc-fg-muted);
+  --accent: var(--mc-surface-2);
+  --accent-foreground: var(--mc-fg);
+  --destructive: var(--mc-danger);
+  --destructive-foreground: #ffffff;
+  --border: var(--mc-border);
+  --input: var(--mc-border-strong);
+  --ring: var(--mc-accent-ring);
+}

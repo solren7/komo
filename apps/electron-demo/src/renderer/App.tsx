@@ -7,6 +7,7 @@ import { Sidebar } from "./Sidebar";
 import { SettingsModal } from "./settings/SettingsModal";
 import { newSessionId } from "./lib/ipc";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
+import { Button } from "@/components/ui/button";
 
 export function App() {
   const [conn, setConn] = useState<KomoConnectResponse>({ connected: false });
@@ -49,13 +50,15 @@ export function App() {
             <header className="h-12 shrink-0 px-4 flex items-center gap-2 border-b border-(--mc-border)">
               <span className="text-sm font-medium text-(--mc-fg-muted) truncate">对话</span>
               <div className="flex-1" />
-              <button
-                className="w-9 h-9 inline-flex items-center justify-center rounded-md cursor-pointer text-(--mc-fg-muted) hover:text-(--mc-fg) hover:bg-(--mc-surface-2) transition-colors"
+              <Button
+                variant="ghost"
+                size="icon"
+                className="text-(--mc-fg-muted) hover:text-(--mc-fg)"
                 title={theme === "dark" ? "切换到亮色" : "切换到暗色"}
                 onClick={toggleTheme}
               >
                 {theme === "dark" ? <SunIcon /> : <MoonIcon />}
-              </button>
+              </Button>
             </header>
 
             {!conn.connected && (

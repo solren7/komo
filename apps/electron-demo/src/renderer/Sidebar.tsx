@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useApp, useConnection } from "./app-context";
 import { apiField, fmtTs, newSessionId } from "./lib/ipc";
 import type { SessionSummary } from "./types";
+import { Button } from "@/components/ui/button";
 
 /** A short, human-readable label for a session id. */
 function sessionLabel(id: string): string {
@@ -48,14 +49,10 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
       </div>
 
       <div className="px-3 pb-2">
-        <button
-          className="w-full inline-flex items-center gap-2 h-9 px-3 rounded-[10px] cursor-pointer text-sm font-medium text-white transition-opacity hover:opacity-90"
-          style={{ background: "var(--mc-accent-grad)" }}
-          onClick={() => setSession(newSessionId())}
-        >
+        <Button variant="gradient" className="w-full" onClick={() => setSession(newSessionId())}>
           <PlusIcon />
           <span>新建会话</span>
-        </button>
+        </Button>
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0 px-2 pb-2 flex flex-col gap-0.5">
@@ -96,13 +93,14 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
       </div>
 
       <div className="border-t border-(--mc-border) p-2">
-        <button
-          className="w-full inline-flex items-center gap-2 px-3 py-2 rounded-[10px] cursor-pointer text-[13px] text-(--mc-fg-muted) hover:text-(--mc-fg) hover:bg-(--mc-surface-2) transition-colors"
+        <Button
+          variant="ghost"
+          className="w-full justify-start text-(--mc-fg-muted) hover:text-(--mc-fg)"
           onClick={onOpenSettings}
         >
           <GearIcon />
           <span>设置</span>
-        </button>
+        </Button>
       </div>
     </aside>
   );

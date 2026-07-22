@@ -3,16 +3,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { apiField, apiGet, apiPost, fmtTs } from "../lib/ipc";
 import type { Memory, Run, StatusSnapshot, Task } from "../types";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 
 const POLL_MS = 6000;
 
-// Shared presentational class strings (token-driven, mineclaw look).
-const ROW = "flex items-center gap-2 px-2.5 py-2 rounded-[10px] border border-(--mc-border) bg-(--mc-surface)";
-const TAG = "text-[11px] px-1.5 py-0.5 rounded-full bg-(--mc-bg) border border-(--mc-border) whitespace-nowrap";
-const CHIP = "text-[11px] px-1.5 py-0.5 rounded-[8px] bg-(--mc-bg) border border-(--mc-border) whitespace-nowrap";
+// Layout-only class strings (the token look); anything button- or chip-shaped
+// now goes through the shadcn <Button> / <Badge> components.
+const ROW =
+  "flex items-center gap-2 px-2.5 py-2 rounded-[10px] border border-(--mc-border) bg-(--mc-surface)";
 const MUTED = "text-xs text-(--mc-fg-muted) whitespace-nowrap";
 const PANEL = "flex flex-col gap-1.5";
-const BTN = "px-2.5 py-1 rounded-[8px] text-[12px] cursor-pointer border border-(--mc-border) bg-(--mc-surface-2) text-(--mc-fg) hover:border-(--mc-accent) transition-colors";
 
 function useLoad<T>(key: string[], fn: () => Promise<T>) {
   return useQuery({ queryKey: key, queryFn: fn, refetchInterval: POLL_MS });
@@ -61,11 +62,7 @@ export function StatusTab() {
         {s.channels.length === 0 ? (
           <span className="text-[13px]">无</span>
         ) : (
-          s.channels.map((c) => (
-            <span className={CHIP} key={c}>
-              {c}
-            </span>
-          ))
+          s.channels.map((c) => <Badge key={c}>{c}</Badge>)
         )}
       </div>
     </div>
@@ -82,9 +79,9 @@ export function TasksTab() {
     <div className={PANEL}>
       {tasks.map((t) => (
         <div className={ROW} key={t.id}>
-          <span className={TAG}>{t.status}</span>
+          <Badge variant="pill">{t.status}</Badge>
           <span className="flex-1 truncate">{t.title}</span>
-          {t.board && <span className={CHIP}>#{t.board}</span>}
+          {t.board && <Badge>#{t.board}</Badge>}
           {t.due_at != null && <span className={MUTED}>截止 {fmtTs(t.due_at)}</span>}
         </div>
       ))}
@@ -129,28 +126,30 @@ export function MemoriesTab() {
         q.data!.map((m) => (
           <div className={`${ROW} !flex-col !items-stretch`} key={m.id}>
             <div className="flex items-center gap-1.5">
-              <span className={TAG}>{m.status}</span>
-              <span className={CHIP}>{m.kind}</span>
-              {m.pinned && <span className={`${CHIP} !text-(--mc-warn) !border-(--mc-warn)`}>📌</span>}
+              <Badge variant="pill">{m.status}</Badge>
+              <Badge>{m.kind}</Badge>
+              {m.pinned && <Badge variant="warn">📌</Badge>}
               <span className={MUTED}>{m.confidence}</span>
             </div>
             <div className="my-1 whitespace-pre-wrap break-words text-[13px]">{m.content}</div>
             <div className="flex gap-1.5">
-              <button
-                className={`${BTN} !text-(--mc-ok) hover:!border-(--mc-ok)`}
-                onClick={() => act.mutate({ id: m.id, action: "promote" })}
-              >
+              <Button size="sm" onClick={() => act.mutate({ id: m.id, action: "promote" })}>
                 promote
-              </button>
-              <button className={BTN} onClick={() => act.mutate({ id: m.id, action: "pin" })}>
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => act.mutate({ id: m.id, action: "pin" })}
+              >
                 pin
-              </button>
-              <button
-                className={`${BTN} !text-(--mc-danger) hover:!border-(--mc-danger)`}
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
                 onClick={() => act.mutate({ id: m.id, action: "reject" })}
               >
                 reject
-              </button>
+              </Button>
             </div>
           </div>
         ))
@@ -174,12 +173,12 @@ export function RunsTab() {
             className={`${ROW} cursor-pointer hover:border-(--mc-accent)`}
             onClick={() => setOpen(open === r.id ? null : r.id)}
           >
-            <span className={TAG}>{r.status}</span>
+            <Badge variant="pill">{r.status}</Badge>
             <span className="flex-1 truncate">{r.input}</span>
             {r.recoverable && (
-              <span className={`${CHIP} !text-(--mc-warn) !border-(--mc-warn)`} title="可恢复">
+              <Badge variant="warn" title="可恢复">
                 ⟲
-              </span>
+              </Badge>
             )}
             <span className={MUTED}>{fmtTs(r.started_at)}</span>
           </div>
@@ -195,8 +194,18 @@ function RunDetail({ id }: { id: string }) {
     queryKey: ["run", id],
     queryFn: () => apiGet<{ run: Run; steps: RunStepLite[] }>(`/api/runs/${id}`),
   });
-  if (q.isPending) return <div className="ml-4 mt-1 pl-3 border-l-2 border-(--mc-accent) text-(--mc-fg-faint) text-[13px] py-1">加载步骤…</div>;
-  if (q.error) return <div className="ml-4 mt-1 pl-3 border-l-2 border-(--mc-danger) text-(--mc-danger) text-[13px] py-1">{String(q.error)}</div>;
+  if (q.isPending)
+    return (
+      <div className="ml-4 mt-1 pl-3 border-l-2 border-(--mc-accent) text-(--mc-fg-faint) text-[13px] py-1">
+        加载步骤…
+      </div>
+    );
+  if (q.error)
+    return (
+      <div className="ml-4 mt-1 pl-3 border-l-2 border-(--mc-danger) text-(--mc-danger) text-[13px] py-1">
+        {String(q.error)}
+      </div>
+    );
   const { run, steps } = q.data!;
   return (
     <div className="ml-4 mt-1 pl-3 border-l-2 border-(--mc-accent) flex flex-col gap-1 py-1">
@@ -204,9 +213,9 @@ function RunDetail({ id }: { id: string }) {
       {run.error && <div className="text-(--mc-danger) text-[13px]">{run.error}</div>}
       {steps.map((s) => (
         <div className="flex gap-2 items-baseline text-[13px]" key={s.seq}>
-          <span className={`${TAG} ${s.ok ? "!text-(--mc-ok) !border-(--mc-ok)" : "!text-(--mc-danger) !border-(--mc-danger)"}`}>
+          <Badge variant={s.ok ? "ok" : "danger"} className="rounded-full">
             {s.seq}. {s.tool_name}
-          </span>
+          </Badge>
           <span className="text-(--mc-fg-muted) font-mono text-[11px] truncate">{s.args}</span>
         </div>
       ))}

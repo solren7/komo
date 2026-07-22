@@ -2,6 +2,9 @@ import { useState } from "react";
 
 import { useApp, useConnection } from "../app-context";
 import { MemoriesTab, RunsTab, StatusTab, TasksTab } from "./panels";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 
 type Tab = "general" | "tasks" | "memories" | "runs";
 const TABS: [Tab, string][] = [
@@ -26,13 +29,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       >
         <div className="flex items-center justify-between px-5 pt-4 pb-2.5">
           <div className="font-bold text-(--mc-fg)">设置</div>
-          <button
-            className="w-7 h-7 inline-flex items-center justify-center rounded-md cursor-pointer text-(--mc-fg-muted) hover:text-(--mc-fg) hover:bg-(--mc-surface-2) transition-colors"
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 text-(--mc-fg-muted) hover:text-(--mc-fg)"
             onClick={onClose}
             title="关闭"
           >
             ✕
-          </button>
+          </Button>
         </div>
 
         <div className="flex gap-1 px-5 border-b border-(--mc-border)">
@@ -85,11 +90,9 @@ function GeneralTab() {
             开启后副作用工具自动批准（等同 komo chat）；关闭则弹出审批。
           </div>
         </div>
-        <input
-          type="checkbox"
-          className="w-4 h-4 accent-[var(--mc-accent)]"
+        <Switch
           checked={mode === "trusted"}
-          onChange={(e) => setMode(e.target.checked ? "trusted" : "interactive")}
+          onCheckedChange={(v) => setMode(v ? "trusted" : "interactive")}
         />
       </label>
 
@@ -98,15 +101,9 @@ function GeneralTab() {
           <div className="text-sm text-(--mc-fg)">连接状态</div>
           <div className="text-xs text-(--mc-fg-muted) mt-0.5">komo gateway 的实时连接。</div>
         </div>
-        <span
-          className={`text-[11px] px-2 py-1 rounded-full border ${
-            connected
-              ? "text-(--mc-ok) border-(--mc-ok)"
-              : "text-(--mc-warn) border-(--mc-warn)"
-          }`}
-        >
+        <Badge variant={connected ? "ok" : "warn"} className="rounded-full px-2 py-1">
           {connected ? "已连接" : "未连接"}
-        </span>
+        </Badge>
       </div>
 
       {connected && (

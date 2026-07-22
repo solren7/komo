@@ -22,7 +22,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         if (!open) onClose();
       }}
     >
-      <DialogContent className="flex flex-col gap-0 p-0 sm:max-w-[620px] max-h-[82vh] overflow-hidden">
+      <DialogContent className="flex flex-col gap-0 p-0 sm:max-w-[620px] h-[600px] max-h-[85vh] overflow-hidden">
         <DialogHeader className="px-5 pt-4">
           <DialogTitle>设置</DialogTitle>
         </DialogHeader>

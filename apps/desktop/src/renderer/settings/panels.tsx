@@ -61,7 +61,7 @@ export function StatusTab() {
   ];
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fill,minmax(120px,1fr))]">
+      <div className="grid gap-2.5 grid-cols-[repeat(auto-fill,minmax(120px,1fr))]">
         {cards.map(([value, label]) => (
           <div
             key={label}

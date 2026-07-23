@@ -85,7 +85,7 @@ function Composer() {
     <ComposerPrimitive.Root className="flex gap-2 items-end px-4 py-3 border-t border-(--mc-border)">
       <ComposerPrimitive.Input
         {...history}
-        className="flex-1 resize-none min-h-[44px] max-h-[160px] px-3.5 py-3 rounded-[14px] border border-(--mc-border) bg-(--mc-surface-strong) text-(--mc-fg) outline-none focus:border-(--mc-accent) focus:shadow-(--mc-shadow-glow) transition-shadow font-[inherit]"
+        className="flex-1 resize-none min-h-11 max-h-40 px-3.5 py-3 rounded-[14px] border border-(--mc-border) bg-(--mc-surface-strong) text-(--mc-fg) outline-none focus:border-(--mc-accent) focus:shadow-(--mc-shadow-glow) transition-shadow font-[inherit]"
         placeholder="给 komo 发消息…（↑ 召回历史输入）"
       />
       <ComposerPrimitive.Send className={cn(buttonVariants({ variant: "gradient", size: "lg" }))}>
@@ -107,11 +107,11 @@ function ApprovalModal({
     <Dialog open onOpenChange={() => {}}>
       <DialogContent
         showCloseButton={false}
-        className={cn("sm:max-w-[480px]", dangerous && "ring-destructive/50")}
+        className={cn("sm:max-w-120", dangerous && "ring-destructive/50")}
       >
         <DialogHeader>
           <DialogTitle>{dangerous ? "🛑 需要审批（危险操作）" : "⚠️ 需要审批"}</DialogTitle>
-          <DialogDescription className="break-words text-(--mc-fg)">{req.summary}</DialogDescription>
+          <DialogDescription className="wrap-break-word text-(--mc-fg)">{req.summary}</DialogDescription>
         </DialogHeader>
         {req.detail && (
           <div className="text-[13px] text-(--mc-fg-muted) whitespace-pre-wrap">{req.detail}</div>

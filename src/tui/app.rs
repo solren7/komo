@@ -2,6 +2,8 @@
 //! The event loop (`mod.rs`) feeds key events in and interprets the returned
 //! [`Action`]s; rendering (`ui.rs`) reads the state.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::approver::{Answer, ApprovalPrompt};
@@ -14,11 +16,19 @@ pub enum Role {
     /// System notices (session started, …).
     Info,
     Error,
+    /// A tool-call activity line (fed by the turn's live [`TurnEvent`] stream).
+    /// Its glyph/color comes from [`Entry::tool_ok`], not a fixed prefix.
+    ///
+    /// [`TurnEvent`]: komo_core::domain::events::TurnEvent
+    Tool,
 }
 
 pub struct Entry {
     pub role: Role,
     pub text: String,
+    /// For [`Role::Tool`] entries: `None` while the call is running, `Some(true)`
+    /// on success, `Some(false)` on failure. `None` (unused) for every other role.
+    pub tool_ok: Option<bool>,
 }
 
 /// What the event loop should do in response to a key, beyond the state
@@ -51,6 +61,13 @@ pub struct App {
     pub awaiting_answer: bool,
     pub spinner: usize,
     pub modal: Option<ApprovalPrompt>,
+    /// Maps a running tool's turn sequence → its transcript entry index, so a
+    /// `ToolFinished` can update the same line in place. Reset each turn (seqs
+    /// restart per turn); `-1` (un-ledgered) calls are not tracked here.
+    tool_index: HashMap<i64, usize>,
+    /// Name of the tool currently running, shown in the status line. `None`
+    /// when nothing is mid-call.
+    pub active_tool: Option<String>,
 }
 
 impl App {
@@ -65,6 +82,8 @@ impl App {
             awaiting_answer: false,
             spinner: 0,
             modal: None,
+            tool_index: HashMap::new(),
+            active_tool: None,
         }
     }
 
@@ -72,8 +91,67 @@ impl App {
         self.entries.push(Entry {
             role,
             text: text.into(),
+            tool_ok: None,
         });
         // New content: snap back to following the tail.
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Reset the per-turn tool state (call when a new turn is submitted): a new
+    /// turn's sequence counter restarts, so stale seq→index mappings must go.
+    pub fn begin_tools(&mut self) {
+        self.tool_index.clear();
+        self.active_tool = None;
+    }
+
+    /// A tool call started: append a running activity line and remember it so
+    /// [`tool_finished`](Self::tool_finished) can update it in place.
+    pub fn tool_started(&mut self, seq: i64, name: String, args: String) {
+        let args = preview(&args, 100);
+        let text = if args.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {args}")
+        };
+        self.entries.push(Entry {
+            role: Role::Tool,
+            text,
+            tool_ok: None,
+        });
+        if seq >= 0 {
+            self.tool_index.insert(seq, self.entries.len() - 1);
+        }
+        self.active_tool = Some(name);
+        self.scroll_from_bottom = 0;
+    }
+
+    /// A tool call finished: mark its line ✓/✗ with a result preview, updating
+    /// the running line in place when the seq is known, else appending one.
+    pub fn tool_finished(&mut self, seq: i64, name: String, ok: bool, summary: String) {
+        let summary = preview(&summary, 120);
+        let text = if summary.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {summary}")
+        };
+        match self
+            .tool_index
+            .remove(&seq)
+            .filter(|&i| i < self.entries.len())
+        {
+            Some(i) => {
+                self.entries[i].text = text;
+                self.entries[i].tool_ok = Some(ok);
+            }
+            None => self.entries.push(Entry {
+                role: Role::Tool,
+                text,
+                tool_ok: Some(ok),
+            }),
+        }
+        // Only the tracked run is "active"; a later start may have replaced it,
+        // but on finish we clear the indicator (the next start re-sets it).
+        self.active_tool = None;
         self.scroll_from_bottom = 0;
     }
 
@@ -209,6 +287,33 @@ impl App {
     }
 }
 
+/// Collapse a (possibly multi-line, possibly long) tool arg/result into a
+/// single tidy line for the activity feed: newlines/tabs → spaces, runs of
+/// whitespace squeezed, then truncated to `max` display chars with an ellipsis.
+fn preview(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max + 1));
+    let mut last_space = false;
+    for c in s.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c == ' ' {
+            if last_space || out.is_empty() {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim_end();
+    if trimmed.chars().count() > max {
+        let kept: String = trimmed.chars().take(max).collect();
+        format!("{kept}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +330,44 @@ mod tests {
         for c in s.chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn tool_line_updates_in_place_on_finish() {
+        let mut app = App::new("s".into());
+        app.begin_tools();
+        app.tool_started(1, "shell".into(), "ls -la /very/long/path".into());
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].role, Role::Tool);
+        assert_eq!(app.entries[0].tool_ok, None);
+        assert_eq!(app.active_tool.as_deref(), Some("shell"));
+
+        // Finishing the same seq updates the existing line, not a new one.
+        app.tool_finished(1, "shell".into(), true, "total 42\nfoo".into());
+        assert_eq!(app.entries.len(), 1, "updated in place, no new entry");
+        assert_eq!(app.entries[0].tool_ok, Some(true));
+        assert!(app.entries[0].text.contains("total 42"));
+        assert!(
+            app.entries[0].text.contains("foo"),
+            "newline collapsed inline"
+        );
+        assert_eq!(app.active_tool, None);
+
+        // A new turn resets tracking so a reused seq starts a fresh line.
+        app.begin_tools();
+        app.tool_started(1, "web_fetch".into(), String::new());
+        app.tool_finished(1, "web_fetch".into(), false, "404".into());
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.entries[1].tool_ok, Some(false));
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_truncates() {
+        assert_eq!(preview("a\n\n  b\tc", 100), "a b c");
+        let long = "x".repeat(200);
+        let p = preview(&long, 10);
+        assert_eq!(p.chars().count(), 11); // 10 + ellipsis
+        assert!(p.ends_with('…'));
     }
 
     #[test]

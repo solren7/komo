@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::domain::{
     cron::{CronJob, CronJobSpec},
+    events::TurnEvent,
     memory::Memory,
     reminder::Reminder,
     run::{Run, RunStep},
@@ -403,13 +404,33 @@ impl GatewayClient {
     /// Run one chat turn server-side and return the reply. Sends the stable
     /// session id (so history threads) and the trusted marker (so the gateway
     /// auto-approves side-effecting tools — it is gated to loopback callers).
+    #[allow(dead_code)]
     pub async fn chat(&self, session_id: &str, message: &str) -> anyhow::Result<String> {
+        self.chat_streaming(session_id, message, |_| {}).await
+    }
+
+    /// Like [`chat`](Self::chat), but asks the gateway to **stream** the turn
+    /// (`stream: true`) and invokes `on_event` for each live [`TurnEvent`] (a
+    /// tool starting / finishing) as it arrives, returning the final reply.
+    ///
+    /// The gateway's `/v1/chat/completions` streams SSE frames: `event: tool`
+    /// frames carry a JSON [`TurnEvent`]; the final default-event frame is an
+    /// OpenAI-style `chat.completion.chunk` whose `delta.content` is the whole
+    /// reply; a trailing `[DONE]` closes it (see `infra/messaging/api.rs`).
+    /// rig's tool loop has no token stream, so this streams the *tool-call
+    /// process*, not the assistant text token-by-token.
+    pub async fn chat_streaming(
+        &self,
+        session_id: &str,
+        message: &str,
+        mut on_event: impl FnMut(TurnEvent),
+    ) -> anyhow::Result<String> {
         let body = json!({
             "model": "komo",
-            "stream": false,
+            "stream": true,
             "messages": [{ "role": "user", "content": message }],
         });
-        let resp = self
+        let mut resp = self
             .http
             .post(self.url("/v1/chat/completions"))
             .bearer_auth(&self.key)
@@ -419,13 +440,60 @@ impl GatewayClient {
             .send()
             .await?
             .error_for_status()?;
-        let v: Value = resp.json().await?;
-        let reply = v
-            .pointer("/choices/0/message/content")
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string();
+
+        let mut reply = String::new();
+        let mut buf = String::new();
+        // SSE frames are separated by a blank line; read the body incrementally
+        // (reqwest's `chunk()` needs no extra feature) and dispatch whole frames.
+        while let Some(chunk) = resp.chunk().await? {
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                parse_sse_frame(&frame, &mut on_event, &mut reply);
+            }
+        }
+        // A final frame without a trailing blank line (some servers omit it).
+        if !buf.trim().is_empty() {
+            parse_sse_frame(&buf, &mut on_event, &mut reply);
+        }
         Ok(reply)
+    }
+}
+
+/// Parse one SSE frame from the chat stream: dispatch a `TurnEvent` (on the
+/// `tool` event) via `on_event`, or capture the final reply from a
+/// `chat.completion.chunk` delta. `[DONE]` and anything unrecognized are
+/// ignored. Multiple `data:` lines in a frame are joined with newlines per the
+/// SSE spec (komo's payloads are single-line, but this stays spec-correct).
+fn parse_sse_frame(frame: &str, on_event: &mut impl FnMut(TurnEvent), reply: &mut String) {
+    let mut event_name = "message".to_string();
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    if event_name == "tool" {
+        if let Ok(event) = serde_json::from_str::<TurnEvent>(&data) {
+            on_event(event);
+        }
+        return;
+    }
+    // Default event: the OpenAI-style chunk carrying the final reply text.
+    if let Ok(v) = serde_json::from_str::<Value>(&data)
+        && let Some(text) = v
+            .pointer("/choices/0/delta/content")
+            .and_then(|c| c.as_str())
+    {
+        *reply = text.to_string();
     }
 }
 

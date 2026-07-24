@@ -1,14 +1,18 @@
 //! Full-screen chat TUI — `komo chat`'s interface (a terminal is required;
 //! scripted access goes through the gateway's api channel instead). A ratatui
-//! front end over two backends: a running gateway via [`GatewayClient::chat`]
-//! (trusted loopback, approvals auto-granted server-side), or the in-process
-//! [`AgentRuntime`] against the local db.
+//! front end over two backends: a running gateway via
+//! [`GatewayClient::chat_streaming`] (trusted loopback, approvals auto-granted
+//! server-side), or the in-process [`AgentRuntime`] against the local db.
 //!
 //! Layout: scrollable transcript · status line (spinner while a turn runs) ·
-//! bordered input box. In local mode, a side-effecting tool's approval request
-//! arrives over a channel ([`TuiApprover`]) and renders as a modal — `y`/`s`/`n`
-//! — with the same semantics as `cli/approver.rs`'s stdin prompt (still used
-//! by `komo run resume`).
+//! bordered input box. As the agent works, each tool call renders as a live
+//! activity line (`⚙ shell …` → `✓`/`✗` with a result preview) fed by the
+//! turn's [`TurnEvent`] stream — from the in-process executor's event sink in
+//! local mode, or parsed from the gateway's SSE stream in remote mode; the
+//! running tool also shows in the status line. In local mode, a side-effecting
+//! tool's approval request arrives over a channel ([`TuiApprover`]) and renders
+//! as a modal — `y`/`s`/`n` — with the same semantics as `cli/approver.rs`'s
+//! stdin prompt (still used by `komo run resume`).
 //!
 //! Logs: `main.rs::init_tracing` routes tracing to `~/.komo/logs/chat-tui.log`
 //! when it detects the TUI will run — stderr writes would tear the alternate
@@ -30,7 +34,11 @@ use crate::{
     cli::wiring,
     config::ConfigSnapshot,
     domain::{
-        approval::Approver, gateway::ReplySink, repository::SessionRepository, session::Session,
+        approval::Approver,
+        events::{ToolEventSink, TurnEvent},
+        gateway::ReplySink,
+        repository::SessionRepository,
+        session::Session,
     },
     infra::{
         gateway_client::GatewayClient,
@@ -67,14 +75,39 @@ impl Backend {
         session_id: &str,
         input: String,
         ctx: Option<SessionContext>,
+        events: mpsc::UnboundedSender<TurnEvent>,
     ) -> anyhow::Result<String> {
         match self {
-            Backend::Remote(gw) => gw.chat(session_id, &input).await,
+            // Remote turns run server-side; stream their tool events over SSE
+            // and forward each onto the loop's event channel.
+            Backend::Remote(gw) => {
+                gw.chat_streaming(session_id, &input, |ev| {
+                    let _ = events.send(ev);
+                })
+                .await
+            }
+            // Local turns emit tool events through the sink on `ctx` (set by the
+            // caller); the `events` sender is unused on this arm.
             Backend::Local { runtime, .. } => match ctx {
                 Some(ctx) => with_session(ctx, runtime.handle_input(session_id, input)).await,
                 None => runtime.handle_input(session_id, input).await,
             },
         }
+    }
+}
+
+/// A [`ToolEventSink`] that forwards each live [`TurnEvent`] (a tool starting or
+/// finishing) into the TUI event loop's channel for the activity feed. Used by
+/// the local in-process turn; the remote turn feeds the same channel by parsing
+/// the gateway's SSE stream (see [`Backend::turn`]).
+struct TuiEventSink {
+    tx: mpsc::UnboundedSender<TurnEvent>,
+}
+
+impl ToolEventSink for TuiEventSink {
+    fn emit(&self, event: TurnEvent) {
+        // Best-effort: if the loop is gone the send just drops.
+        let _ = self.tx.send(event);
     }
 }
 
@@ -184,6 +217,9 @@ async fn event_loop(
     // Mid-turn agent messages (the `ask_user` question) from the local turn's
     // sink; the sender is also parked so the arm pends in remote mode.
     let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<String>();
+    // Live tool-call events for the activity feed (both backends). The sender is
+    // cloned per turn; this original stays alive so the arm never closes.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
     let mut app = App::new(session);
     let mode = match &backend {
@@ -216,6 +252,10 @@ async fn event_loop(
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         tokio::select! {
+            // Biased so ordering is deterministic: keys stay responsive, and
+            // queued tool events always drain before the final reply — so the
+            // ✓ activity lines never render below the agent's answer.
+            biased;
             maybe_event = events.next() => {
                 let Some(event) = maybe_event.transpose()? else { break };
                 let Event::Key(key) = event else { continue };
@@ -228,12 +268,16 @@ async fn event_loop(
                     Some(Action::Submit(text)) => {
                         app.push(Role::You, text.clone());
                         app.in_flight = true;
+                        // Fresh tool feed for the new turn (seqs restart).
+                        app.begin_tools();
                         let backend = backend.clone();
                         let session_id = app.session_id.clone();
                         let turn_tx = turn_tx.clone();
+                        let events = event_tx.clone();
                         // Local mode: an interactive context whose sink feeds
                         // mid-turn messages into this loop, so `ask_user` can
-                        // question the user; fresh clarify budget per turn.
+                        // question the user; fresh clarify budget per turn. Its
+                        // event sink drives the tool activity feed.
                         let ctx = clarify.as_ref().map(|cl| {
                             cl.begin_turn(&session_id);
                             SessionContext {
@@ -241,12 +285,12 @@ async fn event_loop(
                                 sink: Arc::new(ChannelSink { tx: sink_tx.clone() }),
                                 interactive: true,
                                 auto_approve: false,
-                                event_sink: None,
+                                event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
                             }
                         });
                         tokio::spawn(async move {
                             let result = backend
-                                .turn(&session_id, text, ctx)
+                                .turn(&session_id, text, ctx, events)
                                 .await
                                 .map_err(|e| format!("{e:#}"));
                             let _ = turn_tx.send(result);
@@ -281,10 +325,25 @@ async fn event_loop(
                     Some(Action::Answered(_)) | None => {}
                 }
             }
+            // Live tool-call events (both backends): render each as an activity
+            // line, updating the same line in place when it finishes. Kept above
+            // `turn_rx` (under `biased`) so a turn's events drain before its reply.
+            Some(event) = event_rx.recv() => {
+                match event {
+                    TurnEvent::ToolStarted { seq, name, args } => {
+                        app.tool_started(seq, name, args);
+                    }
+                    TurnEvent::ToolFinished { seq, name, ok, summary } => {
+                        app.tool_finished(seq, name, ok, summary);
+                    }
+                }
+            }
             Some(result) = turn_rx.recv() => {
                 app.in_flight = false;
                 // A question the turn never resolved dies with it.
                 app.awaiting_answer = false;
+                // No tool is running once the turn is done.
+                app.active_tool = None;
                 match result {
                     Ok(reply) => app.push(Role::Agent, reply),
                     Err(error) => app.push(Role::Error, error),

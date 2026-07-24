@@ -46,11 +46,37 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::default());
             continue;
         }
-        let (prefix, style) = match entry.role {
-            Role::You => ("❯ ", Style::new().fg(Color::Cyan)),
-            Role::Agent => ("", Style::new()),
-            Role::Info => ("· ", Style::new().fg(Color::DarkGray)),
-            Role::Error => ("✗ ", Style::new().fg(Color::Red)),
+        // Tool lines carry their glyph/color in `tool_ok` (running vs ✓/✗) and
+        // render the body dimmed so they read as secondary activity.
+        let (prefix, head_style, body_style) = match entry.role {
+            Role::You => (
+                "❯ ",
+                Style::new().fg(Color::Cyan),
+                Style::new().fg(Color::Cyan),
+            ),
+            Role::Agent => ("", Style::new(), Style::new()),
+            Role::Info => (
+                "· ",
+                Style::new().fg(Color::DarkGray),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Role::Error => (
+                "✗ ",
+                Style::new().fg(Color::Red),
+                Style::new().fg(Color::Red),
+            ),
+            Role::Tool => {
+                let (glyph, color) = match entry.tool_ok {
+                    None => ("⚙ ", Color::Cyan),
+                    Some(true) => ("✓ ", Color::Green),
+                    Some(false) => ("✗ ", Color::Red),
+                };
+                (
+                    glyph,
+                    Style::new().fg(color),
+                    Style::new().fg(Color::DarkGray),
+                )
+            }
         };
         for (i, wrapped) in wrap_text(&entry.text, width.saturating_sub(prefix.chars().count()))
             .into_iter()
@@ -62,8 +88,8 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 " ".repeat(prefix.chars().count())
             };
             lines.push(Line::from(vec![
-                Span::styled(head, style.add_modifier(Modifier::BOLD)),
-                Span::styled(wrapped, style),
+                Span::styled(head, head_style.add_modifier(Modifier::BOLD)),
+                Span::styled(wrapped, body_style),
             ]));
         }
         // A blank separator between messages keeps the transcript scannable.
@@ -85,6 +111,18 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(
                 " ❓ 等待你的回答 — 直接输入并回车 ",
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("session {}", app.session_id),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.in_flight && app.active_tool.is_some() {
+        let tool = app.active_tool.as_deref().unwrap_or_default();
+        Line::from(vec![
+            Span::styled(
+                format!(" {} {tool} 运行中… ", SPINNER[app.spinner % SPINNER.len()]),
                 Style::new().fg(Color::Cyan),
             ),
             Span::styled(
@@ -354,5 +392,31 @@ mod tests {
         let content = format!("{:?}", terminal.backend().buffer());
         assert!(content.contains("rm -rf"), "modal summary rendered");
         assert!(content.contains("拒绝"), "modal key hints rendered");
+    }
+
+    /// Headless render smoke for the tool activity feed: a running line shows
+    /// the ⚙ glyph and the "运行中…" status; a finished line shows ✓ and the
+    /// result preview.
+    #[test]
+    fn renders_tool_activity_line() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new("sess-1".into());
+        app.in_flight = true;
+        app.tool_started(0, "shell".into(), "ls /tmp".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains('⚙'), "running glyph rendered");
+        assert!(content.contains("shell"), "tool name rendered");
+        assert!(content.contains("运行中"), "status shows the running tool");
+
+        app.tool_finished(0, "shell".into(), true, "3 entries".into());
+        app.in_flight = false;
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains('✓'), "success glyph rendered");
+        assert!(content.contains("3 entries"), "result preview rendered");
     }
 }

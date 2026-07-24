@@ -8,11 +8,12 @@
 //! dependency-light. The infra layer (the api channel) provides an mpsc-backed
 //! impl; every non-streaming caller leaves the sink absent.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One event emitted during a turn. Serialized to JSON for the SSE stream
-/// (`{"type":"tool_started", ...}`).
-#[derive(Clone, Debug, Serialize)]
+/// (`{"type":"tool_started", ...}`) and deserialized back by the gateway
+/// client that consumes that stream (the chat TUI's live tool feed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnEvent {
     /// A tool call is about to run.

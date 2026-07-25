@@ -1,6 +1,8 @@
 import { MessagePrimitive, type ToolCallMessagePartProps } from "@assistant-ui/react";
+import { ChevronRightIcon } from "lucide-react";
 
 import { MarkdownText } from "@/shared/assistant-ui/markdown-text";
+import { cn } from "@/shared/lib/utils";
 
 export function UserMessage() {
   return (
@@ -41,23 +43,26 @@ export function ToolCallView({
     typeof result === "string" ? result : result == null ? "" : JSON.stringify(result, null, 2);
 
   return (
-    <details className="my-1 overflow-hidden rounded-lg border border-border bg-muted">
-      <summary className="flex items-center gap-2 px-3 py-2 text-sm select-none">
-        <span className={isError ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"}>
-          {isError ? "✗" : "✓"}
-        </span>
-        <span className="font-mono font-semibold text-foreground">{title}</span>
-        {action && <span className="text-xs text-muted-foreground">{action}</span>}
+    // Deliberately chrome-less: a tool call is context for the reply, not the
+    // reply. One quiet line that expands in place — no card, no fill, and the
+    // disclosure arrow is the only affordance.
+    <details className="group/tool my-0.5">
+      <summary
+        className={cn(
+          "flex list-none items-center gap-1.5 py-0.5 text-xs transition-colors [&::-webkit-details-marker]:hidden",
+          isError ? "text-destructive" : "text-muted-foreground hover:text-foreground",
+        )}
+      >
+        <ChevronRightIcon className="size-3 shrink-0 transition-transform group-open/tool:rotate-90" />
+        <span className="truncate font-mono">{title}</span>
+        {action && <span className="truncate opacity-70">{action}</span>}
+        {isError && <span className="shrink-0">失败</span>}
       </summary>
       {(detail || output) && (
-        <div className="grid gap-2 border-t border-border px-3 py-2 text-xs">
-          {detail && (
-            <pre className="break-all whitespace-pre-wrap text-muted-foreground">{detail}</pre>
-          )}
+        <div className="mt-1 mb-1.5 ml-1.5 grid gap-1.5 border-l border-border pl-3 text-xs text-muted-foreground">
+          {detail && <pre className="break-all whitespace-pre-wrap">{detail}</pre>}
           {output && (
-            <pre className="max-h-64 overflow-auto break-all whitespace-pre-wrap text-muted-foreground">
-              {output}
-            </pre>
+            <pre className="max-h-64 overflow-auto break-all whitespace-pre-wrap">{output}</pre>
           )}
         </div>
       )}

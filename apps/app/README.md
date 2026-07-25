@@ -70,8 +70,9 @@ Hard rules, enforced by `bun run lint` (`apps/scripts/check-tokens.mjs`):
   No `text-[13px]`, no `rounded-[12px]`.
 - The theme has no success/warning token, so status colors are the **one**
   sanctioned use of a Tailwind ramp: the `ok` / `warn` variants in
-  `shared/ui/badge.tsx`, plus the tool ✓ in `features/chat/messages.tsx` and the
-  connection dot in `features/sessions/SessionList.tsx`.
+  `shared/ui/badge.tsx` and the connection dot in
+  `features/sessions/SessionList.tsx`. Everywhere else a failure uses
+  `text-destructive` and success gets no color at all.
 
 `components.json` lives here (not in a host), with aliases pointing at
 `@/shared/ui` and `@/shared/lib/utils`, so `bunx shadcn add <component>` writes

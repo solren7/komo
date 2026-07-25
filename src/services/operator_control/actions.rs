@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::domain::cron::{
     CronAction, CronJob, CronJobRepository, CronJobSpec, DEFAULT_CRON_JOB_TIMEOUT_SECS,
+    MAX_CRON_JOB_NAME_LEN, valid_cron_job_name,
 };
 use crate::domain::home::HomeRepository;
 use crate::domain::memory::{
@@ -229,6 +230,15 @@ pub async fn add_cron_job(
     let name = spec.name.trim();
     if name.is_empty() {
         anyhow::bail!("a cron job needs a name");
+    }
+    // A name is a key (every `komo cron` subcommand, and an agent job's session
+    // id) — keep it key-shaped. Matters most on the agent's `cron` tool path,
+    // where the name is model-authored.
+    if !valid_cron_job_name(name) {
+        anyhow::bail!(
+            "invalid job name `{name}`: no whitespace or `:` `/` `\\`, at most \
+             {MAX_CRON_JOB_NAME_LEN} characters"
+        );
     }
     // Normalize + validate the action per kind.
     let action = match spec.action {

@@ -14,8 +14,8 @@ use crate::{
     },
     config::ConfigSnapshot,
     domain::{
-        approval::Approver, llm::LlmClient, memory::MemoryRepository, repository::SkillRepository,
-        reviewer::Reviewer, workspace::Workspace,
+        approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
+        repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
     },
     infra::{
         llm::{PreambleFn, build_llm},
@@ -30,7 +30,7 @@ use crate::{
         tool_execution::{ToolExecutionConfig, ToolExecutor},
     },
     tools::{
-        ask_user::AskUserTool, delegate::DelegateTool, file::FileTool,
+        ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool, file::FileTool,
         homeassistant::HomeAssistantTool, memory::MemoryTool, reminder::ReminderTool,
         session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
         todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
@@ -64,14 +64,20 @@ pub struct Wiring {
     pub cron_runtime: Arc<AgentRuntime>,
 }
 
-/// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
-/// tasks, a separate file), gating side-effecting tools through `approver`.
-/// Every setting comes from the caller's one resolved `config` snapshot —
-/// wiring never re-reads config.toml, the env, or `.env`.
+/// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
+/// tasks, a separate file) and `cron_jobs` (durable scheduled jobs, ditto),
+/// gating side-effecting tools through `approver`. Every setting comes from the
+/// caller's one resolved `config` snapshot — wiring never re-reads config.toml,
+/// the env, or `.env`.
+///
+/// The stores are passed in rather than opened here because Turso takes an
+/// exclusive lock per file: the gateway already holds all three open and must
+/// hand its own handles over.
 pub async fn build(
     config: &ConfigSnapshot,
     db: Arc<Db>,
     kanban: Arc<KanbanDb>,
+    cron_jobs: Arc<dyn CronJobRepository>,
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
     // An unusable model selection (bad KOMO_* value, unknown provider,
@@ -180,6 +186,10 @@ pub async fn build(
         tools.register(Arc::new(WebSearchTool::new()));
         tools.register(Arc::new(SessionTool::new(db.clone())));
         tools.register(Arc::new(ReminderTool::new(db.clone())));
+        // Scheduled jobs from inside a conversation. Every mutation is gated
+        // through this tool set's approver — a chat-authored job is
+        // model-authored, unlike one added with `komo cron add`.
+        tools.register(Arc::new(CronTool::new(cron_jobs.clone(), approver.clone())));
         tools.register(Arc::new(TaskTool::new(kanban.clone())));
         tools.register(Arc::new(TodoTool::new(db.clone())));
         tools.register(Arc::new(AskUserTool::new(clarify.clone())));

@@ -54,6 +54,21 @@ const REMINDER_GUIDANCE: &str = "You CAN schedule reminders: call the `reminder`
     expression via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's \
     local timezone. One-shot reminders use `after` or `at` as before.";
 
+/// Gated on the `cron` tool. Its job is the routing decision: a recurring ask
+/// is a *job* when it needs work done, and a reminder only when a message is the
+/// whole point.
+const CRON_GUIDANCE: &str = "You CAN schedule recurring work: call the `cron` tool \
+    (action=add) with a name, a 5-field cron `schedule` in the user's local timezone, \
+    and a `prompt` — an agent job runs that prompt as a full turn with your tools \
+    each time it fires. Choose between the two schedulers by what has to happen: \
+    \"每天8点告诉我今天的日程\" or \"每周五跑一下轮换脚本\" needs work done, so it is a \
+    cron job; \"提醒我下午3点开会\" only needs a message delivered, so it is a \
+    `reminder`. Write the prompt self-contained — the scheduled turn has none of \
+    this conversation's history — and use action=list/disable/enable/remove to \
+    inspect and adjust existing jobs instead of adding near-duplicates. Jobs fire \
+    only while `komo gateway` runs, their output is delivered to the user's home \
+    channel rather than here, and creating or changing one asks the user to approve.";
+
 /// Gated on the `ask_user` tool.
 const CLARIFY_GUIDANCE: &str = "When a key parameter is ambiguous, the target of an \
     action is unclear, or an irreversible action's intent is uncertain, ask first: \
@@ -242,6 +257,9 @@ impl SystemPromptBuilder {
         if self.has("reminder") {
             parts.push(REMINDER_GUIDANCE.to_string());
         }
+        if self.has("cron") {
+            parts.push(CRON_GUIDANCE.to_string());
+        }
         if self.has("ask_user") {
             parts.push(CLARIFY_GUIDANCE.to_string());
         }
@@ -406,6 +424,17 @@ mod tests {
         assert!(p.contains("schedule reminders"));
         assert!(p.contains("tmux ls")); // state guidance, via `memory`
         assert!(p.contains("`time` tool"));
+        // `cron` wasn't loaded, so its scheduler-routing guidance stays out.
+        assert!(!p.contains("schedule recurring work"));
+    }
+
+    #[test]
+    fn cron_guidance_appears_only_with_the_cron_tool() {
+        let p = SystemPromptBuilder::new(&config())
+            .home(tmp("cron"))
+            .tools(vec!["cron".into()])
+            .build();
+        assert!(p.contains("schedule recurring work"));
     }
 
     #[test]

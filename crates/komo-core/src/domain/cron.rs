@@ -4,11 +4,16 @@
 //! Jobs live in their own durable store (`~/.komo/cron.db`) — not in
 //! `config.toml`, because an operator can accumulate many of them, and not in
 //! the disposable `state.db`, because a job silently vanishing on a state reset
-//! means its work silently stops happening. The command is **operator-authored**
+//! means its work silently stops happening. A command job is **operator-authored**
 //! (added via `komo cron add` or the loopback-gated api) — the same trust
 //! boundary as running `komo gateway` itself — so execution is direct: no shell
-//! tool, no approver, no `[policy]` involvement. Anything needing LLM judgment
-//! belongs in an agent sweep (like the briefing), not here.
+//! tool, no approver, no `[policy]` involvement at fire time.
+//!
+//! A job created in conversation through the agent's `cron` tool is
+//! *model*-authored, so that path moves the human decision to creation time: the
+//! tool gates every mutation through the `Approver` (a command job prominently,
+//! since approving it approves every future execution). By the time a job is in
+//! the store the sweep treats both origins identically.
 
 use async_trait::async_trait;
 
@@ -151,6 +156,24 @@ impl CronJob {
     }
 }
 
+/// Longest job name accepted. Names appear in notification titles, `komo cron`
+/// listings and the per-run session id, so an essay is never one.
+pub const MAX_CRON_JOB_NAME_LEN: usize = 64;
+
+/// Shape floor for a job name. A name is a key: it identifies the job in every
+/// `komo cron` subcommand and becomes part of an agent job's session id
+/// (`cron:<name>:<unix>`), so whitespace and the separators that structure those
+/// strings are refused. Everything else — including CJK — is allowed, because a
+/// name is for the operator to read. Enforced in the shared create action, so
+/// the CLI, the api channel and the agent's `cron` tool agree.
+pub fn valid_cron_job_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_CRON_JOB_NAME_LEN
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '/' | '\\'))
+}
+
 /// The operator's request to create a job (`komo cron add` / `POST
 /// /api/cron/add`). Validation and `next_run_at` computation happen in the
 /// shared operator action, not here.
@@ -217,6 +240,28 @@ mod tests {
         assert!(!job.is_due(99));
         job.enabled = false;
         assert!(!job.is_due(200), "a disabled job is never due");
+    }
+
+    #[test]
+    fn job_names_must_stay_key_shaped() {
+        assert!(valid_cron_job_name("morning-brief"));
+        assert!(valid_cron_job_name("weekly_alarm.rotation"));
+        // A name is for the operator to read, so CJK is fine.
+        assert!(valid_cron_job_name("每日简报"));
+        assert!(!valid_cron_job_name(""));
+        assert!(
+            !valid_cron_job_name("morning brief"),
+            "whitespace splits it"
+        );
+        assert!(
+            !valid_cron_job_name("cron:brief"),
+            "`:` structures the session id"
+        );
+        assert!(!valid_cron_job_name("a/b"));
+        assert!(!valid_cron_job_name("a\\b"));
+        assert!(!valid_cron_job_name("a\nb"));
+        assert!(!valid_cron_job_name(&"x".repeat(MAX_CRON_JOB_NAME_LEN + 1)));
+        assert!(valid_cron_job_name(&"x".repeat(MAX_CRON_JOB_NAME_LEN)));
     }
 
     #[test]

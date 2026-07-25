@@ -227,9 +227,10 @@ within a minute, no restart. The sweep **claims before running** (advances
 `next_run_at` first), so a crash mid-run never re-fires a slot and a
 longer-than-a-minute job is never double-started; a gateway asleep over a slot
 runs the job late, once (computed from now, like recurring reminders).
-Validation (cron parse, unique name, per-kind required fields) lives in the
-shared operator action (`operator_control/actions.rs::add_cron_job`), so the CLI
-and api paths can't fork; `komo cron` works with the gateway up (routed to
+Validation (cron parse, key-shaped unique name — `domain::cron::valid_cron_job_name`
+— per-kind required fields) lives in the
+shared operator action (`operator_control/actions.rs::add_cron_job`), so the CLI,
+api, and `cron`-tool paths can't fork; `komo cron` works with the gateway up (routed to
 `/api/cron/*`; writes loopback-gated) or down (direct `cron.db` open). Every
 outcome is delivered, success and failure alike, and recorded on the job
 (`last_status`/`last_error`, shown in `komo cron list` and `komo doctor`) — a
@@ -237,6 +238,23 @@ failed command/turn still returns `Ok` (the operator was told; breaker cooldowns
 are meaningless on a weekly cron), only delivery failure fails the cycle. Command
 jobs aren't run-ledgered (sweeps run outside any session); agent jobs are (they
 run a real turn on `cron_runtime`, so `komo run list` shows them).
+
+**Scheduling from a conversation** (`tools/cron.rs::CronTool`): the same store,
+the agent's surface — `list` / `add` / `remove` / `enable` / `disable` / `run`,
+over the same shared operator actions, so a chat-created job is indistinguishable
+from a `komo cron add` one once stored. What differs is *authorship*: a CLI job
+is operator-authored by construction, a chat job is model-authored, so the tool
+moves the human decision to creation time and gates every mutation through the
+`Approver` — an agent job at `Risk::Normal` (scope `cron:add`), management
+actions at `Risk::Normal` (scope `cron:manage`), and a **command** job at
+`Risk::Dangerous` carrying an `ActionRef::Shell` (approving it approves every
+future unattended execution, and no ordinary shell *allow* rule can grant it —
+`include_dangerous` is required, while a shell deny rule still fences it). The
+tool is part of `build_full_tools`, so the unattended `cron_runtime` has it too:
+a job can reschedule itself, subject to the same `unattended = true` policy gate
+as any other side effect. `CRON_GUIDANCE` in the system prompt owns the routing
+rule the model needs — recurring *work* is a cron job, a recurring *message* is a
+`reminder`.
 
 The `codex` provider (`provider = "codex"`) is the exception to the API-key
 rule: it has no env key, authenticating instead from the Codex CLI's OAuth login

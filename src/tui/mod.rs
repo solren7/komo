@@ -42,7 +42,7 @@ use crate::{
     },
     infra::{
         gateway_client::GatewayClient,
-        persistence::{db::Db, kanban::KanbanDb},
+        persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
     },
     services::{
         clarify::ClarifyState,
@@ -179,8 +179,12 @@ async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
     }
     let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
     let kanban = Arc::new(KanbanDb::connect(&config.runtime.kanban_db_url).await?);
+    // No gateway is running (we'd have taken the remote path above), so opening
+    // cron.db here can't collide with its exclusive lock. Jobs the user
+    // schedules from this session fire once a gateway comes up.
+    let cron_jobs = Arc::new(CronDb::connect(&config.runtime.cron_db_url).await?);
     let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(tx.clone()));
-    let wired = wiring::build(config, db.clone(), kanban, approver).await?;
+    let wired = wiring::build(config, db.clone(), kanban, cron_jobs, approver).await?;
     Ok(Connected {
         backend: Backend::Local {
             runtime: Arc::new(wired.runtime),

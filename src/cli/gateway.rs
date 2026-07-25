@@ -87,7 +87,14 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
     let approvals = Arc::new(ApprovalState::new());
     let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
-    let wired = wiring::build(config, db.clone(), kanban.clone(), approver).await?;
+    let wired = wiring::build(
+        config,
+        db.clone(),
+        kanban.clone(),
+        cron_jobs.clone(),
+        approver,
+    )
+    .await?;
 
     let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
         review: wired.review.clone(),

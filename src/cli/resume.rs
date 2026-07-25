@@ -17,6 +17,7 @@ use crate::{
     cli::{approver::CliApprover, wiring},
     config::ConfigSnapshot,
     domain::approval::Approver,
+    infra::persistence::cron::CronDb,
     services::operator_control::OperatorControl,
 };
 
@@ -32,7 +33,12 @@ pub async fn run(
             // Same construction as the chat TUI's local mode: interactive
             // approval at the TTY.
             let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
-            let runtime = wiring::build(config, db, kanban, approver).await?.runtime;
+            // This closure only runs on the direct path (no gateway holding the
+            // db locks), so the cron store is ours to open.
+            let cron_jobs = Arc::new(CronDb::connect(&config.runtime.cron_db_url).await?);
+            let runtime = wiring::build(config, db, kanban, cron_jobs, approver)
+                .await?
+                .runtime;
             runtime.handle_input(&session_id, input).await
         })
         .await?;

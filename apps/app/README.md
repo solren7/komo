@@ -21,8 +21,10 @@ Feature-first: everything one screen needs — its components, its queries, its
 src/
   app/          App shell, providers, error boundary. What a host mounts.
   features/
-    chat/       Thread, composer, approval modal, clarify bar, tool feed,
-                turn-orchestrator.ts (one turn, no React), history.ts, api.ts
+    chat/       Thread, composer, approval modal, clarify bar, tool display
+                (ToolCalls.tsx + the live ToolActivityStrip, both over
+                tool-summary.ts), turn-orchestrator.ts (one turn, no React),
+                history.ts, api.ts
     sessions/   Session list, labels.ts, api.ts
     settings/   Settings modal + tabs/, api.ts
     connect/    Browser key-entry gate + where its endpoint is stored
@@ -110,6 +112,8 @@ that is where this app's bugs live:
   malformed payloads, tool vs text frames.
 - `features/chat/history.test.ts` — pairing runs with messages, including a turn
   that produced no assistant reply.
+- `features/chat/tool-summary.test.ts` — what a collapsed round of tool calls
+  says on its one line (count, deduped names, elision, failures).
 - `shared/api/request.test.ts`, `shared/lib/*.test.ts`,
   `features/sessions/labels.test.ts`.
 
@@ -124,3 +128,7 @@ without catching real defects.
 - A turn is one HTTP request that can block for minutes server-side; approval
   and clarify resolve out of band over `/api/interactions/*`. The stream carries
   tool-call frames only — no token deltas — so replies appear all at once.
+- A turn's tool calls collapse to one line per turn (`ToolCalls.tsx`), expanding
+  to the call list and then to each call's arguments and result. The live strip
+  during a turn is deliberately the same line, so nothing jumps when the reply
+  lands and the message takes the round over.

@@ -4,7 +4,21 @@ import { CornerDownLeftIcon, SquareIcon } from "lucide-react";
 import { cn } from "@/shared/lib/utils";
 import { buttonVariants } from "@/shared/ui/button";
 
-const ACTION = cn(buttonVariants({ size: "icon-sm" }));
+// Both corner buttons are icon-only and chrome-less: no fill at rest, none on
+// hover either (ghost's own `hover:bg-muted` is overridden in both schemes) —
+// hovering only lifts the color. `buttonVariants` still supplies the sizing,
+// focus ring and `disabled:opacity-50`.
+const CORNER_ACTION = "hover:bg-transparent dark:hover:bg-transparent hover:text-foreground";
+
+// Send is the *redundant* affordance — Enter already sends — so it sits back at
+// muted. Stop is the only pointer route to interrupting a reply, so it stays at
+// full foreground weight while it's showing.
+const SEND = cn(
+  buttonVariants({ variant: "ghost", size: "icon-sm" }),
+  CORNER_ACTION,
+  "text-muted-foreground",
+);
+const STOP = cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), CORNER_ACTION);
 
 /** The composer.
  *
@@ -33,16 +47,15 @@ export function Composer() {
         />
         <div className="absolute right-2 bottom-2">
           <AuiIf condition={(s) => !s.thread.isRunning}>
-            <ComposerPrimitive.Send className={ACTION} title="发送（Enter）">
-              <CornerDownLeftIcon />
+            <ComposerPrimitive.Send className={SEND} title="发送（Enter）">
+              <CornerDownLeftIcon className="size-3.5" />
             </ComposerPrimitive.Send>
           </AuiIf>
           <AuiIf condition={(s) => s.thread.isRunning}>
-            <ComposerPrimitive.Cancel
-              className={cn(buttonVariants({ variant: "secondary", size: "icon-sm" }))}
-              title="中断回复"
-            >
-              <SquareIcon className="fill-current" />
+            <ComposerPrimitive.Cancel className={STOP} title="中断回复">
+              {/* Small but filled: a solid square is the universal stop glyph,
+                  and at this size it reads without weighing the corner down. */}
+              <SquareIcon className="size-3 fill-current" />
             </ComposerPrimitive.Cancel>
           </AuiIf>
         </div>

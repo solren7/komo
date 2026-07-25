@@ -18,7 +18,13 @@
     "unicorn/no-array-reverse": "off",
     "unicorn/consistent-function-scoping": "off",
     "unicorn/require-module-specifiers": "off",
-    "promise/always-return": "off"
+    "promise/always-return": "off",
+    "no-underscore-dangle": [
+      "warn",
+      {
+        "allow": ["__KOMO_DEV_PROXY_TARGET__"]
+      }
+    ]
   },
   "ignorePatterns": ["**/dist/**", "**/node_modules/**", "**/target/**"]
 }

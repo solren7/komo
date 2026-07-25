@@ -10,6 +10,10 @@ declare global {
       gateway(): Promise<Gateway | null>;
     };
   }
+
+  /** Injected by electron.vite.config.ts: the gateway the dev server proxies
+   *  to, or null (production build, or no gateway found at dev-server start). */
+  const __KOMO_DEV_PROXY_TARGET__: string | null;
 }
 
 export {};

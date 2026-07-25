@@ -27,9 +27,11 @@ points Tailwind at this host's source.
 
 ## Run (dev)
 
-The gateway has no CORS layer, so a cross-origin dev browser must go through the
-Vite proxy. Run a gateway with `[channels.api] enabled = true` on a fixed port,
-then point the dev server at it:
+The gateway grants CORS to loopback origins, so a dev browser can reach it
+directly — but going through the Vite proxy keeps dev same-origin (and works
+regardless of which port the gateway is on). Run a gateway with
+`[channels.api] enabled = true` on a fixed port, then point the dev server at
+it:
 
 ```bash
 cd apps && bun install

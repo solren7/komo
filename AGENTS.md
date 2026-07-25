@@ -132,12 +132,21 @@ history) and `X-Komo-Trusted` (the gateway runs the turn with
 `SessionContext::trusted` → side-effecting tools **auto-approve**, since the CLI
 user is the host operator; gated to **loopback** callers, so a publicly-bound api
 never gets it). `/pair approve` in chat remains the other in-gateway admission
-path. The api channel is loopback-only on an ephemeral port by default;
+path. A **CORS layer** (`infra/messaging/api.rs::cors_layer`, applied outermost so a
+preflight is answered before the bearer-key middleware could 401 it) grants
+loopback page origins — plus the opaque `null` origin a packaged Electron
+renderer sends from `file://`. Without it the desktop/web renderers, which do
+their HTTP from the renderer process, can't reach the gateway at all unless they
+happen to be same-origin with it. Credentials are off and only loopback origins
+are granted, so the bearer key stays the only thing that admits a caller.
+
+The api channel is loopback-only on an ephemeral port by default;
 `[channels.api] enabled = true` widens it to an external bind/port (requires
 `API_SERVER_KEY`) for Open WebUI / the dashboard. Two further `[channels.api]`
 options serve the web client (`apps/web`): `web_dir = "…/apps/web/dist"` serves
 that built SPA same-origin as the router's fallback (static assets are public,
-like `/health`; `/api` + `/v1` stay key-gated — so no CORS is involved), and
+like `/health`; `/api` + `/v1` stay key-gated — served this way the SPA is
+same-origin, so CORS never enters into it), and
 `remote_interactive = true` lets **keyed remote** (non-loopback) callers run
 interactive turns (`X-Komo-Interactive`) and resolve approval/clarify prompts
 over `/api/interactions/*` (off by default — those assume a host operator behind

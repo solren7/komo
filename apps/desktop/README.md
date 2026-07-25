@@ -33,6 +33,16 @@ implementation with a desktop-specific gateway resolver:
   shared stylesheet and points Tailwind at this host's source. The renderer
   stays sandboxed (`contextIsolation`, no node integration).
 
+Because the renderer does its own HTTP, **the page origin matters**: packaged,
+it is `file://` (origin `null`) and requests go straight to loopback, which the
+gateway's CORS layer grants; in dev the renderer is served by Vite on
+`127.0.0.1:5273`, so `electron.vite.config.ts` proxies `/api`, `/v1` and
+`/health` to whatever `~/.komo/gateway.json` advertised when the dev server
+started, and the renderer talks same-origin through that proxy. If the gateway
+restarts on a new port mid-session the proxy target goes stale, so the renderer
+compares it against the live rendezvous and goes direct (via CORS) when they
+differ — no dev-server restart needed.
+
 Unlike the earlier REST-over-IPC design, the bearer key now lives in the
 renderer — the deliberate trade for sharing one client with the web build (where
 the key must reach the browser regardless). The renderer is sandboxed and the

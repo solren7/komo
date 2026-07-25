@@ -20,6 +20,14 @@
 //!
 //! Auth is a single bearer key (`API_SERVER_KEY`); the listener binds loopback
 //! by default. `/health` is unauthenticated so a probe can check liveness.
+//!
+//! A **CORS layer** ([`cors_layer`]) allows browser clients whose page origin
+//! isn't this port: the Electron renderer (a Vite dev origin in development,
+//! `file://` — origin `null` — when packaged) and a cross-origin browser dev
+//! server. Without it those fetches are blocked before auth ever runs, since a
+//! request carrying `Authorization` is preflighted and the preflight would hit
+//! the bearer-key middleware. Only loopback origins are allowed and credentials
+//! are off, so the bearer key remains the sole thing that grants access.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -28,7 +36,10 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderName, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -39,7 +50,10 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -179,6 +193,63 @@ impl Channel for ApiChannel {
     }
 }
 
+/// Is this `Origin` a local page? Loopback hosts on any port, plus the opaque
+/// `null` origin a packaged Electron renderer sends from `file://`.
+fn is_local_origin(origin: &HeaderValue) -> bool {
+    let Ok(text) = origin.to_str() else {
+        return false;
+    };
+    // Packaged Electron loads the renderer over file://, whose origin is opaque.
+    if text == "null" {
+        return true;
+    }
+    let Some(host_port) = text
+        .strip_prefix("http://")
+        .or_else(|| text.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    // Bracketed IPv6 (`[::1]:5273`) keeps its colons inside the brackets.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((host, _)) => host,
+            None => return false,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// CORS for local browser clients. Applied as the **outermost** layer so a
+/// preflight is answered here and never reaches [`require_auth`] (which would
+/// 401 it, blocking the real request that follows).
+///
+/// Deliberately narrow: loopback/`null` origins only, no credentials (the key
+/// travels in a header, not a cookie), and the small fixed set of headers this
+/// API reads. A page on the open web gets no CORS grant — and even a local one
+/// still needs the bearer key.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _parts| {
+            is_local_origin(origin)
+        }))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static("x-komo-session-id"),
+            HeaderName::from_static("x-komo-trusted"),
+            HeaderName::from_static("x-komo-interactive"),
+        ])
+        .max_age(std::time::Duration::from_secs(600))
+}
+
 /// Build the router: `/health` and (if configured) the static web SPA are
 /// public; everything else sits behind the bearer-key middleware.
 fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
@@ -255,7 +326,8 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         router = router.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)));
     }
 
-    router.with_state(state)
+    // Outermost: preflights are answered before auth/loopback gating runs.
+    router.layer(cors_layer()).with_state(state)
 }
 
 /// Gate the interactive-resolution endpoints: always allow loopback (the local
@@ -1153,6 +1225,92 @@ mod tests {
         let (id, stateful) = resolve_session(&headers);
         assert_eq!(id, "api:panel-1");
         assert!(stateful);
+    }
+
+    #[test]
+    fn local_origins_are_allowed_for_cors() {
+        for origin in [
+            "http://127.0.0.1:5273", // Electron renderer, vite dev
+            "http://localhost:5274", // web build, vite dev
+            "http://[::1]:5273",     // IPv6 loopback
+            "http://127.0.0.2:8080", // any loopback address
+            "null",                  // packaged Electron (file://)
+        ] {
+            assert!(
+                is_local_origin(&HeaderValue::from_static(origin)),
+                "{origin} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_origins_are_refused_for_cors() {
+        for origin in [
+            "https://evil.example",
+            "http://127.0.0.1.evil.example", // loopback as a subdomain label
+            "http://192.168.1.20:5273",      // LAN, not loopback
+            "file://",                       // not an origin we grant
+            "ws://127.0.0.1:5273",           // only http(s) is granted
+            "http://[::1",                   // malformed
+        ] {
+            assert!(
+                !is_local_origin(&HeaderValue::from_static(origin)),
+                "{origin} should be refused"
+            );
+        }
+    }
+
+    /// A router shaped like the real one: a protected route whose auth layer
+    /// rejects everything, with the CORS layer outermost.
+    fn cors_test_router() -> Router {
+        Router::new()
+            .route("/api/status", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn(
+                |_req: Request, _next: Next| async move { StatusCode::UNAUTHORIZED },
+            ))
+            .layer(cors_layer())
+    }
+
+    fn preflight(origin: &str) -> Request {
+        Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/status")
+            .header("origin", origin)
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "authorization")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preflight_is_answered_before_auth() {
+        use tower::ServiceExt;
+
+        // The whole point of layering CORS outermost: an `Authorization`-bearing
+        // request is preflighted, and if the preflight reached the bearer-key
+        // middleware it would 401 — killing the real request behind it.
+        let res = cors_test_router()
+            .oneshot(preflight("http://127.0.0.1:5273"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("access-control-allow-origin").unwrap(),
+            "http://127.0.0.1:5273"
+        );
+        let allowed = res.headers().get("access-control-allow-headers").unwrap();
+        assert!(allowed.to_str().unwrap().contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn preflight_from_a_remote_origin_gets_no_grant() {
+        use tower::ServiceExt;
+
+        let res = cors_test_router()
+            .oneshot(preflight("https://evil.example"))
+            .await
+            .unwrap();
+        assert!(res.headers().get("access-control-allow-origin").is_none());
     }
 
     #[test]

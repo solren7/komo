@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AssistantRuntimeProvider,
+  AuiIf,
   ThreadPrimitive,
   useLocalRuntime,
   type ChatModelAdapter,
@@ -107,16 +108,16 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
       <div className="flex min-h-0 flex-1 flex-col">
         <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-5">
-            <ThreadPrimitive.Empty>
+            <AuiIf condition={(s) => s.thread.isEmpty}>
               <div className="flex flex-1 items-center justify-center py-10 text-muted-foreground">
                 开始和 komo 对话…
               </div>
-            </ThreadPrimitive.Empty>
+            </AuiIf>
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
-            <ThreadPrimitive.If running>
+            <AuiIf condition={(s) => s.thread.isRunning}>
               <ToolActivityStrip tools={tools} />
               <div className="px-1 text-sm italic text-muted-foreground">komo 正在思考…</div>
-            </ThreadPrimitive.If>
+            </AuiIf>
           </ThreadPrimitive.Viewport>
 
           {question && <ClarifyBar question={question} onAnswer={answer} />}

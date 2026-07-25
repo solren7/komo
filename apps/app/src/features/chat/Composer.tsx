@@ -1,8 +1,4 @@
-import {
-  ComposerPrimitive,
-  ThreadPrimitive,
-  unstable_useComposerInputHistory,
-} from "@assistant-ui/react";
+import { AuiIf, ComposerPrimitive, unstable_useComposerInputHistory } from "@assistant-ui/react";
 import { CornerDownLeftIcon, SquareIcon } from "lucide-react";
 
 import { cn } from "@/shared/lib/utils";
@@ -36,19 +32,19 @@ export function Composer() {
           placeholder="给 komo 发消息…（Enter 发送 · Shift+Enter 换行 · ↑ 召回历史）"
         />
         <div className="absolute right-2 bottom-2">
-          <ThreadPrimitive.If running={false}>
+          <AuiIf condition={(s) => !s.thread.isRunning}>
             <ComposerPrimitive.Send className={ACTION} title="发送（Enter）">
               <CornerDownLeftIcon />
             </ComposerPrimitive.Send>
-          </ThreadPrimitive.If>
-          <ThreadPrimitive.If running>
+          </AuiIf>
+          <AuiIf condition={(s) => s.thread.isRunning}>
             <ComposerPrimitive.Cancel
               className={cn(buttonVariants({ variant: "secondary", size: "icon-sm" }))}
               title="中断回复"
             >
               <SquareIcon className="fill-current" />
             </ComposerPrimitive.Cancel>
-          </ThreadPrimitive.If>
+          </AuiIf>
         </div>
       </div>
     </ComposerPrimitive.Root>

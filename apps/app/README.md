@@ -93,7 +93,7 @@ Three layers, deliberately separate:
   it reports, which is what makes the timing behaviour testable.
 
 Interrupting (the composer's stop button) takes all three of: aborting the
-request, `POST /api/interactions/{session}/cancel` so the *agent* stops too (the
+request, `POST /api/interactions/{session}/cancel` so the _agent_ stops too (the
 gateway runs the turn on its own task — hanging up doesn't reach it), and
 surfacing an `AbortError` so the runtime marks the message cancelled rather than
 failed. A tool call already running still finishes.

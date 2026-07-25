@@ -7,6 +7,15 @@
 // eventually returns the final reply. Tool-call frames arrive live on the
 // stream and fold into an activity list.
 //
+// Interrupting is part of that, and it takes three things — anything less looks
+// like a stop button that doesn't stop:
+//   1. abort the request, so the stream and the poll stop locally;
+//   2. POST the gateway's cancel endpoint, so the *agent* stops too — the turn
+//      runs on a spawned task server-side, so hanging up alone leaves it going;
+//   3. surface an AbortError, so the runtime marks the message cancelled rather
+//      than failed.
+// The one thing it cannot stop is a tool call already executing; that finishes.
+//
 // Everything here is injectable (client + sleep), which is what makes the
 // timing behaviour testable — see turn-orchestrator.test.ts.
 
@@ -50,6 +59,8 @@ export interface TurnHooks {
 
 export interface TurnDeps {
   client: KomoClient;
+  /** The runtime's per-run signal. Aborted when the user hits stop. */
+  signal?: AbortSignal;
   /** Interval between interaction polls (overridden in tests). */
   pollMs?: number;
   /** Abortable delay (overridden in tests). */
@@ -65,6 +76,13 @@ export interface TurnRequest {
 export interface TurnResult {
   reply: string;
   tools: ToolActivity[];
+}
+
+/** Tell the gateway to stop the turn. Fire-and-forget: the request is already
+ *  aborted by the time this runs, so there is nobody to report a failure to —
+ *  and a failed cancel just means the turn finishes on its own. */
+function requestServerCancel(session: string, client: KomoClient): void {
+  void client.api({ path: `${interactionsPath(session)}/cancel`, method: "POST" }).catch(() => {});
 }
 
 /** Poll for pending approvals/questions until aborted. A single failure is
@@ -111,6 +129,11 @@ export async function runTurn(
   hooks.onTools?.(tools);
 
   const controller = new AbortController();
+  const stopOnAbort = () => {
+    controller.abort();
+    requestServerCancel(req.session, resolved.client);
+  };
+  deps.signal?.addEventListener("abort", stopOnAbort, { once: true });
   const poll = pollInteractions(req.session, hooks, resolved, controller.signal).catch(() => {
     /* a poll must never fail the turn */
   });
@@ -122,14 +145,22 @@ export async function runTurn(
         message: req.message,
         mode: req.mode,
       },
-      (event) => {
-        tools = foldToolEvent(tools, event);
-        hooks.onTools?.(tools);
+      {
+        onToolEvent: (event) => {
+          tools = foldToolEvent(tools, event);
+          hooks.onTools?.(tools);
+        },
+        signal: deps.signal,
       },
     );
+    // An interrupt must surface as an AbortError: that is what tells the runtime
+    // the message was *cancelled* rather than failed (anything else renders as
+    // an error bubble).
+    if (deps.signal?.aborted) throw new DOMException("turn cancelled", "AbortError");
     if (!res.ok) throw new Error(res.error || "请求失败");
     return { reply: res.reply ?? "", tools };
   } finally {
+    deps.signal?.removeEventListener("abort", stopOnAbort);
     controller.abort();
     await poll;
     hooks.onApproval?.(null);

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::domain::approval::{ApprovalRequest, Approver};
+use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::ReplySink;
 use crate::domain::run::RunRepository;
@@ -42,6 +43,11 @@ pub struct SessionContext {
     /// as each tool starts and finishes. `None` for every ordinary turn — no
     /// watcher, no emission. Attached via [`with_event_sink`](Self::with_event_sink).
     pub event_sink: Option<Arc<dyn ToolEventSink>>,
+    /// Optional cancellation signal for this turn. Set when the caller has a way
+    /// to ask for a stop (the api channel's `/api/interactions/{session}/cancel`);
+    /// `None` for turns nobody can interrupt — sweeps, cron, aux sub-agents.
+    /// See [`CancelSignal`] for what "cancelled" does and does not stop.
+    pub cancel: Option<Arc<dyn CancelSignal>>,
 }
 
 impl SessionContext {
@@ -56,6 +62,7 @@ impl SessionContext {
             interactive: false,
             auto_approve: false,
             event_sink: None,
+            cancel: None,
         }
     }
 
@@ -72,6 +79,7 @@ impl SessionContext {
             interactive: false,
             auto_approve: true,
             event_sink: None,
+            cancel: None,
         }
     }
 
@@ -89,6 +97,7 @@ impl SessionContext {
             interactive: true,
             auto_approve: false,
             event_sink: None,
+            cancel: None,
         }
     }
 
@@ -97,6 +106,17 @@ impl SessionContext {
     pub fn with_event_sink(mut self, sink: Arc<dyn ToolEventSink>) -> Self {
         self.event_sink = Some(sink);
         self
+    }
+
+    /// Attach a [`CancelSignal`], making this turn interruptible.
+    pub fn with_cancel(mut self, cancel: Arc<dyn CancelSignal>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Has a stop been requested for this turn?
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
     }
 }
 

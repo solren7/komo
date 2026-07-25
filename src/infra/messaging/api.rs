@@ -60,10 +60,11 @@ use crate::{
     agent::{
         daemon::DreamSweep,
         gateway::Channel,
-        interaction::{ApprovalState, Decision, GatewayDispatcher},
+        interaction::{ApprovalState, CancelState, Decision, GatewayDispatcher},
     },
     config::ApiConfig,
     domain::{
+        cancel::{CANCELLED_REPLY, is_cancelled},
         cron::CronJobSpec,
         events::{ToolEventSink, TurnEvent},
         gateway::MessageHandler,
@@ -103,6 +104,10 @@ struct AppState {
     approvals: Arc<ApprovalState>,
     /// Shared with the `ask_user` tool: same, for mid-turn clarify questions.
     clarify: Arc<ClarifyState>,
+    /// Cancellation slots for in-flight interruptible turns, keyed by session.
+    /// Owned here (not shared with the gateway dispatcher) because the api
+    /// channel is the only surface with a stop affordance.
+    cancels: Arc<CancelState>,
     /// Allow keyed remote (non-loopback) callers to run interactive turns and
     /// resolve approval/clarify prompts. Off by default — those paths assume a
     /// host operator behind a loopback socket. `X-Komo-Trusted` (auto-approve)
@@ -142,6 +147,7 @@ impl ApiChannel {
                 home,
                 approvals,
                 clarify,
+                cancels: Arc::new(CancelState::new()),
                 remote_interactive: config.remote_interactive,
             },
         }
@@ -287,6 +293,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
             post(resolve_approval),
         )
         .route("/api/interactions/{session}/answer", post(answer_question))
+        .route("/api/interactions/{session}/cancel", post(cancel_turn))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_interactive_access,
@@ -498,6 +505,11 @@ async fn chat_completions(
     } else {
         SessionContext::detached(&session_id)
     };
+    // Every api turn is interruptible: the caller holds the connection, so it is
+    // the one surface with somewhere to put a stop button. The slot is dropped
+    // when the turn ends (below / in `stream_turn`) so a late cancel can't hit
+    // the next turn's signal.
+    let ctx = ctx.with_cancel(state.cancels.register(&session_id));
 
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7());
     let created = now();
@@ -509,6 +521,7 @@ async fn chat_completions(
         // stream) — this streams the *tool-call process*, which is the point.
         Ok(stream_turn(
             state.handler.clone(),
+            state.cancels.clone(),
             ctx,
             session_id,
             input,
@@ -518,7 +531,12 @@ async fn chat_completions(
         ))
     } else {
         // Synchronous: drive the turn and await the full reply.
-        let reply = with_session(ctx, state.handler.handle(&session_id, input)).await?;
+        let reply = with_session(ctx, state.handler.handle(&session_id, input)).await;
+        state.cancels.finish(&session_id);
+        let reply = match reply {
+            Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
+            other => other?,
+        };
         Ok(Json(json!({
             "id": id,
             "object": "chat.completion",
@@ -568,8 +586,10 @@ impl ToolEventSink for ChannelEventSink {
 /// (default `message` event) carrying the whole text with `finish_reason:stop`.
 /// The reply is not token-incremental — rig's tool loop has no token stream —
 /// so this streams the tool-call process, not the assistant text.
+#[allow(clippy::too_many_arguments)]
 fn stream_turn(
     handler: Arc<dyn MessageHandler>,
+    cancels: Arc<CancelState>,
     ctx: SessionContext,
     session_id: String,
     input: String,
@@ -585,8 +605,11 @@ fn stream_turn(
     // (this `tx` and the sink's clone inside `ctx`) so the receiver closes.
     tokio::spawn(async move {
         let outcome = with_session(ctx, handler.handle(&session_id, input)).await;
+        cancels.finish(&session_id);
         let final_msg = match outcome {
             Ok(text) => text,
+            // A cancel is the caller's own doing, not a failure to report as one.
+            Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
             Err(error) => format!("请求失败：{error:#}"),
         };
         let _ = tx.send(SseMsg::Final(final_msg));
@@ -1115,6 +1138,30 @@ async fn get_interactions(
     let approval = state.approvals.pending_info(&session);
     let question = state.clarify.pending_question(&session);
     Json(json!({ "approval": approval, "question": question }))
+}
+
+/// Stop the session's in-flight turn.
+///
+/// Order matters: a turn parked on an approval prompt or a clarify question is
+/// not at an await the cancel signal can interrupt, so resolve those first (deny
+/// / a stop answer) and the loop reaches its next cancellation check
+/// immediately, instead of sitting out the 5-minute prompt timeout.
+///
+/// Cancelling stops further rounds and further tool calls; a tool call already
+/// executing runs to completion (see `domain::cancel`). The turn's reply becomes
+/// `CANCELLED_REPLY`, which is what lands in the transcript.
+async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>) -> Json<Value> {
+    let denied = state.approvals.resolve(&session, Decision::Deny);
+    let answered = state.clarify.resolve(&session, CANCELLED_REPLY);
+    let cancelled = state.cancels.cancel(&session);
+    if cancelled {
+        info!(%session, denied, answered, "turn cancelled by client");
+    }
+    Json(json!({
+        "cancelled": cancelled,
+        "denied_pending_approval": denied,
+        "answered_pending_question": answered,
+    }))
 }
 
 #[derive(Deserialize)]

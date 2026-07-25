@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use tracing::{Instrument, info, info_span, warn};
@@ -5,6 +6,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::{
     agent::review_coordinator::{ReviewCoordinator, ReviewTrigger},
     domain::{
+        cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
         llm::{LlmClient, Step, ToolOutcome},
         message::Message,
         repository::{MessageRepository, SessionRepository},
@@ -117,6 +119,14 @@ impl AgentRuntime {
                 run.final_output = truncate(reply, RUN_FIELD_CAP);
                 info!(run_id = %run.id, "run done");
             }
+            Err(error) if is_cancelled(error) => {
+                // Cancelled, not broken: a distinct ledger error so `run list`
+                // reads honestly, and deliberately *not* `recoverable` — there
+                // is nothing to resume, the user asked it to stop.
+                run.status = RunStatus::Failed;
+                run.error = CANCELLED_ERROR.to_string();
+                info!(run_id = %run.id, "run cancelled");
+            }
             Err(error) => {
                 run.status = RunStatus::Failed;
                 run.error = truncate(&format!("{error:#}"), RUN_FIELD_CAP);
@@ -170,10 +180,17 @@ impl AgentRuntime {
                 // the history-window repair only fixes a *leading* assistant
                 // message, not an interior double-user). The stored note is
                 // concise — the full error lives in the run ledger.
-                let note = format!(
-                    "(上一条消息处理失败，未能完成回复：{})",
-                    truncate(&format!("{error:#}"), 400)
-                );
+                //
+                // A user cancel is not a failure, so it gets its own note: the
+                // transcript should read as "I stopped this", not as an error.
+                let note = if is_cancelled(&error) {
+                    CANCELLED_REPLY.to_string()
+                } else {
+                    format!(
+                        "(上一条消息处理失败，未能完成回复：{})",
+                        truncate(&format!("{error:#}"), 400)
+                    )
+                };
                 if let Err(save_err) = self
                     .messages
                     .save(session_id, &Message::assistant(&note))
@@ -210,6 +227,29 @@ impl AgentRuntime {
         Ok(reply)
     }
 
+    /// Await `work`, unless the turn is cancelled first.
+    ///
+    /// `Err(Cancelled)` rather than an `Option` so the loop's control points read
+    /// as one `?` each: a cancel propagates out of the loop like any other turn
+    /// failure, and every layer above tells it apart by downcasting.
+    async fn until_cancelled<T>(
+        cancel: Option<&Arc<dyn CancelSignal>>,
+        work: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let Some(cancel) = cancel else {
+            return work.await;
+        };
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        tokio::select! {
+            // Bias the work: when both are ready, finishing beats discarding.
+            biased;
+            done = work => done,
+            () = cancel.cancelled() => Err(Cancelled.into()),
+        }
+    }
+
     /// komo's own tool-calling loop (roadmap §7 — the loop lives here, not in
     /// rig, so control points can sit between rounds). Drive the model a round
     /// at a time: a [`Step::Final`] ends the turn; [`Step::ToolCalls`] go to the
@@ -228,8 +268,14 @@ impl AgentRuntime {
             // tool chain can't quietly overflow the context window.
             budget: TurnResultBudget::new(self.tool_executor.turn_result_cap()),
         };
+        // Cancellation, if this caller offers a stop. Raced against each await
+        // rather than only checked between rounds: the model round-trip is the
+        // longest wait in a turn and the likeliest thing a user interrupts.
+        let cancel = context.session.cancel.clone();
+        let cancel = cancel.as_ref();
+
         let mut driver = self.llm.begin_turn(session).await?;
-        let mut step = driver.first().await?;
+        let mut step = Self::until_cancelled(cancel, driver.first()).await?;
         let mut rounds = 0usize;
 
         loop {
@@ -253,11 +299,16 @@ impl AgentRuntime {
                         // calls concurrently (order-preserving) and maps tool
                         // errors / unknown names into outcome content the model
                         // can recover from — only a driver/LLM error aborts the
-                        // turn.
-                        self.tool_executor.execute_round(&calls, &context).await
+                        // turn. A cancel here abandons the round's results; the
+                        // calls themselves are spawned and still finish (see
+                        // `domain::cancel`).
+                        Self::until_cancelled(cancel, async {
+                            Ok(self.tool_executor.execute_round(&calls, &context).await)
+                        })
+                        .await?
                     };
 
-                    let next = driver.step(results).await?;
+                    let next = Self::until_cancelled(cancel, driver.step(results)).await?;
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
                     step = if over_budget {
@@ -280,6 +331,7 @@ impl AgentRuntime {
 mod tests {
     use super::*;
     use crate::{
+        agent::interaction::CancelState,
         domain::{
             llm::{LlmClient, Step, ToolCallReq, TurnDriver},
             message::Role,
@@ -409,6 +461,141 @@ mod tests {
             review: None,
         };
         (rt, received)
+    }
+
+    /// A tool that parks until released, so a turn can be cancelled *while* a
+    /// round is in flight rather than only between rounds.
+    struct BlockingTool {
+        released: Arc<tokio::sync::Notify>,
+        started: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &'static str {
+            "block"
+        }
+        fn description(&self) -> &'static str {
+            "parks until released"
+        }
+        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+            self.started.notify_waiters();
+            self.released.notified().await;
+            Ok("released".to_string())
+        }
+    }
+
+    /// A `SessionContext` carrying a cancellation signal, plus its trigger.
+    fn cancellable_ctx(session: &str) -> (SessionContext, Arc<CancelState>) {
+        let cancels = Arc::new(CancelState::new());
+        let ctx = SessionContext::detached(session).with_cancel(cancels.register(session));
+        (ctx, cancels)
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_round_stops_the_turn_and_notes_it_in_the_transcript() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_cancel_mid.db"))
+                .await
+                .unwrap(),
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("block", "{}")]),
+                Step::Final("never reached".into()),
+            ],
+            vec![Arc::new(BlockingTool {
+                started: started.clone(),
+                released: released.clone(),
+            })],
+            30,
+        );
+
+        let (ctx, cancels) = cancellable_ctx("cancel-mid");
+        let wait_started = started.notified();
+        let turn = tokio::spawn(with_session(ctx, async move {
+            rt.handle_input("cancel-mid", "长任务".to_string()).await
+        }));
+
+        // Cancel while the tool round is still running.
+        wait_started.await;
+        assert!(cancels.cancel("cancel-mid"), "signal should be registered");
+
+        let outcome = turn.await.unwrap();
+        let error = outcome.expect_err("a cancelled turn fails");
+        assert!(is_cancelled(&error), "expected Cancelled, got {error:#}");
+        released.notify_waiters();
+
+        // The transcript keeps alternating, with a note that says what happened.
+        let messages = MessageRepository::list_by_session(&*db, "cancel-mid")
+            .await
+            .unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, CANCELLED_REPLY);
+
+        // The ledger says cancelled — not a failure, and not resumable.
+        let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error, CANCELLED_ERROR);
+        assert!(!run.recoverable);
+        assert!(run.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_first_round_never_calls_the_model() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_cancel_early.db"))
+                .await
+                .unwrap(),
+        );
+        // An empty script: reaching the model at all would panic ("script
+        // exhausted"), so this also proves the check happens before the round.
+        let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
+
+        let (ctx, cancels) = cancellable_ctx("cancel-early");
+        cancels.cancel("cancel-early");
+        let error = with_session(ctx, rt.handle_input("cancel-early", "算了".to_string()))
+            .await
+            .expect_err("a cancelled turn fails");
+        assert!(is_cancelled(&error));
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_cancel_signal_runs_normally() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_cancel_absent.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(db.clone(), vec![Step::Final("done".into())], vec![], 30);
+        // Sweeps, cron and aux turns carry no signal; that must stay a no-op path.
+        let reply = rt
+            .handle_input("no-cancel", "hi".to_string())
+            .await
+            .unwrap();
+        assert_eq!(reply, "done");
+    }
+
+    #[tokio::test]
+    async fn cancel_state_reports_whether_a_turn_was_listening() {
+        let cancels = CancelState::new();
+        assert!(
+            !cancels.cancel("nobody"),
+            "no turn in flight → nothing to do"
+        );
+
+        let signal = cancels.register("s1");
+        assert!(!signal.is_cancelled());
+        assert!(cancels.cancel("s1"));
+        assert!(signal.is_cancelled());
+        // Awaiting an already-cancelled signal resolves immediately.
+        signal.cancelled().await;
+
+        cancels.finish("s1");
+        assert!(!cancels.cancel("s1"), "finished turns are unreachable");
     }
 
     #[tokio::test]

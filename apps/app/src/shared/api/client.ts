@@ -11,6 +11,7 @@
 import { TIMEOUT } from "../config";
 import { createFrameSplitter, textDeltaFrom, toolEventFrom } from "./sse";
 import type {
+  ChatOptions,
   Gateway,
   GatewayResolver,
   KomoApiRequest,
@@ -19,7 +20,6 @@ import type {
   KomoChatResponse,
   KomoClient,
   KomoConnectResponse,
-  TurnEvent,
 } from "./types";
 
 async function fetchWithTimeout(
@@ -47,6 +47,21 @@ async function healthOk(base: string): Promise<boolean> {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Make `controller` follow `external`, returning the detach function. Used
+ *  instead of passing `external` to `fetch` directly, because the request also
+ *  needs its own timeout — and both have to be able to abort the *stream*, not
+ *  just the headers phase. */
+function follow(controller: AbortController, external: AbortSignal | undefined): () => void {
+  if (!external) return () => {};
+  if (external.aborted) {
+    controller.abort(external.reason);
+    return () => {};
+  }
+  const onAbort = () => controller.abort(external.reason);
+  external.addEventListener("abort", onAbort, { once: true });
+  return () => external.removeEventListener("abort", onAbort);
 }
 
 export class HttpKomoClient implements KomoClient {
@@ -105,10 +120,11 @@ export class HttpKomoClient implements KomoClient {
   // context: interactive (approval/clarify suspend the turn, resolved
   // out-of-band) or trusted (side-effecting tools auto-approve, like
   // `komo chat`). Tool frames fire `onToolEvent` live; text deltas accumulate.
-  async chat(
-    req: KomoChatRequest,
-    onToolEvent?: (event: TurnEvent) => void,
-  ): Promise<KomoChatResponse> {
+  //
+  // The controller here spans the whole call — headers *and* body — so an
+  // interrupt (or the timeout) also tears down a stream that has already
+  // started, which `fetchWithTimeout` could not do.
+  async chat(req: KomoChatRequest, options?: ChatOptions): Promise<KomoChatResponse> {
     if (!this.gateway) return { ok: false, error: "未连接" };
     const { header, message, mode } = req;
     const headers: Record<string, string> = {
@@ -117,20 +133,21 @@ export class HttpKomoClient implements KomoClient {
       "X-Komo-Session-Id": header,
       ...(mode === "trusted" ? { "X-Komo-Trusted": "1" } : { "X-Komo-Interactive": "1" }),
     };
+
+    const controller = new AbortController();
+    const unfollow = follow(controller, options?.signal);
+    const timer = setTimeout(() => controller.abort(), TIMEOUT.request);
     try {
-      const res = await fetchWithTimeout(
-        `${this.gateway.base}/v1/chat/completions`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            model: "komo",
-            stream: true,
-            messages: [{ role: "user", content: message }],
-          }),
-        },
-        TIMEOUT.request,
-      );
+      const res = await fetch(`${this.gateway.base}/v1/chat/completions`, {
+        method: "POST",
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: "komo",
+          stream: true,
+          messages: [{ role: "user", content: message }],
+        }),
+      });
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
         let msg = `HTTP ${res.status}`;
@@ -151,7 +168,7 @@ export class HttpKomoClient implements KomoClient {
         for (const frame of frames) {
           const tool = toolEventFrom(frame);
           if (tool) {
-            onToolEvent?.(tool);
+            options?.onToolEvent?.(tool);
             continue;
           }
           reply += textDeltaFrom(frame) ?? "";
@@ -166,6 +183,9 @@ export class HttpKomoClient implements KomoClient {
       return { ok: true, reply };
     } catch (err) {
       return { ok: false, error: errMsg(err) };
+    } finally {
+      clearTimeout(timer);
+      unfollow();
     }
   }
 }

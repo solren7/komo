@@ -184,6 +184,7 @@ mod tests {
             interactive: true,
             auto_approve: false,
             event_sink: None,
+            cancel: None,
         };
         ToolContext::new(session, None, Arc::new(DenyAll))
     }

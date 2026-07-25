@@ -132,7 +132,26 @@ history) and `X-Komo-Trusted` (the gateway runs the turn with
 `SessionContext::trusted` → side-effecting tools **auto-approve**, since the CLI
 user is the host operator; gated to **loopback** callers, so a publicly-bound api
 never gets it). `/pair approve` in chat remains the other in-gateway admission
-path. A **CORS layer** (`infra/messaging/api.rs::cors_layer`, applied outermost so a
+path. **Cancelling a turn** (`domain/cancel.rs`): an api turn runs on a spawned task,
+so a client hanging up doesn't stop it — the agent would keep going and its reply
+would land in the transcript unread. `POST /api/interactions/{session}/cancel`
+stops it for real: it resolves any pending approval as *deny* and any pending
+clarify with a stop answer (a turn parked on a prompt isn't at an await the
+signal can interrupt), then flips the session's `CancelSignal`
+(`agent/interaction.rs::CancelState`, a `watch` channel per session, hung on the
+turn's `SessionContext` like the event sink). `run_agent_loop` races **every**
+await against it — the model round-trip included, since that is the longest wait
+and the likeliest thing a user interrupts — so a cancel lands within one await
+rather than after the whole turn. The turn then fails with `Cancelled`:
+`（已中断）` is persisted as the assistant message (keeping the transcript
+alternating and self-explanatory) and the run is finalized `Failed` /
+`cancelled by user`, deliberately **not** `recoverable` — a deliberate stop is
+not crash residue. What it does *not* stop: a tool call already executing. The
+executor spawns each call and `Tool` has no abort hook, so cancelling means "no
+further rounds, no further tool calls". Turns with no signal attached (chat
+channels, cron, sweeps, aux sub-agents) are unaffected.
+
+A **CORS layer** (`infra/messaging/api.rs::cors_layer`, applied outermost so a
 preflight is answered before the bearer-key middleware could 401 it) grants
 loopback page origins — plus the opaque `null` origin a packaged Electron
 renderer sends from `file://`. Without it the desktop/web renderers, which do
@@ -343,7 +362,8 @@ round at a time via `LlmClient::begin_turn` — rig performs a **single** comple
 not its own multi-step loop — and hands each round of requested tools to the `ToolExecutor`,
 threading the results back until the model returns a final answer. A hard per-turn round
 budget (`max_turns`) forces a clean final answer once exceeded. There is still no separate
-planner *type* — the loop is this one method, which is where control points (budget today;
+planner *type* — the loop is this one method, which is where control points (budget and
+cancellation today;
 clarify/resume next) live.
 
 **Layers and their responsibilities:**

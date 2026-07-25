@@ -92,6 +92,12 @@ Three layers, deliberately separate:
   polling that raises the approval modal / clarify bar. React only renders what
   it reports, which is what makes the timing behaviour testable.
 
+Interrupting (the composer's stop button) takes all three of: aborting the
+request, `POST /api/interactions/{session}/cancel` so the *agent* stops too (the
+gateway runs the turn on its own task — hanging up doesn't reach it), and
+surfacing an `AbortError` so the runtime marks the message cancelled rather than
+failed. A tool call already running still finishes.
+
 ## Tests
 
 `bun run test` (vitest, no DOM environment). Only pure logic is covered, because

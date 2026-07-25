@@ -286,6 +286,9 @@ async fn event_loop(
                                 interactive: true,
                                 auto_approve: false,
                                 event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
+                                // The TUI has no stop key (yet); Ctrl-C tears
+                                // down the whole process instead.
+                                cancel: None,
                             }
                         });
                         tokio::spawn(async move {

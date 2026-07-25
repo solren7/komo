@@ -64,7 +64,7 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
   // reports.
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
-      async run({ messages }) {
+      async run({ messages, abortSignal }) {
         const last = [...messages].reverse().find((m) => m.role === "user");
         const text = (last?.content ?? [])
           .map((part) => (part.type === "text" ? part.text : ""))
@@ -73,7 +73,7 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
         const result = await runTurn(
           { session, message: text, mode },
           { onTools: setTools, onApproval: setApproval, onQuestion: setQuestion },
-          { client: getClient() },
+          { client: getClient(), signal: abortSignal },
         );
 
         // A brand-new session now exists server-side — surface it in the list.

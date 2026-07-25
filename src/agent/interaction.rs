@@ -26,12 +26,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 use crate::{
     domain::{
         approval::{ApprovalRequest, Approver, Risk},
+        cancel::CancelSignal,
         gateway::{MessageHandler, ReplySink, WeChatLogin},
         home::HomeRepository,
         pairing::{ApproveOutcome, PairingRepository, PairingStatus},
@@ -78,6 +79,76 @@ impl PendingApproval {
                 _ => "normal",
             }
             .to_string(),
+        }
+    }
+}
+
+/// Per-session cancellation, keyed like the approval/clarify state: the api
+/// channel registers a signal when it starts an interruptible turn, the
+/// `/api/interactions/{session}/cancel` endpoint flips it, and the agent loop
+/// (which holds the matching [`CancelSignal`] on its [`SessionContext`]) stops at
+/// its next await.
+///
+/// A `watch` channel rather than a `oneshot`: the signal is cloned into the turn
+/// context and may be observed from several await points, and a cancel arriving
+/// for a session with no turn in flight is simply a no-op.
+#[derive(Default)]
+pub struct CancelState {
+    pending: Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+impl CancelState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open a cancellation slot for a turn about to start, returning the signal
+    /// to hang on its context. Replaces any stale slot for the session (one turn
+    /// at a time per session).
+    pub fn register(&self, session: &str) -> Arc<dyn CancelSignal> {
+        let (tx, rx) = watch::channel(false);
+        self.pending.lock().unwrap().insert(session.to_string(), tx);
+        Arc::new(WatchCancel { rx })
+    }
+
+    /// Request cancellation. `false` when nothing is registered for the session
+    /// — no turn in flight, or it already finished.
+    pub fn cancel(&self, session: &str) -> bool {
+        match self.pending.lock().unwrap().get(session) {
+            Some(tx) => tx.send(true).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drop the slot once the turn is over, so a later cancel can't hit a
+    /// finished turn's signal.
+    pub fn finish(&self, session: &str) {
+        self.pending.lock().unwrap().remove(session);
+    }
+}
+
+/// [`CancelSignal`] over a `watch` receiver.
+struct WatchCancel {
+    rx: watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CancelSignal for WatchCancel {
+    fn is_cancelled(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut rx = self.rx.clone();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            // Sender gone (the turn's slot was dropped) — park forever rather
+            // than resolve, since this races real work in a `select!`.
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
         }
     }
 }
@@ -655,6 +726,9 @@ impl GatewayDispatcher {
             auto_approve: false,
             // Chat channels don't stream tool events (no live watcher wiring).
             event_sink: None,
+            // No cancel affordance in a chat channel — there is no "stop"
+            // message, and a turn ends on its own or times out.
+            cancel: None,
         };
         tokio::spawn(async move {
             // Armed until normal completion below. If the task is cancelled

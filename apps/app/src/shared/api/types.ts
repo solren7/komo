@@ -54,6 +54,13 @@ export type TurnEvent =
   | { type: "tool_started"; seq: number; name: string; args: string }
   | { type: "tool_finished"; seq: number; name: string; ok: boolean; summary: string };
 
+export interface ChatOptions {
+  /** Fires per live `event: tool` frame while the turn runs. */
+  onToolEvent?: (event: TurnEvent) => void;
+  /** Aborts the request — including mid-stream — when the user interrupts. */
+  signal?: AbortSignal;
+}
+
 /** The renderer's entire data plane. One HTTP implementation (`client.ts`)
  *  backs every host. */
 export interface KomoClient {
@@ -61,7 +68,7 @@ export interface KomoClient {
   connect(): Promise<KomoConnectResponse>;
   /** One authenticated `/api/*` or `/v1/*` request. */
   api<T = unknown>(req: KomoApiRequest): Promise<KomoApiResponse<T>>;
-  /** One chat turn over the SSE stream; `onToolEvent` fires per live tool
-   *  frame, the final assistant text is returned. */
-  chat(req: KomoChatRequest, onToolEvent?: (event: TurnEvent) => void): Promise<KomoChatResponse>;
+  /** One chat turn over the SSE stream. Tool frames fire `onToolEvent` live and
+   *  the final assistant text is returned; `signal` interrupts the turn. */
+  chat(req: KomoChatRequest, options?: ChatOptions): Promise<KomoChatResponse>;
 }

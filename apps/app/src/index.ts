@@ -1,17 +1,15 @@
-// Public surface of the shared komo renderer. Each host (Electron renderer,
-// web bootstrap) builds an `HttpKomoClient` over its own gateway resolver,
-// installs it with `setClient`, then mounts `<App/>` under the query provider.
-// The host also imports the stylesheet: `import "@komo/app/styles/main.css"`.
+// Public surface of the shared komo renderer. Each host (Electron renderer, web
+// bootstrap) builds an `HttpKomoClient` over its own gateway resolver, installs
+// it with `installHost`, then mounts `<KomoApp/>`. The host also imports the
+// stylesheet — see apps/desktop/src/renderer/styles.css.
 
-export { App } from "./App";
-export { HttpKomoClient } from "./client/http";
-export { setClient, getClient } from "./client/runtime";
-export { queryClient } from "./lib/query-client";
-export { applyTheme, initialTheme } from "./lib/theme";
-export type { Theme } from "./lib/theme";
-export type {
-  Gateway,
-  GatewayResolver,
-  KomoClient,
-  KomoConnectResponse,
-} from "./types";
+export { KomoApp } from "./app/KomoApp";
+export { HttpKomoClient } from "./shared/api/client";
+export { installHost } from "./shared/bootstrap";
+
+// Browser-only: the key-entry screen and where its endpoint is stored.
+export { ConnectGate } from "./features/connect/ConnectGate";
+export { consumeQueryParams, currentGateway } from "./features/connect/gateway-storage";
+
+export type { Gateway, GatewayResolver, KomoClient, KomoConnectResponse } from "./shared/api/types";
+export type { HostTag } from "./shared/lib/session-id";

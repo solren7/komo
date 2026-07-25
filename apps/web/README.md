@@ -8,7 +8,11 @@ renderer and a web SPA), unified by the gateway's HTTP api channel.
 ## How it connects
 
 The app talks to the gateway only through a `KomoClient`; the web entry
-(`src/entry.tsx`) builds an `HttpKomoClient` with a browser gateway resolver:
+(`src/entry.tsx`) builds an `HttpKomoClient` with a browser gateway resolver and
+installs it with `installHost({ client, tag: "web" })` — sessions started here
+are tagged `api:gui-web-<uuid>`. The key-entry screen itself
+(`features/connect/`) and every other piece of UI live in
+[`../app`](../app/README.md):
 
 - **Base URL**: same-origin by default (`location.origin`) — the intended
   production shape is the gateway serving this build itself (a `ServeDir`
@@ -17,6 +21,9 @@ The app talks to the gateway only through a `KomoClient`; the web entry
 - **Bearer key**: from a `?key=` (or `?token=`) query param — read once, saved
   to `localStorage`, then stripped from the address bar — or entered on the
   connect screen. It comes from `~/.komo/gateway.json`'s `key`.
+
+Styles come from `src/styles.css`, which imports the shared stylesheet and
+points Tailwind at this host's source.
 
 ## Run (dev)
 

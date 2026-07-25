@@ -481,6 +481,22 @@ kanban.db connections), and two cross-cutting files at the top level —
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
 
+`apps/` — the **JS/TS clients** (a bun workspace, not part of the cargo build):
+`apps/app` is the shared React renderer (`@komo/app`), mounted by two thin hosts
+— `apps/desktop` (Electron: a native window + gateway discovery over a preload
+bridge) and `apps/web` (a static SPA the api channel can serve via `web_dir`).
+Both talk to the gateway only over its HTTP api channel, through one
+`HttpKomoClient`; the renderer is feature-first (`features/{chat,sessions,settings,connect}`
+over `shared/{ui,api,lib}`), server state lives in react-query, client state in
+zustand, and one chat turn is a plain-TypeScript orchestrator
+(`features/chat/turn-orchestrator.ts`) so its approval/clarify timing is unit
+tested. The theme is a generated shadcn preset (`bd1khtfE`: zinc + teal, Noto
+Sans, lucide) and component code may only use semantic tokens — `bun run lint`
+fails on a raw color. Conventions and commands: `apps/app/README.md`
+(`cd apps && bun install`, then `bun run check` = typecheck + lint + fmt + test).
+There is no second GUI: the former Dioxus `crates/komo-gui` was deleted in favor
+of this one.
+
 ## Key extension points
 
 - **Add a tool**: implement `Tool` in `src/tools/`, register it in `cli/wiring.rs`

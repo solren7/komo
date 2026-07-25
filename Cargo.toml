@@ -78,12 +78,12 @@ libc = "0.2"
 tokio = { version = "1.52.0", features = ["full", "test-util"] }
 
 [workspace]
-members = ["crates/komo-core", "crates/komo-gui"]
+members = ["crates/komo-core"]
 resolver = "3"
 
-# Shared across the workspace so komo, komo-core, and komo-gui pin one version
-# each. Crate-unique / heavy deps (toasty, rig, axum, ratatui, dioxus, …) stay
-# in their own manifests.
+# Shared across the workspace so komo and komo-core pin one version each.
+# Crate-unique / heavy deps (toasty, rig, axum, ratatui, …) stay in their own
+# manifests.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

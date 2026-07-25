@@ -1,9 +1,9 @@
 {
   "name": "komo-web",
-  "private": true,
   "version": "0.1.0",
-  "type": "module",
+  "private": true,
   "description": "Standalone web build of the shared @komo/app renderer. Talks to the gateway's HTTP api channel same-origin (served by the gateway) or via a dev proxy; the bearer key comes from a ?key= param or a connect screen.",
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -17,11 +17,9 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.1.0",
     "@types/node": "^26.1.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^6.0.4",
     "typescript": "^7.0.2",
     "vite": "^8.1.5"
   }

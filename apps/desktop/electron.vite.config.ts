@@ -1,13 +1,8 @@
 import { fileURLToPath, URL } from "node:url";
 
-import react from "@vitejs/plugin-react";
-import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "electron-vite";
 
-// Path to the shared renderer package's source. The renderer bundles it
-// directly (it's a source-only workspace package), so both `@komo/app` (the
-// barrel) and `@` (the app's internal alias) resolve here.
-const appSrc = fileURLToPath(new URL("../app/src", import.meta.url));
+import { sharedAlias, sharedPlugins } from "../vite.shared";
 
 // Three-part build (main / preload / renderer). Main and preload bundle to
 // CommonJS (`.cjs`) so the sandboxed preload and the Electron main entry load
@@ -35,13 +30,8 @@ export default defineConfig({
   },
   renderer: {
     root: fileURLToPath(new URL("./src/renderer", import.meta.url)),
-    plugins: [tailwindcss(), react()],
-    resolve: {
-      alias: {
-        "@komo/app": appSrc,
-        "@": appSrc,
-      },
-    },
+    plugins: sharedPlugins(),
+    resolve: { alias: sharedAlias },
     build: {
       outDir: fileURLToPath(new URL("./dist/renderer", import.meta.url)),
       emptyOutDir: true,

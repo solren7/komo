@@ -55,7 +55,7 @@ export function Composer() {
             <ComposerPrimitive.Cancel className={STOP} title="中断回复">
               {/* Small but filled: a solid square is the universal stop glyph,
                   and at this size it reads without weighing the corner down. */}
-              <SquareIcon className="size-3 fill-current" />
+              <SquareIcon className="size-3" />
             </ComposerPrimitive.Cancel>
           </AuiIf>
         </div>

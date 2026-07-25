@@ -5,17 +5,17 @@ edition = "2024"
 
 [dependencies]
 komo-core = { path = "crates/komo-core" }
-clap = { version = "4.6.1", features = ["derive"] }
-tokio = { version = "1.52.0", features = ["full"] }
-toasty = { version = "0.8.0", features = ["sqlite", "turso"] }
-toasty-driver-turso = "0.8.0"
+clap = { version = "4.6.4", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["full"] }
+toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
+toasty-driver-turso = "0.9.0"
 # Direct handle to the same Turso engine toasty uses, for the one thing toasty's
 # typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
 # memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
 # Must stay on the same major as toasty-driver-turso's pin (`turso = "0.6"`):
 # a second turso version both duplicates the engine over the same db files and
 # drags in a second `#[global_allocator]` (mimalloc), which fails to link.
-turso = "0.6"
+turso = "0.7.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -23,7 +23,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 dotenvy = "0.15"
 envy = "0.4"
-toml = "1.1"
+toml = "1.1.3+spec-1.1.0"
 dirs = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
@@ -44,7 +44,7 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 # Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
 # (no signature verification — we only inspect the payload). See `infra/codex.rs`.
-base64 = "0.22"
+base64 = "0.23.0"
 # Codex provider: a custom `rig` HTTP backend re-stamps the bearer per request,
 # so we touch `http`/`bytes` types directly (versions matched to rig + reqwest).
 http = "1"
@@ -54,8 +54,8 @@ chrono = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # Both `ring` and `aws-lc-rs` are activated transitively. Select ring explicitly
 # before any TLS client is constructed (notably open-lark's WebSocket runtime).
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-futures-util = "0.3"
+rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
+futures-util = "0.3.33"
 wechatbot = "=0.4.0"
 qrcode = { version = "0.14.1", default-features = false }
 # PNG only — render the wechat login QR for delivery over chat (no image codecs we don't need).
@@ -63,14 +63,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # HTTP API channel: OpenAI-compatible + dashboard endpoints over a loopback port.
 axum = "0.8"
 # Static-file serving for the api channel's optional web SPA (`web_dir`).
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.7.0", features = ["fs", "cors"] }
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 unicode-width = "0.2.2"
 # Markdown rendering for agent replies in the chat TUI.
 pulldown-cmark = { version = "0.13", default-features = false }
 tracing-appender = "0.2.5"
-libc = "0.2"
+libc = "0.2.189"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
@@ -87,16 +87,16 @@ resolver = "3"
 # Crate-unique / heavy deps (toasty, rig, axum, ratatui, …) stay in their own
 # manifests.
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1.0.103"
-thiserror = "2"
-async-trait = "0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+anyhow = "1.0.104"
+thiserror = "2.0.19"
+async-trait = "0.1.91"
 dirs = "6"
 sha2 = "0.11"
 tracing = "0.1"
-time = { version = "0.3.53", features = ["formatting", "macros"] }
-uuid = { version = "1.23.4", features = ["v4", "v7"] }
+time = { version = "0.3.54", features = ["formatting", "macros"] }
+uuid = { version = "1.24.0", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",

@@ -1,6 +1,6 @@
 import { MessagePrimitive, groupPartByType } from "@assistant-ui/react";
 
-import { MarkdownText } from "@/shared/assistant-ui/markdown-text";
+import { Markdown } from "@/shared/ui/markdown";
 import { ToolCallGroup, ToolCallView } from "./ToolCalls";
 
 export function UserMessage() {
@@ -33,7 +33,7 @@ export function AssistantMessage() {
               case "tool-call":
                 return <ToolCallView {...part} />;
               case "text":
-                return <MarkdownText />;
+                return <Markdown text={part.text} />;
               default:
                 return null;
             }

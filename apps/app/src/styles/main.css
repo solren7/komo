@@ -172,6 +172,9 @@
   background-clip: content-box;
 }
 
-/* Assistant replies render via @assistant-ui/react-markdown; its component
-   styles (the `aui-md` tree in shared/assistant-ui/markdown-text.tsx) own the
-   typography, so no global .md layer is needed here. */
+/* Assistant replies render via Streamdown (shared/ui/markdown.tsx), which
+   styles its own tree with Tailwind utilities off the shadcn tokens above — so
+   no global .md layer is needed here. Its classes live in shipped JS rather
+   than our source, hence the extra @source below; the plugins (code/math/
+   mermaid/cjk) ship no classes of their own, so they need no entry. */
+@source "../../node_modules/streamdown/dist/*.js";

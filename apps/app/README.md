@@ -30,8 +30,8 @@ src/
     connect/    Browser key-entry gate + where its endpoint is stored
   shared/
     ui/         shadcn components (the `@/shared/ui` alias) + Loading /
-                EmptyState / ErrorLine / IconButton
-    assistant-ui/  markdown renderer for assistant replies
+                EmptyState / ErrorLine / IconButton + markdown.tsx (assistant
+                replies)
     api/        client seam (types.ts), HttpKomoClient, sse.ts, request.ts,
                 query-keys.ts, runs.ts, use-connection.ts
     lib/        cn, fmtTs, theme, session ids, abortable sleep
@@ -128,6 +128,12 @@ without catching real defects.
 - A turn is one HTTP request that can block for minutes server-side; approval
   and clarify resolve out of band over `/api/interactions/*`. The stream carries
   tool-call frames only — no token deltas — so replies appear all at once.
+- Markdown is [Streamdown](https://streamdown.ai) (`shared/ui/markdown.tsx`)
+  with its `code` / `math` / `mermaid` / `cjk` plugins, in `mode="static"` since
+  a reply arrives whole. It styles its own tree off the shadcn tokens, so the
+  renderer keeps no component map of its own — but its classes ship inside
+  `node_modules`, hence the `@source` line in `styles/main.css`. Shiki languages
+  and mermaid load on demand (their own chunks), not with the app.
 - A turn's tool calls collapse to one line per turn (`ToolCalls.tsx`), expanding
   to the call list and then to each call's arguments and result. The live strip
   during a turn is deliberately the same line, so nothing jumps when the reply

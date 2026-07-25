@@ -23,10 +23,18 @@ export function parseArgs(raw: string): Record<string, JsonValue> | undefined {
 
 /** A RunStep → an assistant tool-call message part (rendered by `ToolCallView`).
  *  `argsText` is always the raw JSON; `args` is the parsed object when it
- *  parses, for skill-name detection in the view. */
+ *  parses, for skill-name detection in the view.
+ *
+ *  `timing` drives `useToolCallElapsed`, which wants epoch millis. The ledger
+ *  only has whole seconds plus the measured `elapsed_ms`, so the pair is
+ *  reconstructed from those — and omitted entirely when `elapsed_ms` is 0 (a
+ *  step recorded before the column existed: unknown, not instant). */
 export function toolPart(
-  step: Pick<RunStep, "seq" | "tool_name" | "args" | "result" | "error" | "ok">,
+  step: Pick<RunStep, "seq" | "tool_name" | "args" | "result" | "error" | "ok"> &
+    Partial<Pick<RunStep, "elapsed_ms">> & { started_at_ms?: number },
 ) {
+  const startedAt = step.started_at_ms;
+  const elapsed = step.elapsed_ms;
   return {
     type: "tool-call" as const,
     toolCallId: `tool-${step.seq}`,
@@ -35,20 +43,46 @@ export function toolPart(
     argsText: step.args,
     result: step.ok ? step.result : step.error,
     isError: !step.ok,
+    ...(startedAt !== undefined && elapsed
+      ? { timing: { startedAt, completedAt: startedAt + elapsed } }
+      : {}),
   };
 }
 
-/** The live feed's view of a call → the same message part, so a just-finished
- *  turn renders identically to a re-hydrated one. */
-export function activityToolPart(tool: ToolActivity) {
+/** A ledger step → a finished tool part. `started_at` is seconds; scaling it to
+ *  millis is what makes the reconstructed `timing` line up with the live feed's. */
+export function stepToolPart(step: RunStep & { started_at?: number }) {
   return toolPart({
-    seq: tool.seq,
-    tool_name: tool.name,
-    args: tool.args,
-    result: tool.ok ? (tool.summary ?? "") : "",
-    error: tool.ok ? "" : (tool.summary ?? "调用失败"),
-    ok: tool.ok ?? false,
+    ...step,
+    started_at_ms: step.started_at === undefined ? undefined : step.started_at * 1000,
   });
+}
+
+/** The live feed's view of a call → the same message part, so a call renders
+ *  identically while it runs, once it lands, and after a reload.
+ *
+ *  A *running* call is the one difference, and it is a deliberate one: `result`
+ *  stays `undefined` so assistant-ui reports the part's status as `running`, and
+ *  `timing` carries a start with no completion so the duration ticks. */
+export function activityToolPart(tool: ToolActivity) {
+  const base = {
+    type: "tool-call" as const,
+    toolCallId: `tool-${tool.seq}`,
+    toolName: tool.name,
+    args: parseArgs(tool.args) ?? {},
+    argsText: tool.args,
+    timing: {
+      startedAt: tool.startedAtMs,
+      ...(tool.elapsedMs === undefined ? {} : { completedAt: tool.startedAtMs + tool.elapsedMs }),
+    },
+  };
+  if (!tool.done) return base;
+  const ok = tool.ok ?? false;
+  return {
+    ...base,
+    result: ok ? (tool.summary ?? "") : (tool.summary ?? "调用失败"),
+    isError: !ok,
+  };
 }
 
 /** Pair each user message with the run it started.
@@ -85,7 +119,7 @@ export function buildInitialMessages(
       result.push({
         role: "assistant",
         content: [
-          ...(pending?.steps ?? []).map(toolPart),
+          ...(pending?.steps ?? []).map(stepToolPart),
           { type: "text" as const, text: message.content },
         ],
         createdAt: new Date(message.timestamp * 1000),

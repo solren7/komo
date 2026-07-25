@@ -22,19 +22,19 @@ src/
   app/          App shell, providers, error boundary. What a host mounts.
   features/
     chat/       Thread, composer, approval modal, clarify bar, tool display
-                (ToolCalls.tsx + the live ToolActivityStrip, both over
-                tool-summary.ts), turn-orchestrator.ts (one turn, no React),
-                history.ts, api.ts
+                (ToolCalls.tsx over tool-summary.ts — the komo copy on top of
+                the vendored kit in shared/ui), turn-orchestrator.ts (one turn,
+                no React), history.ts, api.ts
     sessions/   Session list, labels.ts, api.ts
     settings/   Settings modal + tabs/, api.ts
     connect/    Browser key-entry gate + where its endpoint is stored
   shared/
     ui/         shadcn components (the `@/shared/ui` alias) + Loading /
                 EmptyState / ErrorLine / IconButton + markdown.tsx (assistant
-                replies)
+                replies) + the assistant-ui kit (tool-group, tool-fallback)
     api/        client seam (types.ts), HttpKomoClient, sse.ts, request.ts,
                 query-keys.ts, runs.ts, use-connection.ts
-    lib/        cn, fmtTs, theme, session ids, abortable sleep
+    lib/        cn, fmtTs, theme, session ids, abortable sleep, pushStream
     store.ts    client state (zustand)
     config.ts   every poll interval and timeout
     types.ts    gateway DTOs
@@ -135,6 +135,17 @@ without catching real defects.
   `node_modules`, hence the `@source` line in `styles/main.css`. Shiki languages
   and mermaid load on demand (their own chunks), not with the app.
 - A turn's tool calls collapse to one line per turn (`ToolCalls.tsx`), expanding
-  to the call list and then to each call's arguments and result. The live strip
-  during a turn is deliberately the same line, so nothing jumps when the reply
-  lands and the message takes the round over.
+  to the call list and then to each call's arguments and result. There is only
+  **one** rendering of a call, used while it runs, once it lands, and after a
+  reload — the chat adapter is an async generator, so each tool frame yields a
+  fresh assistant message and a running call is a real tool-call part in the
+  transcript. Nothing unmounts when the reply arrives.
+- The chrome for those lines is the assistant-ui kit, vendored via
+  `bunx shadcn@latest add @assistant-ui/tool-group @assistant-ui/tool-fallback`
+  into `shared/ui/`. Each file's header lists the departures from upstream (komo
+  supplies its own labels; the in-part approval UI is dropped because komo
+  approves out of band) so a re-add is a known, re-appliable diff.
+- Tool durations come from the gateway — `elapsed_ms` on both `TurnEvent` and
+  `RunStep`, measured on a monotonic clock — not from browser timestamps. A step
+  recorded before that column existed reports 0, which `history.ts` treats as
+  _unknown_: it omits `timing` rather than rendering a false `<1s`.

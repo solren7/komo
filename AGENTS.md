@@ -466,7 +466,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 - **Dreaming / consolidation** (OpenClaw-borrowed, on by default — nightly `0 3 * * *`, set `dream_schedule = "off"` to disable): `domain::memory::dream_verdict`/`dream_score` decide each **candidate**'s fate purely from accumulated usage — recalled ≥`DREAM_MIN_RECALL_COUNT`(3) **by ≥`DREAM_MIN_UNIQUE_QUERIES`(2) lexically-distinct queries** (the `recall_query_hashes` fingerprints — OpenClaw's `minUniqueQueries`; one repeated question can no longer pump a candidate to active on count alone, and pre-fingerprint candidates wait until diversity accrues) → promote to `Active`+`Inferred` (recallable, but still **not** L1-pinnable — pinning stays confirmed-only/manual); a candidate older than `DREAM_FORGET_AGE_DAYS`(30) that has gone **cold** (never recalled, or not recalled within that window — measured on `last_used_at`, so *weakly* recalled candidates are retired too rather than lingering forever) → `Archived`. (`dream_score` still ranks the `komo dream` preview but no longer gates: with recall-count its dominant term, a score threshold could never reject anything the count gate accepted, so it was removed.) `agent::daemon::DreamSweep` applies it (scheduled via `dream_schedule`, wired in `cli/gateway.rs`; `komo dream [--apply]` is the operator preview/run, showing `recalls=/queries=` per candidate). Only candidates are touched — active/user-saved memories are left to the operator (`komo memory report`). Importance is proven by use, not guessed at write time. Reviewer/`memory`-tool write guidance follows Hermes: declarative facts not instructions, nothing stale-in-a-week; the `memory` tool reports the L1 pinned-budget usage% on save/list to nudge self-curation
 
 `domain/run.rs` + `RunRepository` (impl in `infra/persistence/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
-- one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `state.db` — execution state bound to a session, disposable like messages, **not** durable personal data
+- one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps, `elapsed_ms`). Lives in `state.db` — execution state bound to a session, disposable like messages, **not** durable personal data. `started_at`/`ended_at` are whole unix seconds, so differencing them reports 0 for any sub-second call: **`elapsed_ms` is the duration field**, measured off a monotonic `Instant` in the executor (so the transient-error retry collapse is included) and shared verbatim with the live `TurnEvent::ToolFinished`. It is an additive column (`STEP_COLUMNS` in `db.rs::connect`), so an upgraded gateway reads an old `state.db` — steps written before it exist report 0, which every reader must treat as *unknown*, not instant (`komo run inspect` prints no duration for those; the web client omits its timing)
 - steps are captured inside the tool executor (see `services/tool_execution/`), so the ledger covers every executed call. `RunContext` carries a shared `seq` counter so steps order stably even across the tool's spawned task
 - every write is best-effort (warn-logged, never fails a turn or a tool) — same contract as memory `mark_used`
 - **redaction**: step `args` are stored verbatim *except* each `Tool` may scrub its own via `Tool::redact_args` (default identity) — `shell` strips secret-looking substrings (`key=value`, `Bearer`, `--password`, high-entropy tokens), `file` drops the write `content` body. `result` is truncated but not scrubbed (shell *output* can still contain secrets — accepted, `state.db` is local/disposable). Fields are length-capped (`RUN_FIELD_CAP`/`STEP_FIELD_CAP`)
@@ -537,7 +537,22 @@ Both talk to the gateway only over its HTTP api channel, through one
 over `shared/{ui,api,lib}`), server state lives in react-query, client state in
 zustand, and one chat turn is a plain-TypeScript orchestrator
 (`features/chat/turn-orchestrator.ts`) so its approval/clarify timing is unit
-tested. The theme is a generated shadcn preset (`bd1khtfE`: zinc + teal, Noto
+tested. The thread itself is assistant-ui: `ThreadPrimitive` +
+`useLocalRuntime` over a `ChatModelAdapter` that is an **async generator** — each
+`event: tool` frame yields a fresh assistant message, so a running tool call is a
+real tool-call part in the transcript (status `running`, `timing.startedAt` set,
+no result yet) rather than a widget rendered beside it. That is why the wire
+format carries `started_at_ms`/`elapsed_ms` and why the live event cap equals the
+ledger's `STEP_FIELD_CAP`: one component renders a call while it runs, once it
+lands, and after a reload, so anything the stream says less precisely than the
+ledger would become a visible jump. `runTurn` reports by callback while a
+generator must pull, and `shared/lib/async.ts::pushStream` is that join (it
+coalesces, and tolerates a consumer abandoning it mid-turn — which is what an
+interrupt does). The tool-call chrome is the assistant-ui shadcn kit vendored
+into `shared/ui/` (`tool-group`, `tool-fallback`; each file's header lists the
+departures from upstream), with komo's own copy in
+`features/chat/ToolCalls.tsx`. The theme is a generated shadcn preset
+(`bd1khtfE`: zinc + teal, Noto
 Sans, lucide) and component code may only use semantic tokens — `bun run lint`
 fails on a raw color. Conventions and commands: `apps/app/README.md`
 (`cd apps && bun install`, then `bun run check` = typecheck + lint + fmt + test).

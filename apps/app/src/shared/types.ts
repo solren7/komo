@@ -50,6 +50,10 @@ export interface RunStep {
   result: string;
   error: string;
   ok: boolean;
+  /** Measured call duration. 0 on steps recorded before the column existed, and
+   *  absent entirely from a gateway older than the field — both mean "unknown",
+   *  never "instant". */
+  elapsed_ms?: number;
 }
 
 export interface RunDetail {

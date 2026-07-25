@@ -130,6 +130,17 @@ pub struct RunStep {
     pub ok: bool,
     pub started_at: i64,
     pub ended_at: i64,
+    /// Measured duration off a monotonic clock. `started_at`/`ended_at` are
+    /// whole seconds, so differencing them reports 0 for any sub-second call —
+    /// this is the field a duration is rendered from.
+    ///
+    /// `default`: an operator CLI deserializes steps straight off a running
+    /// gateway's `/api/runs/{id}`, and `komo upgrade` reinstalls the binary
+    /// before restarting the gateway — so a new CLI against a not-yet-restarted
+    /// old gateway must not fail on a field that release did not send. 0 already
+    /// means "unknown" for pre-column rows, so the two cases coincide.
+    #[serde(default)]
+    pub elapsed_ms: i64,
 }
 
 /// Per-field cap on a step's args/result inside the resume digest, and the

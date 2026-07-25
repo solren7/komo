@@ -35,10 +35,12 @@ use crate::domain::llm::{ToolCallReq, ToolOutcome};
 use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
 use crate::domain::tool::{Tool, ToolError};
 
-/// Cap on a `TurnEvent` result/args preview — small so the live event stream
-/// stays lightweight (the full result is still capped separately for the model
-/// and stored in full-ish in the ledger).
-const EVENT_SUMMARY_CAP: usize = 300;
+/// Live `TurnEvent` args/result use the **ledger's** cap, not a smaller one of
+/// their own. A watcher renders a running call from the stream and the same call
+/// from the ledger after a reload with one component, so a tighter live cap
+/// showed a truncated result that silently grew on reload. The stream is
+/// loopback SSE — a couple of KB per call costs nothing worth that.
+const EVENT_SUMMARY_CAP: usize = STEP_FIELD_CAP;
 
 use context::SESSION;
 use result::cap_tool_result;
@@ -274,6 +276,7 @@ impl ToolExecutionCore {
                 seq: seq_field,
                 name: name.to_string(),
                 args: truncate(&args, EVENT_SUMMARY_CAP),
+                started_at_ms: now_ms(),
             });
         }
 
@@ -408,6 +411,10 @@ impl ToolExecutionCore {
             }
         };
 
+        // Measured once and shared by the live event and the ledger step, so a
+        // watcher and `run inspect` report the same duration for the same call.
+        let elapsed_ms = started_instant.elapsed().as_millis() as i64;
+
         // Live event: the call finished (after retries collapse). Emitted
         // regardless of ledger state so a watcher sees every call resolve.
         if let Some(sink) = &context.session.event_sink {
@@ -420,6 +427,7 @@ impl ToolExecutionCore {
                 name: name.to_string(),
                 ok,
                 summary,
+                elapsed_ms,
             });
         }
 
@@ -437,12 +445,7 @@ impl ToolExecutionCore {
                 ),
             };
             if ok {
-                info!(
-                    tool = name,
-                    seq,
-                    elapsed_ms = started_instant.elapsed().as_millis() as u64,
-                    "tool ok"
-                );
+                info!(tool = name, seq, elapsed_ms, "tool ok");
             } else {
                 warn!(tool = name, seq, error = %error_s, "tool failed");
             }
@@ -456,6 +459,7 @@ impl ToolExecutionCore {
                 ok,
                 started_at,
                 ended_at,
+                elapsed_ms,
             };
             if let Err(error) = run.repo.append_step(&step).await {
                 warn!(%error, tool = name, "failed to record run step (non-fatal)");
@@ -510,6 +514,13 @@ impl Approver for DenyAllApprover {
 
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Unix milliseconds. The ledger keeps whole seconds, but a live watcher renders
+/// a ticking duration off the start instant, and whole seconds make every
+/// sub-second call read as zero.
+fn now_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 #[cfg(test)]

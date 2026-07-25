@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import type { RunDetail, RunStep, SessionMessage } from "@/shared/types";
-import { activityToolPart, buildInitialMessages, parseArgs, toolPart } from "./history";
+import {
+  activityToolPart,
+  buildInitialMessages,
+  parseArgs,
+  stepToolPart,
+  toolPart,
+} from "./history";
+import type { ToolActivity } from "./turn-orchestrator";
 
 const step = (over: Partial<RunStep> = {}): RunStep => ({
   seq: 1,
@@ -10,6 +17,20 @@ const step = (over: Partial<RunStep> = {}): RunStep => ({
   result: "ok",
   error: "",
   ok: true,
+  elapsed_ms: 40,
+  ...over,
+});
+
+/** A live activity, defaulted to a finished successful call. */
+const activity = (over: Partial<ToolActivity> = {}): ToolActivity => ({
+  seq: 3,
+  name: "time",
+  args: "{}",
+  done: true,
+  ok: true,
+  summary: "now",
+  startedAtMs: 1_700_000_000_000,
+  elapsedMs: 40,
   ...over,
 });
 
@@ -65,20 +86,58 @@ describe("toolPart", () => {
   });
 
   it("maps a live activity the same way a ledger step maps", () => {
-    const live = activityToolPart({
-      seq: 3,
-      name: "time",
-      args: "{}",
-      done: true,
-      ok: true,
-      summary: "now",
-    });
+    const live = activityToolPart(activity());
     expect(live).toMatchObject({ toolName: "time", result: "now", isError: false });
   });
 
   it("gives a failed live call a fallback error message", () => {
-    const live = activityToolPart({ seq: 4, name: "shell", args: "{}", done: true, ok: false });
+    const live = activityToolPart(
+      activity({ seq: 4, name: "shell", ok: false, summary: undefined }),
+    );
     expect(live).toMatchObject({ isError: true, result: "调用失败" });
+  });
+
+  // A running call is the one part that differs, and both differences matter:
+  // no `result` is what makes assistant-ui report the part as running, and a
+  // `timing` without `completedAt` is what makes the duration tick.
+  it("leaves a running call without a result and without a completion time", () => {
+    const live = activityToolPart(
+      activity({ done: false, ok: undefined, summary: undefined, elapsedMs: undefined }),
+    );
+    expect(live).not.toHaveProperty("result");
+    expect(live).not.toHaveProperty("isError");
+    expect(live.timing).toEqual({ startedAt: 1_700_000_000_000 });
+  });
+
+  it("derives a finished call's timing window from the measured duration", () => {
+    const live = activityToolPart(activity({ startedAtMs: 1000, elapsedMs: 250 }));
+    expect(live.timing).toEqual({ startedAt: 1000, completedAt: 1250 });
+  });
+});
+
+describe("stepToolPart", () => {
+  // The ledger keeps whole seconds; assistant-ui's timing wants epoch millis.
+  it("scales the ledger's second-resolution start into the timing window", () => {
+    const part = stepToolPart({ ...step(), started_at: 1_700_000_000, elapsed_ms: 250 });
+    expect(part.timing).toEqual({
+      startedAt: 1_700_000_000_000,
+      completedAt: 1_700_000_000_250,
+    });
+  });
+
+  // Steps predate the column; 0 means unknown, and claiming "instant" would be
+  // a lie the UI renders as `<1s`.
+  it("omits timing entirely when the duration was never recorded", () => {
+    const part = stepToolPart({ ...step(), started_at: 1_700_000_000, elapsed_ms: 0 });
+    expect(part).not.toHaveProperty("timing");
+  });
+
+  // A gateway predating the field omits it rather than sending 0 — the same
+  // "unknown", arriving a different way.
+  it("omits timing when the gateway never sent the field", () => {
+    const { elapsed_ms: _drop, ...legacy } = step();
+    const part = stepToolPart({ ...legacy, started_at: 1_700_000_000 });
+    expect(part).not.toHaveProperty("timing");
   });
 });
 

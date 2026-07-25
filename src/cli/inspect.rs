@@ -220,6 +220,16 @@ pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A step's measured duration, at the precision a reader cares about: whole
+/// milliseconds below a second, then one decimal, then whole seconds.
+fn fmt_elapsed(ms: i64) -> String {
+    match ms {
+        ms if ms < 1000 => format!("{ms}ms"),
+        ms if ms < 10_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        ms => format!("{}s", ms / 1000),
+    }
+}
+
 /// Truncate a string to `n` chars for a single-line summary, collapsing newlines.
 fn oneline(s: &str, n: usize) -> String {
     let flat = s.replace('\n', " ");
@@ -299,7 +309,14 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     println!("\nsteps:");
     for s in steps {
         let mark = if s.ok { "ok " } else { "ERR" };
-        println!("  #{}  {}  {}", s.seq, mark, s.tool_name);
+        // Steps recorded before `elapsed_ms` existed default to 0 — say nothing
+        // rather than claim every one of them took no time.
+        let took = if s.elapsed_ms > 0 {
+            format!("  {}", fmt_elapsed(s.elapsed_ms))
+        } else {
+            String::new()
+        };
+        println!("  #{}  {}  {}{}", s.seq, mark, s.tool_name, took);
         println!("      args   {}", oneline(&s.args, 120));
         if s.ok {
             println!("      result {}", oneline(&s.result, 120));
@@ -383,4 +400,20 @@ pub async fn session_clean(control: &OperatorControl) -> anyhow::Result<()> {
     };
     println!("Removed {removed} empty session(s).");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_elapsed_scales_precision_with_magnitude() {
+        assert_eq!(fmt_elapsed(0), "0ms");
+        assert_eq!(fmt_elapsed(37), "37ms");
+        assert_eq!(fmt_elapsed(999), "999ms");
+        assert_eq!(fmt_elapsed(1000), "1.0s");
+        assert_eq!(fmt_elapsed(2500), "2.5s");
+        assert_eq!(fmt_elapsed(9999), "10.0s");
+        assert_eq!(fmt_elapsed(12_000), "12s");
+    }
 }

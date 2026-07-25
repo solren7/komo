@@ -4,11 +4,14 @@ import type { KomoApiResponse, KomoChatRequest, KomoClient, TurnEvent } from "@/
 import type { Interactions, PendingApproval } from "@/shared/types";
 import { foldToolEvent, runTurn, type ToolActivity } from "./turn-orchestrator";
 
+const STARTED_AT = 1_700_000_000_000;
+
 const started = (seq: number, name = "shell"): TurnEvent => ({
   type: "tool_started",
   seq,
   name,
   args: '{"cmd":"ls"}',
+  started_at_ms: STARTED_AT,
 });
 const finished = (seq: number, ok = true): TurnEvent => ({
   type: "tool_finished",
@@ -16,6 +19,7 @@ const finished = (seq: number, ok = true): TurnEvent => ({
   name: "shell",
   ok,
   summary: ok ? "done" : "failed",
+  elapsed_ms: 40,
 });
 
 const approval: PendingApproval = { summary: "run ls", detail: null, risk: "normal" };
@@ -85,7 +89,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe("foldToolEvent", () => {
   it("appends a started call", () => {
     expect(foldToolEvent([], started(1))).toEqual([
-      { seq: 1, name: "shell", args: '{"cmd":"ls"}', done: false },
+      { seq: 1, name: "shell", args: '{"cmd":"ls"}', done: false, startedAtMs: STARTED_AT },
     ]);
   });
 

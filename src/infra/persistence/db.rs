@@ -171,6 +171,11 @@ struct RunStepRecord {
     ok: bool,
     started_at: i64,
     ended_at: i64,
+
+    /// Measured call duration in milliseconds. Additive column (see
+    /// `STEP_COLUMNS`); `started_at`/`ended_at` are whole seconds and can't
+    /// express a sub-second call.
+    elapsed_ms: i64,
 }
 
 /// Setting key for the runtime home channel (`/sethome`).
@@ -220,6 +225,9 @@ impl Db {
                 "\"recoverable\" boolean NOT NULL DEFAULT false",
             )];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
+            const STEP_COLUMNS: &[(&str, &str)] =
+                &[("elapsed_ms", "\"elapsed_ms\" integer NOT NULL DEFAULT 0")];
+            ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
         }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
@@ -983,6 +991,7 @@ impl RunRepository for Db {
                 ok: step.ok,
                 started_at: step.started_at,
                 ended_at: step.ended_at,
+                elapsed_ms: step.elapsed_ms,
             })
             .exec(&mut conn)
             .await?;
@@ -1148,6 +1157,7 @@ fn step_from_record(record: RunStepRecord) -> RunStep {
         ok: record.ok,
         started_at: record.started_at,
         ended_at: record.ended_at,
+        elapsed_ms: record.elapsed_ms,
     }
 }
 
@@ -1256,6 +1266,7 @@ mod tests {
             ok,
             started_at: 100 + seq,
             ended_at: 101 + seq,
+            elapsed_ms: 250 + seq,
         };
         RunRepository::append_step(&db, &step(1, "time", true))
             .await
@@ -1325,6 +1336,7 @@ mod tests {
                     ok: true,
                     started_at: t,
                     ended_at: t + 1,
+                    elapsed_ms: 12,
                 },
             )
             .await

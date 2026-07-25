@@ -337,10 +337,10 @@ async fn event_loop(
             // `turn_rx` (under `biased`) so a turn's events drain before its reply.
             Some(event) = event_rx.recv() => {
                 match event {
-                    TurnEvent::ToolStarted { seq, name, args } => {
+                    TurnEvent::ToolStarted { seq, name, args, .. } => {
                         app.tool_started(seq, name, args);
                     }
-                    TurnEvent::ToolFinished { seq, name, ok, summary } => {
+                    TurnEvent::ToolFinished { seq, name, ok, summary, .. } => {
                         app.tool_finished(seq, name, ok, summary);
                     }
                 }

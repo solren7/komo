@@ -49,10 +49,19 @@ export interface KomoConnectResponse {
   error?: string;
 }
 
-/** A live tool-call event streamed during a turn (mirrors komo's `TurnEvent`). */
+/** A live tool-call event streamed during a turn (mirrors komo's `TurnEvent`).
+ *  `started_at_ms` is unix ms and `elapsed_ms` the gateway's monotonic
+ *  measurement — the ledger's whole-second timestamps can't express either. */
 export type TurnEvent =
-  | { type: "tool_started"; seq: number; name: string; args: string }
-  | { type: "tool_finished"; seq: number; name: string; ok: boolean; summary: string };
+  | { type: "tool_started"; seq: number; name: string; args: string; started_at_ms: number }
+  | {
+      type: "tool_finished";
+      seq: number;
+      name: string;
+      ok: boolean;
+      summary: string;
+      elapsed_ms: number;
+    };
 
 export interface ChatOptions {
   /** Fires per live `event: tool` frame while the turn runs. */

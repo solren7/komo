@@ -34,6 +34,11 @@ export interface ToolActivity {
   done: boolean;
   ok?: boolean;
   summary?: string;
+  /** Unix ms, from the gateway — so a duration is measured against the clock the
+   *  call actually started on, not against when its frame reached the browser. */
+  startedAtMs: number;
+  /** The gateway's monotonic measurement. Absent while the call runs. */
+  elapsedMs?: number;
 }
 
 /** Fold one streamed event into the activity list. Pure: a started event
@@ -42,11 +47,19 @@ export function foldToolEvent(tools: ToolActivity[], event: TurnEvent): ToolActi
   if (event.type === "tool_started") {
     return [
       ...tools.filter((t) => t.seq !== event.seq),
-      { seq: event.seq, name: event.name, args: event.args, done: false },
+      {
+        seq: event.seq,
+        name: event.name,
+        args: event.args,
+        done: false,
+        startedAtMs: event.started_at_ms,
+      },
     ];
   }
   return tools.map((t) =>
-    t.seq === event.seq ? { ...t, done: true, ok: event.ok, summary: event.summary } : t,
+    t.seq === event.seq
+      ? { ...t, done: true, ok: event.ok, summary: event.summary, elapsedMs: event.elapsed_ms }
+      : t,
   );
 }
 

@@ -38,7 +38,7 @@ const STOP = cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), CORNER_AC
 export function Composer() {
   const history = unstable_useComposerInputHistory();
   return (
-    <ComposerPrimitive.Root className="border-t border-border px-4 py-3">
+    <ComposerPrimitive.Root className="px-4 py-3">
       <div className="relative">
         <ComposerPrimitive.Input
           {...history}

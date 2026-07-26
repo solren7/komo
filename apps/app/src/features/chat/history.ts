@@ -80,7 +80,7 @@ export function activityToolPart(tool: ToolActivity) {
   const ok = tool.ok ?? false;
   return {
     ...base,
-    result: ok ? (tool.summary ?? "") : (tool.summary ?? "调用失败"),
+    result: ok ? (tool.summary ?? "") : (tool.summary ?? "Tool call failed"),
     isError: !ok,
   };
 }

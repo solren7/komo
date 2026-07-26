@@ -170,7 +170,7 @@ export async function runTurn(
     // the message was *cancelled* rather than failed (anything else renders as
     // an error bubble).
     if (deps.signal?.aborted) throw new DOMException("turn cancelled", "AbortError");
-    if (!res.ok) throw new Error(res.error || "请求失败");
+    if (!res.ok) throw new Error(res.error || "Request failed");
     return { reply: res.reply ?? "", tools };
   } finally {
     deps.signal?.removeEventListener("abort", stopOnAbort);

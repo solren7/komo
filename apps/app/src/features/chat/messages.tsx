@@ -22,7 +22,7 @@ export function AssistantMessage() {
   return (
     <MessagePrimitive.Root className="flex justify-start">
       <div className="max-w-[80%] rounded-2xl rounded-bl-md border border-border bg-card px-3.5 py-2 leading-relaxed break-words text-card-foreground">
-        {/* `indicator="never"`: the thread already says "komo 正在思考…" below the
+        {/* `indicator="never"`: the thread already says "Thinking…" below the
             transcript, and a reply arrives whole (the stream carries tool frames
             only), so there is nothing for a per-message indicator to show. */}
         <MessagePrimitive.GroupedParts groupBy={groupToolCalls} indicator="never">

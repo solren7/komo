@@ -19,6 +19,7 @@ import type { SessionSummary } from "@/shared/types";
 import { Button } from "@/shared/ui/button";
 import { IconButton } from "@/shared/ui/icon-button";
 import { Input } from "@/shared/ui/input";
+import { KomoMark } from "@/shared/ui/komo-mark";
 import { fetchSessions, renameSession, setSessionStatus } from "./api";
 import { sessionLabel } from "./labels";
 
@@ -149,7 +150,7 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
   return (
     <aside className="flex w-[264px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground min-h-0">
       <div className="flex h-12 shrink-0 items-center gap-2.5 px-4">
-        <span className="size-6 shrink-0 rounded-md bg-primary" />
+        <KomoMark className="size-7" />
         <span className="font-bold tracking-wide">komo</span>
         <span className="flex-1" />
         <span

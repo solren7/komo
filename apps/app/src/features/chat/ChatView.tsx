@@ -16,6 +16,7 @@ import { pushStream } from "@/shared/lib/async";
 import { useMode, useSession } from "@/shared/store";
 import type { PendingApproval } from "@/shared/types";
 import { Loading } from "@/shared/ui/loading";
+import { KomorebiSpinner } from "@/shared/ui/komorebi-spinner";
 import { ErrorLine } from "@/shared/ui/error-line";
 import { answerQuestion, decideApproval } from "./api";
 import { ApprovalModal, type ApprovalDecision } from "./ApprovalModal";
@@ -148,7 +149,13 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
                 in the assistant message itself, so all that is left to say is
                 that the turn hasn't answered yet. */}
             <AuiIf condition={(s) => s.thread.isRunning}>
-              <div className="px-1 text-sm italic text-muted-foreground">komo 正在思考…</div>
+              <div
+                role="status"
+                className="flex items-center gap-2 px-1 text-sm text-muted-foreground"
+              >
+                <KomorebiSpinner />
+                <span>Thinking…</span>
+              </div>
             </AuiIf>
           </ThreadPrimitive.Viewport>
 

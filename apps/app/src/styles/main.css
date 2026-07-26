@@ -93,72 +93,74 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.141 0.005 285.823);
+  /* Komorebi light — warm paper, mossy ink, and sage leaves sampled from the avatar. */
+  --background: oklch(0.988 0.009 113.155);
+  --foreground: oklch(0.319 0.022 129.269);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.141 0.005 285.823);
+  --card-foreground: oklch(0.319 0.022 129.269);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.141 0.005 285.823);
-  --primary: oklch(0.511 0.096 186.391);
-  --primary-foreground: oklch(0.984 0.014 180.72);
-  --secondary: oklch(0.967 0.001 286.375);
-  --secondary-foreground: oklch(0.21 0.006 285.885);
-  --muted: oklch(0.967 0.001 286.375);
-  --muted-foreground: oklch(0.552 0.016 285.938);
-  --accent: oklch(0.967 0.001 286.375);
-  --accent-foreground: oklch(0.21 0.006 285.885);
+  --popover-foreground: oklch(0.319 0.022 129.269);
+  --primary: oklch(0.52 0.068 124.961);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.959 0.016 118.124);
+  --secondary-foreground: oklch(0.346 0.033 129.574);
+  --muted: oklch(0.959 0.016 118.124);
+  --muted-foreground: oklch(0.486 0.062 126.726);
+  --accent: oklch(0.95 0.024 117.041);
+  --accent-foreground: oklch(0.375 0.038 127.995);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.92 0.004 286.32);
-  --input: oklch(0.92 0.004 286.32);
-  --ring: oklch(0.705 0.015 286.067);
-  --chart-1: oklch(0.871 0.006 286.286);
-  --chart-2: oklch(0.552 0.016 285.938);
-  --chart-3: oklch(0.442 0.017 285.786);
-  --chart-4: oklch(0.37 0.013 285.805);
-  --chart-5: oklch(0.274 0.006 286.033);
+  --border: oklch(0.912 0.025 121.934);
+  --input: oklch(0.868 0.036 122.715);
+  --ring: oklch(0.663 0.087 126.649);
+  --chart-1: oklch(0.52 0.068 124.961);
+  --chart-2: oklch(0.753 0.091 123.773);
+  --chart-3: oklch(0.833 0.068 122.563);
+  --chart-4: oklch(0.845 0.142 104.073);
+  --chart-5: oklch(0.906 0.064 69.119);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.141 0.005 285.823);
-  --sidebar-primary: oklch(0.6 0.118 184.704);
-  --sidebar-primary-foreground: oklch(0.984 0.014 180.72);
-  --sidebar-accent: oklch(0.967 0.001 286.375);
-  --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
-  --sidebar-border: oklch(0.92 0.004 286.32);
-  --sidebar-ring: oklch(0.705 0.015 286.067);
+  --sidebar: oklch(0.969 0.013 115.831);
+  --sidebar-foreground: oklch(0.319 0.022 129.269);
+  --sidebar-primary: oklch(0.486 0.062 126.726);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.95 0.024 117.041);
+  --sidebar-accent-foreground: oklch(0.375 0.038 127.995);
+  --sidebar-border: oklch(0.912 0.025 121.934);
+  --sidebar-ring: oklch(0.663 0.087 126.649);
 }
 
 .dark {
-  --background: oklch(0.141 0.005 285.823);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.21 0.006 285.885);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.21 0.006 285.885);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.437 0.078 188.216);
-  --primary-foreground: oklch(0.984 0.014 180.72);
-  --secondary: oklch(0.274 0.006 286.033);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.274 0.006 286.033);
-  --muted-foreground: oklch(0.705 0.015 286.067);
-  --accent: oklch(0.274 0.006 286.033);
-  --accent-foreground: oklch(0.985 0 0);
+  /* Komorebi dusk — forest shade with a softly luminous leaf-green accent. */
+  --background: oklch(0.216 0.013 135.138);
+  --foreground: oklch(0.955 0.015 123.043);
+  --card: oklch(0.259 0.02 132.975);
+  --card-foreground: oklch(0.955 0.015 123.043);
+  --popover: oklch(0.259 0.02 132.975);
+  --popover-foreground: oklch(0.955 0.015 123.043);
+  --primary: oklch(0.793 0.083 124.174);
+  --primary-foreground: oklch(0.249 0.024 132.574);
+  --secondary: oklch(0.305 0.027 132.069);
+  --secondary-foreground: oklch(0.955 0.015 123.043);
+  --muted: oklch(0.305 0.027 132.069);
+  --muted-foreground: oklch(0.753 0.091 123.773);
+  --accent: oklch(0.334 0.033 131.641);
+  --accent-foreground: oklch(0.955 0.015 123.043);
   --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.552 0.016 285.938);
-  --chart-1: oklch(0.871 0.006 286.286);
-  --chart-2: oklch(0.552 0.016 285.938);
-  --chart-3: oklch(0.442 0.017 285.786);
-  --chart-4: oklch(0.37 0.013 285.805);
-  --chart-5: oklch(0.274 0.006 286.033);
-  --sidebar: oklch(0.21 0.006 285.885);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.704 0.14 182.503);
-  --sidebar-primary-foreground: oklch(0.277 0.046 192.524);
-  --sidebar-accent: oklch(0.274 0.006 286.033);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.552 0.016 285.938);
+  --border: oklch(0.833 0.068 122.563 / 14%);
+  --input: oklch(0.833 0.068 122.563 / 20%);
+  --ring: oklch(0.663 0.087 126.649);
+  --chart-1: oklch(0.793 0.083 124.174);
+  --chart-2: oklch(0.663 0.087 126.649);
+  --chart-3: oklch(0.833 0.068 122.563);
+  --chart-4: oklch(0.845 0.142 104.073);
+  --chart-5: oklch(0.906 0.064 69.119);
+  --sidebar: oklch(0.259 0.02 132.975);
+  --sidebar-foreground: oklch(0.955 0.015 123.043);
+  --sidebar-primary: oklch(0.793 0.083 124.174);
+  --sidebar-primary-foreground: oklch(0.249 0.024 132.574);
+  --sidebar-accent: oklch(0.305 0.027 132.069);
+  --sidebar-accent-foreground: oklch(0.955 0.015 123.043);
+  --sidebar-border: oklch(0.833 0.068 122.563 / 14%);
+  --sidebar-ring: oklch(0.663 0.087 126.649);
 }
 
 @layer base {
@@ -216,3 +218,46 @@
    base-ui arm can match in this app. */
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
 @custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+/* Komorebi orbit — a small mote of light circling a faint, token-tinted path.
+   Used for both thinking and active tool calls so waiting has one visual voice. */
+.komorebi-spinner {
+  position: relative;
+  display: inline-block;
+  border: 1px solid color-mix(in oklch, var(--primary) 24%, transparent);
+  border-radius: 9999px;
+}
+
+.komorebi-spinner-orbit {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  animation: komorebi-orbit 1.15s linear infinite;
+}
+
+.komorebi-spinner-orbit::before {
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--primary);
+  box-shadow:
+    0 0 0 2px color-mix(in oklch, var(--primary) 12%, transparent),
+    0 0 6px color-mix(in oklch, var(--primary) 42%, transparent);
+  content: "";
+  transform: translateX(-50%);
+}
+
+@keyframes komorebi-orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .komorebi-spinner-orbit {
+    animation: none;
+  }
+}

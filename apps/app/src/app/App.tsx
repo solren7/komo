@@ -35,7 +35,7 @@ export function App() {
 
         {!connection.connected && (
           <div className="shrink-0 border-b border-border bg-amber-500/10 px-4 py-1.5 text-sm text-amber-700 dark:text-amber-400">
-            {connection.error ?? "正在连接 komo gateway…"}
+            {connection.error ?? "Connecting…"}
           </div>
         )}
 

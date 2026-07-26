@@ -94,7 +94,7 @@ describe("toolPart", () => {
     const live = activityToolPart(
       activity({ seq: 4, name: "shell", ok: false, summary: undefined }),
     );
-    expect(live).toMatchObject({ isError: true, result: "调用失败" });
+    expect(live).toMatchObject({ isError: true, result: "Tool call failed" });
   });
 
   // A running call is the one part that differs, and both differences matter:

@@ -17,7 +17,7 @@
 //   4. `ToolFallbackResult` takes a `header`, for the same copy reason as (1).
 
 import { useCallback, useRef, useState, type ReactNode } from "react";
-import { AlertCircleIcon, CheckIcon, ChevronDownIcon, LoaderIcon, XCircleIcon } from "lucide-react";
+import { AlertCircleIcon, CheckIcon, ChevronDownIcon, XCircleIcon } from "lucide-react";
 import {
   useScrollLock,
   useToolCallElapsed,
@@ -25,6 +25,7 @@ import {
 } from "@assistant-ui/react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/shared/ui/collapsible";
 import { cn } from "@/shared/lib/utils";
+import { KomorebiSpinner } from "@/shared/ui/komorebi-spinner";
 
 const ANIMATION_DURATION = 200;
 
@@ -84,8 +85,7 @@ function ToolFallbackRoot({
 
 type ToolStatus = ToolCallMessagePartStatus["type"];
 
-const statusIconMap: Record<ToolStatus, React.ElementType> = {
-  running: LoaderIcon,
+const statusIconMap: Record<Exclude<ToolStatus, "running">, React.ElementType> = {
   complete: CheckIcon,
   incomplete: XCircleIcon,
   "requires-action": AlertCircleIcon,
@@ -137,7 +137,7 @@ function ToolFallbackTrigger({
   const isRunning = statusType === "running";
   const isCancelled = status?.type === "incomplete" && status.reason === "cancelled";
 
-  const Icon = statusIconMap[statusType];
+  const Icon = statusType === "running" ? null : statusIconMap[statusType];
   const label = labelProp ?? `${isCancelled ? "Cancelled" : "Used"} tool: ${toolName}`;
 
   return (
@@ -149,14 +149,19 @@ function ToolFallbackTrigger({
       )}
       {...props}
     >
-      <Icon
-        data-slot="tool-fallback-trigger-icon"
-        className={cn(
-          "aui-tool-fallback-trigger-icon size-4 shrink-0",
-          isCancelled && "text-muted-foreground",
-          isRunning && "animate-spin [animation-duration:0.6s]",
-        )}
-      />
+      {isRunning ? (
+        <KomorebiSpinner data-slot="tool-fallback-trigger-icon" />
+      ) : (
+        Icon && (
+          <Icon
+            data-slot="tool-fallback-trigger-icon"
+            className={cn(
+              "aui-tool-fallback-trigger-icon size-4 shrink-0",
+              isCancelled && "text-muted-foreground",
+            )}
+          />
+        )
+      )}
       <span
         data-slot="tool-fallback-trigger-label"
         className={cn(

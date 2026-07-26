@@ -98,6 +98,9 @@ struct AppState {
     channels: Arc<Vec<String>>,
     /// Resolved config `home_chat` fallback, if any (for `/api/status`).
     home: Option<String>,
+    /// Resolved main model identity (safe, non-secret status metadata).
+    provider: Arc<String>,
+    model: Arc<String>,
     /// Shared with the gateway dispatcher and the `ChatApprover`: lets a
     /// loopback interactive HTTP turn (the GUI) surface a pending approval over
     /// `GET /api/interactions/{session}` and resolve it over `POST`.
@@ -132,6 +135,8 @@ impl ApiChannel {
         actions: Arc<OperatorActions>,
         channels: Vec<String>,
         home: Option<String>,
+        provider: String,
+        model: String,
         approvals: Arc<ApprovalState>,
         clarify: Arc<ClarifyState>,
     ) -> Self {
@@ -145,6 +150,8 @@ impl ApiChannel {
                 actions,
                 channels: Arc::new(channels),
                 home,
+                provider: Arc::new(provider),
+                model: Arc::new(model),
                 approvals,
                 clarify,
                 cancels: Arc::new(CancelState::new()),
@@ -703,9 +710,31 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "version": env!("CARGO_PKG_VERSION"),
         "channels": state.channels.as_ref(),
         "home_chat": state.home,
+        "provider": state.provider.as_ref(),
+        "model": state.model.as_ref(),
+        "context_window": model_context_window(state.model.as_ref()),
+        // The provider adapters do not currently expose per-turn token usage.
+        "token_usage": Value::Null,
         "open_tasks": open_tasks,
         "sessions": sessions,
     })))
+}
+
+/// Best-known capacities for model families supported by Komo. Unknown model
+/// ids deliberately return null rather than showing an invented limit.
+fn model_context_window(model: &str) -> Option<u64> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-4.1") {
+        Some(1_047_576)
+    } else if model.starts_with("gpt-5") || model.contains("codex") {
+        Some(400_000)
+    } else if model.starts_with("claude-") {
+        Some(200_000)
+    } else if model.starts_with("gemini-2.5") || model.starts_with("gemini-3") {
+        Some(1_048_576)
+    } else {
+        None
+    }
 }
 
 /// The `/sethome` runtime override (`None` when unset). The config `home_chat`

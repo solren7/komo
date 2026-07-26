@@ -7,6 +7,10 @@ export interface StatusSnapshot {
   version: string;
   channels: string[];
   home_chat: string | null;
+  provider?: string;
+  model?: string;
+  context_window?: number | null;
+  token_usage?: number | null;
   open_tasks: number;
   sessions: number;
 }

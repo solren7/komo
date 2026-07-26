@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AssistantRuntimeProvider,
   AuiIf,
+  SimpleTextAttachmentAdapter,
   ThreadPrimitive,
   useLocalRuntime,
   type ChatModelAdapter,
@@ -25,6 +26,9 @@ import { Composer } from "./Composer";
 import { activityToolPart, loadSessionHistory } from "./history";
 import { AssistantMessage, UserMessage } from "./messages";
 import { runTurn, type ToolActivity } from "./turn-orchestrator";
+
+const textAttachments = new SimpleTextAttachmentAdapter();
+textAttachments.accept += ",.txt,.md,.markdown,.csv,.json,.html,.xml,.css,.log";
 
 /** Loads the session's history, then hands it to the runtime once. */
 export function ChatView() {
@@ -121,7 +125,10 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
     [session, mode, qc],
   );
 
-  const runtime = useLocalRuntime(adapter, { initialMessages });
+  const runtime = useLocalRuntime(adapter, {
+    initialMessages,
+    adapters: { attachments: textAttachments },
+  });
 
   const decide = (decision: ApprovalDecision) => {
     setApproval(null);

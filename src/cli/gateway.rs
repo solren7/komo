@@ -369,6 +369,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             actions,
             enabled,
             config_home.clone(),
+            rt.model.provider.name().to_string(),
+            rt.model.model.clone(),
             approvals.clone(),
             wired.clarify.clone(),
         )));

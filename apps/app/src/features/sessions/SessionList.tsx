@@ -3,9 +3,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   PencilIcon,
   PlusIcon,
   SettingsIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
 } from "lucide-react";
 
@@ -20,6 +23,7 @@ import { Button } from "@/shared/ui/button";
 import { IconButton } from "@/shared/ui/icon-button";
 import { Input } from "@/shared/ui/input";
 import { KomoLogo } from "@/shared/ui/komo-logo";
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/ui/popover";
 import { fetchSessions, renameSession, setSessionStatus } from "./api";
 import { sessionLabel } from "./labels";
 
@@ -33,7 +37,8 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
   const qc = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [showArchived, setShowArchived] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [filter, setFilter] = useState<"active" | "archive" | "all">("active");
 
   const query = useQuery({
     queryKey: qk.sessions,
@@ -70,8 +75,13 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
     restatus.mutate({ id, status: "deleted" });
   };
 
-  const active = sessions.filter((s) => s.status !== "archive");
-  const archived = sessions.filter((s) => s.status === "archive");
+  const visibleSessions = sessions.filter((item) =>
+    filter === "all"
+      ? true
+      : filter === "archive"
+        ? item.status === "archive"
+        : item.status !== "archive",
+  );
 
   const renderRow = (item: SessionSummary) => {
     const isOpen = item.id === session;
@@ -148,56 +158,121 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
   };
 
   return (
-    <aside className="flex w-[264px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground min-h-0">
-      <div className="flex h-12 shrink-0 items-center gap-2.5 px-4">
-        <KomoLogo className="size-7" />
-        <span className="font-bold tracking-wide">komo</span>
-        <span className="flex-1" />
-        <span
-          className={cn("size-2.5 rounded-full", connected ? "bg-emerald-500" : "bg-destructive")}
-          title={connected ? "已连接" : "未连接"}
-        />
-      </div>
-
-      <div className="px-3 pb-2">
-        {/* New session only switches the active id — it does NOT add a row. The
-            session appears in the list once the first message creates it. */}
-        <Button className="w-full" onClick={startNewSession}>
-          <PlusIcon />
-          <span>新建会话</span>
+    <aside
+      className={cn(
+        "relative flex min-h-0 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-200",
+        collapsed ? "w-14" : "w-[264px]",
+      )}
+    >
+      <div
+        className={cn(
+          "flex h-12 shrink-0 items-center",
+          collapsed ? "justify-center px-2" : "gap-2.5 px-4",
+        )}
+      >
+        <KomoLogo className="size-7 shrink-0" />
+        {!collapsed && <span className="font-bold tracking-wide">komo</span>}
+        {!collapsed && <span className="flex-1" />}
+        {!collapsed && (
+          <span
+            className={cn("size-2.5 rounded-full", connected ? "bg-emerald-500" : "bg-destructive")}
+            title={connected ? "已连接" : "未连接"}
+          />
+        )}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className={cn(
+            collapsed &&
+              "absolute -right-3 top-3 z-10 rounded-full border border-border bg-background shadow-sm",
+          )}
+          title={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+          onClick={() => setCollapsed((value) => !value)}
+        >
+          {collapsed ? <ChevronRightIcon /> : <ChevronLeftIcon />}
         </Button>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2">
-        {!connected ? (
-          <div className="px-3 py-3 text-sm text-muted-foreground">未连接</div>
-        ) : query.isPending ? (
-          <div className="px-3 py-3 text-sm text-muted-foreground">加载中…</div>
-        ) : sessions.length === 0 ? (
-          <div className="px-3 py-3 text-sm text-muted-foreground">还没有会话</div>
-        ) : (
-          <>
-            {active.map(renderRow)}
-            {archived.length > 0 && (
-              <div className="mt-1 flex flex-col gap-0.5">
-                <button
-                  type="button"
-                  className="px-2.5 py-1.5 text-left text-xs text-muted-foreground hover:text-foreground"
-                  onClick={() => setShowArchived((v) => !v)}
-                >
-                  {showArchived ? "▾" : "▸"} 已归档 ({archived.length})
-                </button>
-                {showArchived && archived.map(renderRow)}
-              </div>
+      <div className={cn("flex flex-col gap-1 pb-2", collapsed ? "items-center px-2" : "px-3")}>
+        {/* New session only switches the active id — it does NOT add a row. The
+            session appears in the list once the first message creates it. */}
+        <Button
+          className={collapsed ? "size-9 px-0" : "w-full"}
+          onClick={startNewSession}
+          title="新建会话"
+        >
+          <PlusIcon />
+          {!collapsed && <span>新建会话</span>}
+        </Button>
+        <Popover>
+          <PopoverTrigger
+            aria-label="筛选会话"
+            className={cn(
+              "inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+              collapsed ? "w-9" : "w-full",
             )}
-          </>
-        )}
+          >
+            <SlidersHorizontalIcon className="size-4" />
+            {!collapsed && <span>筛选会话</span>}
+          </PopoverTrigger>
+          <PopoverContent side="right" align="start" className="w-52 gap-1 p-2">
+            <PopoverTitle className="px-2 py-1 text-xs text-muted-foreground">
+              会话状态
+            </PopoverTitle>
+            {(
+              [
+                ["active", "进行中"],
+                ["archive", "已归档"],
+                ["all", "全部会话"],
+              ] as const
+            ).map(([value, label]) => (
+              <Button
+                key={value}
+                variant={filter === value ? "secondary" : "ghost"}
+                className="w-full justify-start"
+                onClick={() => setFilter(value)}
+              >
+                <span
+                  className={cn(
+                    "size-2 rounded-full",
+                    filter === value ? "bg-primary" : "bg-muted-foreground/30",
+                  )}
+                />
+                {label}
+              </Button>
+            ))}
+          </PopoverContent>
+        </Popover>
       </div>
 
-      <div className="border-t border-sidebar-border p-2">
-        <Button variant="ghost" className="w-full justify-start" onClick={onOpenSettings}>
+      {!collapsed && (
+        <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2">
+          {!connected ? (
+            <div className="px-3 py-3 text-sm text-muted-foreground">未连接</div>
+          ) : query.isPending ? (
+            <div className="px-3 py-3 text-sm text-muted-foreground">加载中…</div>
+          ) : visibleSessions.length === 0 ? (
+            <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
+          ) : (
+            visibleSessions.map(renderRow)
+          )}
+        </div>
+      )}
+
+      <div
+        className={cn(
+          "mt-auto border-t border-sidebar-border p-2",
+          collapsed && "flex justify-center",
+        )}
+      >
+        <Button
+          variant="ghost"
+          className={collapsed ? "size-9 px-0" : "w-full justify-start"}
+          onClick={onOpenSettings}
+          title="设置"
+        >
           <SettingsIcon />
-          <span>设置</span>
+          {!collapsed && <span>设置</span>}
         </Button>
       </div>
     </aside>

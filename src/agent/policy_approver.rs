@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::domain::{
-    approval::{ApprovalRequest, Approver, Risk},
+    approval::{ApprovalRequest, Approver, Decision, Risk},
     policy::{Policy, Verdict},
 };
 use crate::services::tool_execution::current_session;
@@ -44,7 +44,7 @@ fn channel_of(session_id: &str) -> String {
 
 #[async_trait]
 impl Approver for PolicyApprover {
-    async fn approve(&self, request: &ApprovalRequest) -> bool {
+    async fn decide(&self, request: &ApprovalRequest) -> Decision {
         let channel = current_session().map(|c| channel_of(&c.session_id));
 
         // Read-only actions get deny-only evaluation: a deny rule can block a
@@ -56,9 +56,9 @@ impl Approver for PolicyApprover {
             if decision.verdict == Verdict::Deny {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: denied (safe action)");
-                return false;
+                return policy_denial(decision);
             }
-            return true;
+            return Decision::Allow;
         }
 
         let decision = self.policy.decide(request, channel.as_deref());
@@ -66,7 +66,7 @@ impl Approver for PolicyApprover {
             Verdict::Deny => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: denied");
-                false
+                policy_denial(decision)
             }
             // The engine already gates no-session grants: with `channel = None`
             // only an explicitly `unattended` allow rule (never a default)
@@ -74,10 +74,28 @@ impl Approver for PolicyApprover {
             Verdict::Allow => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: auto-allowed");
-                true
+                Decision::Allow
             }
-            Verdict::Ask => self.inner.approve(request).await,
+            Verdict::Ask => self.inner.decide(request).await,
         }
+    }
+}
+
+/// A policy denial, explained to the model: naming the rule that blocked it is
+/// what stops the model from retrying the same call in a loop, and tells it
+/// whether to look for another route or give up and report the block.
+fn policy_denial(decision: crate::domain::policy::Decision) -> Decision {
+    match decision.rule {
+        // The index is the one `komo policy list` prints, so the operator can
+        // find the exact line if the user asks why.
+        Some(i) => Decision::deny_because(format!(
+            "被权限策略拒绝（命中规则 #{i}，见 `komo policy list`）。\
+             这是 operator 在 config.toml 里设定的，重试同样的调用不会成功。"
+        )),
+        None => Decision::deny_because(
+            "被权限策略的默认规则拒绝。重试同样的调用不会成功；\
+             需要 operator 在 config.toml 的 [policy] 里放行。",
+        ),
     }
 }
 
@@ -95,9 +113,9 @@ mod tests {
     }
     #[async_trait]
     impl Approver for Recording {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
             *self.asked.lock().unwrap() = true;
-            self.answer
+            self.answer.into()
         }
     }
 

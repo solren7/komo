@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     domain::{
-        approval::{ApprovalRequest, Approver},
+        approval::{ApprovalRequest, Decision},
+        context::ToolContext,
         repository::SkillRepository,
         skill::{SOURCE_LEARNED, Skill},
-        tool::Tool,
+        tool::{Tool, ToolError, ToolOutput, parse_args},
     },
     infra::skills::FsSkillStore,
     services::skill_registry::SkillRegistry,
@@ -38,20 +39,11 @@ struct SkillArgs {
 pub struct SkillTool {
     registry: Arc<SkillRegistry>,
     store: Arc<FsSkillStore>,
-    approver: Arc<dyn Approver>,
 }
 
 impl SkillTool {
-    pub fn new(
-        registry: Arc<SkillRegistry>,
-        store: Arc<FsSkillStore>,
-        approver: Arc<dyn Approver>,
-    ) -> Self {
-        Self {
-            registry,
-            store,
-            approver,
-        }
+    pub fn new(registry: Arc<SkillRegistry>, store: Arc<FsSkillStore>) -> Self {
+        Self { registry, store }
     }
 }
 
@@ -108,47 +100,51 @@ impl Tool for SkillTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: SkillArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid skill arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: SkillArgs = parse_args(&input)?;
 
         match args.action.as_str() {
             "list" => {
                 if self.registry.is_empty() {
-                    Ok("(no skills installed)".to_string())
+                    Ok(ToolOutput::text("(no skills installed)"))
                 } else {
-                    Ok(self.registry.catalog())
+                    Ok(ToolOutput::text(self.registry.catalog()))
                 }
             }
             "view" => {
-                let name = args
-                    .name
-                    .ok_or_else(|| anyhow::anyhow!("`name` is required for action=view"))?;
+                let name = args.name.ok_or_else(|| {
+                    ToolError::InvalidInput("`name` is required for action=view".to_string())
+                })?;
                 match self.registry.get(&name) {
                     // A clear terminal answer, not an error: the model should
                     // move on, not retry other spellings.
-                    Some(skill) if skill.disabled => Ok(format!(
+                    Some(skill) if skill.disabled => Ok(ToolOutput::text(format!(
                         "skill `{}` is disabled by the operator and cannot be used.",
                         skill.name
-                    )),
-                    Some(skill) => Ok(format!(
+                    ))),
+                    Some(skill) => Ok(ToolOutput::text(format!(
                         "# Skill: {}\n{}\n\n{}",
                         skill.name, skill.description, skill.instructions
-                    )),
-                    None => Err(anyhow::anyhow!(
+                    ))
+                    .with_title(format!("skill {}", skill.name))),
+                    None => Err(ToolError::InvalidInput(format!(
                         "skill `{name}` not found; use action=list to see available skills"
-                    )),
+                    ))),
                 }
             }
             "learn" => {
-                let name = args
-                    .name
-                    .ok_or_else(|| anyhow::anyhow!("`name` is required for action=learn"))?;
+                let name = args.name.ok_or_else(|| {
+                    ToolError::InvalidInput("`name` is required for action=learn".to_string())
+                })?;
                 let instructions = args.instructions.ok_or_else(|| {
-                    anyhow::anyhow!("`instructions` is required for action=learn")
+                    ToolError::InvalidInput(
+                        "`instructions` is required for action=learn".to_string(),
+                    )
                 })?;
                 if instructions.trim().is_empty() {
-                    return Err(anyhow::anyhow!("`instructions` must not be empty"));
+                    return Err(ToolError::InvalidInput(
+                        "`instructions` must not be empty".to_string(),
+                    ));
                 }
                 let skill = Skill {
                     name: name.clone(),
@@ -164,16 +160,17 @@ impl Tool for SkillTool {
                 // to the runtime until promoted, so the reply must not imply it's
                 // usable this turn.
                 self.store.save(&skill).await?;
-                Ok(format!(
+                Ok(ToolOutput::text(format!(
                     "Learned `{name}` as a candidate skill. Review it with \
                      `komo skills inspect {name}`, then `komo skills promote {name}` \
                      to activate (usable on the agent's next `skill` list once promoted)."
                 ))
+                .with_title(format!("learned {name}")))
             }
             "install" => {
-                let source = args
-                    .source
-                    .ok_or_else(|| anyhow::anyhow!("`source` is required for action=install"))?;
+                let source = args.source.ok_or_else(|| {
+                    ToolError::InvalidInput("`source` is required for action=install".to_string())
+                })?;
                 // Installing third-party code is side-effecting and never
                 // unattended: gate it through the approver (session-scoped, so a
                 // `/approve session` covers a batch). Denied ⇒ nothing written.
@@ -181,8 +178,16 @@ impl Tool for SkillTool {
                     "Install skill from `{source}` into the active skill store"
                 ))
                 .with_scope_key("skill:install".to_string());
-                if !self.approver.approve(&request).await {
-                    return Ok("Skill install rejected by user; nothing was installed.".to_string());
+                if let Decision::Deny { feedback } = ctx.decide(&request).await {
+                    return Ok(ToolOutput::text(match feedback {
+                        Some(reason) => format!(
+                            "Skill install rejected by the user; nothing was installed. \
+                             They said: {reason}"
+                        ),
+                        None => {
+                            "Skill install rejected by user; nothing was installed.".to_string()
+                        }
+                    }));
                 }
                 let installed = crate::infra::skill_install::install(&self.store, &source).await?;
                 let about = if installed.description.is_empty() {
@@ -190,15 +195,16 @@ impl Tool for SkillTool {
                 } else {
                     format!(" — {}", installed.description)
                 };
-                Ok(format!(
+                Ok(ToolOutput::text(format!(
                     "Installed `{}` ({} file(s)){about}. It's active now: use \
                      `skill` view/list to load it (no restart needed).",
                     installed.name, installed.files
                 ))
+                .with_structured(json!({ "name": installed.name, "files": installed.files })))
             }
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected list/view/learn/install)"
-            )),
+            ))),
         }
     }
 }
@@ -226,40 +232,32 @@ mod tests {
         Arc::new(FsSkillStore::new(root))
     }
 
-    /// A no-op approver — install is the only action that consults it, and the
-    /// non-install tests never reach that path.
-    struct DenyAll;
-    #[async_trait]
-    impl Approver for DenyAll {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            false
-        }
-    }
-
-    fn approver() -> Arc<dyn Approver> {
-        Arc::new(DenyAll)
+    /// Install is the only action that consults the approver; every other test
+    /// runs with this deny-all context, which would fail loudly if one did.
+    fn ctx() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
     }
 
     fn tool_with(tag: &str) -> (SkillTool, Arc<FsSkillStore>) {
         let store = store(tag);
-        (SkillTool::new(registry(), store.clone(), approver()), store)
+        (SkillTool::new(registry(), store.clone()), store)
     }
 
     #[tokio::test]
     async fn lists_and_views_skills() {
-        let tool = SkillTool::new(registry(), store("listview"), approver());
+        let tool = SkillTool::new(registry(), store("listview"));
 
         let list = tool
-            .execute(json!({ "action": "list" }).to_string())
+            .call(json!({ "action": "list" }), &ctx())
             .await
             .unwrap();
-        assert!(list.contains("greet: Say hello"));
+        assert!(list.text.contains("greet: Say hello"));
 
         let view = tool
-            .execute(json!({ "action": "view", "name": "greet" }).to_string())
+            .call(json!({ "action": "view", "name": "greet" }), &ctx())
             .await
             .unwrap();
-        assert!(view.contains("Greet the user warmly."));
+        assert!(view.text.contains("Greet the user warmly."));
     }
 
     #[tokio::test]
@@ -274,26 +272,28 @@ mod tests {
                 source: "user".to_string(),
             }])),
             store("disabled"),
-            approver(),
         );
 
         let view = tool
-            .execute(json!({ "action": "view", "name": "paused" }).to_string())
+            .call(json!({ "action": "view", "name": "paused" }), &ctx())
             .await
             .unwrap();
-        assert!(view.contains("disabled by the operator"));
-        assert!(!view.contains("secret steps"));
+        assert!(view.text.contains("disabled by the operator"));
+        assert!(!view.text.contains("secret steps"));
     }
 
     #[tokio::test]
     async fn install_is_refused_when_the_approver_denies() {
         let (tool, store) = tool_with("install_denied");
-        // DenyAll approver ⇒ short-circuits before any fetch; nothing installed.
+        // Deny-all context ⇒ short-circuits before any fetch; nothing installed.
         let out = tool
-            .execute(json!({ "action": "install", "source": "owner/repo" }).to_string())
+            .call(
+                json!({ "action": "install", "source": "owner/repo" }),
+                &ctx(),
+            )
             .await
             .unwrap();
-        assert!(out.contains("rejected"));
+        assert!(out.text.contains("rejected"));
         assert!(store.list_active().is_empty());
     }
 
@@ -301,17 +301,18 @@ mod tests {
     async fn install_requires_a_source() {
         let (tool, _store) = tool_with("install_nosource");
         let err = tool
-            .execute(json!({ "action": "install" }).to_string())
+            .call(json!({ "action": "install" }), &ctx())
             .await
             .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
         assert!(err.to_string().contains("source"));
     }
 
     #[tokio::test]
     async fn view_unknown_skill_errors() {
-        let tool = SkillTool::new(registry(), store("unknown"), approver());
+        let tool = SkillTool::new(registry(), store("unknown"));
         let err = tool
-            .execute(json!({ "action": "view", "name": "nope" }).to_string())
+            .call(json!({ "action": "view", "name": "nope" }), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -321,17 +322,18 @@ mod tests {
     async fn learn_writes_a_candidate() {
         let (tool, store) = tool_with("learn_candidate");
         let reply = tool
-            .execute(
+            .call(
                 json!({
                     "action": "learn",
                     "name": "sync-cal",
                     "description": "Sync the calendar",
                     "instructions": "Step 1. Open the calendar.\nStep 2. Sync."
-                })
-                .to_string(),
+                }),
+                &ctx(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(reply.contains("candidate"));
 
         // Lands as a candidate (not active), tagged with `learned` provenance.
@@ -346,12 +348,12 @@ mod tests {
     async fn learn_requires_name_and_instructions() {
         let (tool, _) = tool_with("learn_missing");
         assert!(
-            tool.execute(json!({ "action": "learn", "instructions": "x" }).to_string())
+            tool.call(json!({ "action": "learn", "instructions": "x" }), &ctx())
                 .await
                 .is_err()
         );
         assert!(
-            tool.execute(json!({ "action": "learn", "name": "x" }).to_string())
+            tool.call(json!({ "action": "learn", "name": "x" }), &ctx())
                 .await
                 .is_err()
         );
@@ -361,9 +363,9 @@ mod tests {
     async fn learn_rejects_path_escaping_name() {
         let (tool, _) = tool_with("learn_badname");
         let err = tool
-            .execute(
-                json!({ "action": "learn", "name": "../escape", "instructions": "body" })
-                    .to_string(),
+            .call(
+                json!({ "action": "learn", "name": "../escape", "instructions": "body" }),
+                &ctx(),
             )
             .await
             .unwrap_err();
@@ -389,9 +391,9 @@ mod tests {
         store.set_protected("guarded", true).unwrap();
 
         let err = tool
-            .execute(
-                json!({ "action": "learn", "name": "guarded", "instructions": "new body" })
-                    .to_string(),
+            .call(
+                json!({ "action": "learn", "name": "guarded", "instructions": "new body" }),
+                &ctx(),
             )
             .await
             .unwrap_err();

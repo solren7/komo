@@ -29,7 +29,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_status(frame, app, status_area);
     render_input(frame, app, input_area);
     if let Some(prompt) = &app.modal {
-        render_modal(frame, prompt, frame.area());
+        render_modal(frame, prompt, app.modal_reason.as_deref(), frame.area());
     }
 }
 
@@ -172,7 +172,15 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), inner.y));
 }
 
-fn render_modal(frame: &mut Frame, prompt: &super::approver::ApprovalPrompt, screen: Rect) {
+/// Draw the approval modal. `reason` is `Some` while the user is typing a
+/// denial reason (see `App::modal_reason`), which replaces the key legend with a
+/// one-line editor.
+fn render_modal(
+    frame: &mut Frame,
+    prompt: &super::approver::ApprovalPrompt,
+    reason: Option<&str>,
+    screen: Rect,
+) {
     let (title, border) = if prompt.dangerous {
         (" 🛑 需要审批(危险操作) ", Style::new().fg(Color::Red))
     } else {
@@ -195,10 +203,26 @@ fn render_modal(frame: &mut Frame, prompt: &super::approver::ApprovalPrompt, scr
         }
     }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "[y] 允许一次   [s] 本会话内同类操作   [n/Esc] 拒绝",
-        Style::new().add_modifier(Modifier::BOLD),
-    )));
+    match reason {
+        // Collecting a denial reason: show the editor and what it's for.
+        Some(text) => {
+            lines.push(Line::from(Span::styled(
+                "拒绝理由（可留空）— 会转达给 agent：",
+                Style::new().fg(Color::DarkGray),
+            )));
+            for l in wrap_text(&format!("❯ {text}▏"), inner_width) {
+                lines.push(Line::from(Span::styled(l, Style::new().fg(Color::Cyan))));
+            }
+            lines.push(Line::from(Span::styled(
+                "[Enter] 确认拒绝   [Esc] 不给理由直接拒绝",
+                Style::new().add_modifier(Modifier::BOLD),
+            )));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "[y] 允许一次   [s] 本会话内同类操作   [n] 拒绝并说明   [Esc] 拒绝",
+            Style::new().add_modifier(Modifier::BOLD),
+        ))),
+    }
 
     let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
     let rect = centered(screen, width, height);

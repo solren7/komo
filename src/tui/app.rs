@@ -61,6 +61,11 @@ pub struct App {
     pub awaiting_answer: bool,
     pub spinner: usize,
     pub modal: Option<ApprovalPrompt>,
+    /// Set while the modal is collecting a *reason* for a denial (the user
+    /// pressed `n`): a one-line buffer whose content is handed to the agent so
+    /// it can correct the call instead of retrying it. `None` = the modal is in
+    /// its normal key-per-answer mode.
+    pub modal_reason: Option<String>,
     /// Maps a running tool's turn sequence → its transcript entry index, so a
     /// `ToolFinished` can update the same line in place. Reset each turn (seqs
     /// restart per turn); `-1` (un-ledgered) calls are not tracked here.
@@ -82,6 +87,7 @@ impl App {
             awaiting_answer: false,
             spinner: 0,
             modal: None,
+            modal_reason: None,
             tool_index: HashMap::new(),
             active_tool: None,
         }
@@ -155,15 +161,55 @@ impl App {
         self.scroll_from_bottom = 0;
     }
 
+    /// Close the approval modal, deliver `answer` to the waiting approver, and
+    /// report it to the event loop.
+    fn resolve_modal(&mut self, answer: Answer) -> Option<Action> {
+        self.modal_reason = None;
+        if let Some(mut prompt) = self.modal.take()
+            && let Some(reply) = prompt.reply.take()
+        {
+            let _ = reply.send(answer.clone());
+        }
+        Some(Action::Answered(answer))
+    }
+
     /// Handle one key press. Mutates the state and returns the action (if any)
     /// the event loop must carry out.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         // The approval modal captures the keyboard while shown.
         if self.modal.is_some() {
+            // Sub-mode: `n` opened a one-line "why?" prompt. Enter sends the
+            // reason with the denial (empty = a plain denial); Esc bails out.
+            if let Some(reason) = self.modal_reason.as_mut() {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Some(Action::Quit);
+                    }
+                    KeyCode::Enter => {
+                        let text = reason.trim().to_string();
+                        return self
+                            .resolve_modal(Answer::Deny((!text.is_empty()).then_some(text)));
+                    }
+                    KeyCode::Esc => return self.resolve_modal(Answer::Deny(None)),
+                    KeyCode::Backspace => {
+                        reason.pop();
+                    }
+                    KeyCode::Char(c) => reason.push(c),
+                    _ => {}
+                }
+                return None;
+            }
+
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Answer::Once),
                 KeyCode::Char('s') | KeyCode::Char('S') => Some(Answer::Session),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Answer::Deny),
+                // `n` asks for a reason first (one extra keystroke); Esc is the
+                // immediate, explanation-free denial.
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.modal_reason = Some(String::new());
+                    return None;
+                }
+                KeyCode::Esc => Some(Answer::Deny(None)),
                 // Ctrl-C still quits even under a modal (the dropped reply
                 // reads as a denial on the approver side).
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -172,12 +218,7 @@ impl App {
                 _ => None,
             };
             if let Some(answer) = answer {
-                if let Some(mut prompt) = self.modal.take()
-                    && let Some(reply) = prompt.reply.take()
-                {
-                    let _ = reply.send(answer);
-                }
-                return Some(Action::Answered(answer));
+                return self.resolve_modal(answer);
             }
             return None;
         }
@@ -332,6 +373,12 @@ mod tests {
         }
     }
 
+    /// Type into the modal's denial-reason line (same keys, different target).
+    fn type_reason(app: &mut App, s: &str) {
+        assert!(app.modal_reason.is_some(), "not in reason-entry mode");
+        type_str(app, s);
+    }
+
     #[test]
     fn tool_line_updates_in_place_on_finish() {
         let mut app = App::new("s".into());
@@ -447,6 +494,99 @@ mod tests {
         );
         assert!(app.modal.is_none());
         assert_eq!(rx.blocking_recv(), Ok(Answer::Once));
+    }
+
+    /// `n` opens a one-line reason prompt whose text reaches the approver, so a
+    /// refusal can tell the agent what to do instead.
+    #[test]
+    fn denying_with_n_collects_a_reason() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut app = App::new("s".into());
+        app.modal = Some(ApprovalPrompt {
+            summary: "rm -rf build".into(),
+            detail: None,
+            dangerous: true,
+            reply: Some(tx),
+        });
+
+        // `n` does not answer yet — it switches the modal to reason entry.
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), None);
+        assert_eq!(app.modal_reason.as_deref(), Some(""));
+        assert!(app.modal.is_some(), "modal stays open while typing");
+
+        for c in "用 trash".chars() {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), None);
+        }
+        // The reason buffer is separate from the composer draft.
+        assert!(app.input.is_empty());
+        assert_eq!(app.modal_reason.as_deref(), Some("用 trash"));
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Answered(Answer::Deny(Some("用 trash".into()))))
+        );
+        assert!(app.modal.is_none());
+        assert!(app.modal_reason.is_none());
+        assert_eq!(
+            rx.blocking_recv(),
+            Ok(Answer::Deny(Some("用 trash".into())))
+        );
+    }
+
+    #[test]
+    fn esc_denies_immediately_without_a_reason() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut app = App::new("s".into());
+        app.modal = Some(ApprovalPrompt {
+            summary: "rm -rf build".into(),
+            detail: None,
+            dangerous: true,
+            reply: Some(tx),
+        });
+        assert_eq!(
+            app.on_key(key(KeyCode::Esc)),
+            Some(Action::Answered(Answer::Deny(None)))
+        );
+        assert_eq!(rx.blocking_recv(), Ok(Answer::Deny(None)));
+    }
+
+    /// Esc out of reason entry is still a denial — just an unexplained one.
+    #[test]
+    fn esc_during_reason_entry_denies_without_the_partial_text() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut app = App::new("s".into());
+        app.modal = Some(ApprovalPrompt {
+            summary: "rm -rf build".into(),
+            detail: None,
+            dangerous: true,
+            reply: Some(tx),
+        });
+        app.on_key(key(KeyCode::Char('n')));
+        type_reason(&mut app, "half-typed");
+        assert_eq!(
+            app.on_key(key(KeyCode::Esc)),
+            Some(Action::Answered(Answer::Deny(None)))
+        );
+        assert_eq!(rx.blocking_recv(), Ok(Answer::Deny(None)));
+    }
+
+    /// An empty reason is the same as a plain denial.
+    #[test]
+    fn enter_with_a_blank_reason_is_a_plain_denial() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut app = App::new("s".into());
+        app.modal = Some(ApprovalPrompt {
+            summary: "write".into(),
+            detail: None,
+            dangerous: false,
+            reply: Some(tx),
+        });
+        app.on_key(key(KeyCode::Char('n')));
+        type_reason(&mut app, "  ");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Answered(Answer::Deny(None)))
+        );
     }
 
     #[test]

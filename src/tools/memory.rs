@@ -2,17 +2,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     domain::{
+        context::ToolContext,
         memory::{
             Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
             MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
         },
-        tool::Tool,
+        tool::{Tool, ToolError, ToolOutput, parse_args},
     },
-    services::{memory_enrichment::pinned_budget_usage, tool_execution::current_session},
+    services::memory_enrichment::pinned_budget_usage,
 };
 
 /// Default cap on search results.
@@ -63,8 +64,8 @@ impl MemoryTool {
     /// Surfacing "how full is it" nudges the model to keep pinned compact and
     /// curate before adding. Returns `None` when nothing is pinned (no pressure
     /// to report). Best-effort: a load failure just omits the line.
-    async fn pinned_usage_line(&self) -> Option<String> {
-        let pinned = self.memories.pinned(&ctx()).await.ok()?;
+    async fn pinned_usage_line(&self, scope: &MemoryContext) -> Option<String> {
+        let pinned = self.memories.pinned(scope).await.ok()?;
         let (used, budget) = pinned_budget_usage(&pinned);
         if used == 0 {
             return None;
@@ -76,14 +77,17 @@ impl MemoryTool {
     }
 
     /// Load a memory by id or return a helpful error.
-    async fn require(&self, id: &Option<String>) -> anyhow::Result<Memory> {
-        let id = id
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("`id` is required for this action"))?;
+    /// Look up the memory an action names. A missing / unknown id is the model's
+    /// mistake to fix, so both map to [`ToolError::InvalidInput`] rather than a
+    /// retryable failure.
+    async fn require(&self, id: &Option<String>) -> Result<Memory, ToolError> {
+        let id = id.as_deref().ok_or_else(|| {
+            ToolError::InvalidInput("`id` is required for this action".to_string())
+        })?;
         self.memories
             .get(id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no memory with id `{id}`"))
+            .ok_or_else(|| ToolError::InvalidInput(format!("no memory with id `{id}`")))
     }
 }
 
@@ -134,16 +138,18 @@ impl Tool for MemoryTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: MemoryArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid memory arguments: {e}"))?;
+    async fn call(&self, input: Value, tool_ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: MemoryArgs = parse_args(&input)?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // Scope comes from the *explicit* per-call context (tool trait v2), not
+        // the ambient task-local: `memory` was the last tool reading that seam.
+        let scope = memory_context(&tool_ctx.session.session_id);
 
         match args.action.as_str() {
             "save" => {
-                let text = args
-                    .text
-                    .ok_or_else(|| anyhow::anyhow!("`text` is required for action=save"))?;
+                let text = args.text.ok_or_else(|| {
+                    ToolError::InvalidInput("`text` is required for action=save".to_string())
+                })?;
                 let kind = args
                     .kind
                     .as_deref()
@@ -153,17 +159,17 @@ impl Tool for MemoryTool {
                 // An explicit user save is the highest trust tier.
                 memory.confidence = MemoryConfidence::UserWritten;
                 // Scope to the current chat so a channel fact does not leak elsewhere.
-                memory.scope = ctx().write_scope();
+                memory.scope = scope.write_scope();
                 if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
                     memory.expires_at = Some(now + days * 86_400);
                 }
                 self.memories.save(&memory).await?;
                 let mut out = format!("Saved memory {}.", memory.id);
-                if let Some(usage) = self.pinned_usage_line().await {
+                if let Some(usage) = self.pinned_usage_line(&scope).await {
                     out.push('\n');
                     out.push_str(&usage);
                 }
-                Ok(out)
+                Ok(ToolOutput::text(out).with_structured(json!({ "id": memory.id })))
             }
             "list" => {
                 let mut memories = self.memories.list().await?;
@@ -171,25 +177,26 @@ impl Tool for MemoryTool {
                     memories.retain(|m| m.status == status);
                 }
                 let mut out = render(&memories);
-                if let Some(usage) = self.pinned_usage_line().await {
+                if let Some(usage) = self.pinned_usage_line(&scope).await {
                     out.push_str("\n\n");
                     out.push_str(&usage);
                 }
-                Ok(out)
+                Ok(ToolOutput::text(out).with_title(format!("{} memories", memories.len())))
             }
             "search" => {
-                let text = args
-                    .query
-                    .ok_or_else(|| anyhow::anyhow!("`query` is required for action=search"))?;
+                let text = args.query.ok_or_else(|| {
+                    ToolError::InvalidInput("`query` is required for action=search".to_string())
+                })?;
                 let query = MemoryQuery {
                     text,
-                    allowed_scopes: ctx().allowed_scopes,
+                    allowed_scopes: scope.allowed_scopes.clone(),
                     kinds: Vec::new(),
                     statuses: vec![MemoryStatus::Active],
                     limit: SEARCH_LIMIT,
                 };
                 let hits = self.memories.search(query).await?;
-                Ok(render_scored(&hits))
+                Ok(ToolOutput::text(render_scored(&hits))
+                    .with_title(format!("{} matches", hits.len())))
             }
             "update" => {
                 let mut memory = self.require(&args.id).await?;
@@ -214,31 +221,31 @@ impl Tool for MemoryTool {
                 }
                 memory.updated_at = now;
                 self.memories.save(&memory).await?;
-                Ok(format!("Updated memory {}.", memory.id))
+                Ok(ToolOutput::text(format!("Updated memory {}.", memory.id)))
             }
             "promote" => {
                 let mut memory = self.require(&args.id).await?;
                 memory.promote(now);
                 self.memories.save(&memory).await?;
-                Ok(format!("Promoted memory {} to active.", memory.id))
+                Ok(ToolOutput::text(format!(
+                    "Promoted memory {} to active.",
+                    memory.id
+                )))
             }
             "reject" => set_status(self, &args.id, MemoryStatus::Rejected, now).await,
             "archive" => set_status(self, &args.id, MemoryStatus::Archived, now).await,
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected save/search/list/update/promote/reject/archive)"
-            )),
+            ))),
         }
     }
 }
 
-/// The memory context for the current turn, derived from the ambient session.
-/// Falls back to a global-only context when there is no session (aux sub-agents
-/// never reach here, but be safe).
-fn ctx() -> MemoryContext {
-    match current_session() {
-        Some(s) => MemoryContext::from_session(&s.session_id),
-        None => MemoryContext::from_session(""),
-    }
+/// The memory context for this call, derived from the turn's session id (see
+/// [`MemoryContext::from_session`]: a chat session also gets channel scope, a
+/// CLI one does not). An empty id yields the global-only context.
+fn memory_context(session_id: &str) -> MemoryContext {
+    MemoryContext::from_session(session_id)
 }
 
 async fn set_status(
@@ -246,12 +253,16 @@ async fn set_status(
     id: &Option<String>,
     status: MemoryStatus,
     now: i64,
-) -> anyhow::Result<String> {
+) -> Result<ToolOutput, ToolError> {
     let mut memory = tool.require(id).await?;
     memory.status = status;
     memory.updated_at = now;
     tool.memories.save(&memory).await?;
-    Ok(format!("Set memory {} to {}.", memory.id, status.as_str()))
+    Ok(ToolOutput::text(format!(
+        "Set memory {} to {}.",
+        memory.id,
+        status.as_str()
+    )))
 }
 
 fn render(memories: &[Memory]) -> String {
@@ -303,31 +314,39 @@ mod tests {
         MemoryTool::new(Arc::new(MdMemoryStore::new(dir)))
     }
 
+    /// A CLI-shaped session: global + session scope, no channel scope.
+    fn ctx() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
+    }
+
     #[tokio::test]
     async fn save_list_search_roundtrip() {
         let tool = temp_tool("komo_mem_tool_test");
 
-        tool.execute(json!({ "action": "save", "text": "用户喜欢蓝色" }).to_string())
+        tool.call(json!({ "action": "save", "text": "用户喜欢蓝色" }), &ctx())
             .await
             .unwrap();
-        tool.execute(
-            json!({ "action": "save", "text": "项目用 Rust 写", "kind": "project" }).to_string(),
+        tool.call(
+            json!({ "action": "save", "text": "项目用 Rust 写", "kind": "project" }),
+            &ctx(),
         )
         .await
         .unwrap();
 
         let list = tool
-            .execute(json!({ "action": "list" }).to_string())
+            .call(json!({ "action": "list" }), &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(list.contains("蓝色"));
         assert!(list.contains("Rust"));
         assert!(list.contains("[project/"));
 
         let hit = tool
-            .execute(json!({ "action": "search", "query": "rust" }).to_string())
+            .call(json!({ "action": "search", "query": "rust" }), &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(hit.contains("Rust"));
         assert!(!hit.contains("蓝色"));
     }
@@ -341,16 +360,19 @@ mod tests {
         cand.confidence = MemoryConfidence::Extracted;
         tool.memories.save(&cand).await.unwrap();
 
-        tool.execute(json!({ "action": "promote", "id": cand.id }).to_string())
+        tool.call(json!({ "action": "promote", "id": cand.id }), &ctx())
             .await
             .unwrap();
         let after = tool.memories.get(&cand.id).await.unwrap().unwrap();
         assert_eq!(after.status, MemoryStatus::Active);
         assert_eq!(after.confidence, MemoryConfidence::Confirmed);
 
-        tool.execute(json!({ "action": "update", "id": cand.id, "pinned": true }).to_string())
-            .await
-            .unwrap();
+        tool.call(
+            json!({ "action": "update", "id": cand.id, "pinned": true }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
         let pinned = tool.memories.get(&cand.id).await.unwrap().unwrap();
         assert!(pinned.pinned);
     }
@@ -361,7 +383,7 @@ mod tests {
         let m = Memory::new(MemoryKind::Fact, "ephemeral");
         tool.memories.save(&m).await.unwrap();
 
-        tool.execute(json!({ "action": "reject", "id": m.id }).to_string())
+        tool.call(json!({ "action": "reject", "id": m.id }), &ctx())
             .await
             .unwrap();
         assert_eq!(
@@ -374,7 +396,7 @@ mod tests {
     async fn update_unknown_id_errors() {
         let tool = temp_tool("komo_mem_tool_unknown");
         let err = tool
-            .execute(json!({ "action": "promote", "id": "nope" }).to_string())
+            .call(json!({ "action": "promote", "id": "nope" }), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no memory with id"));

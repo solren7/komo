@@ -143,38 +143,17 @@ pub trait Tool: Send + Sync {
         })
     }
 
-    /// **Tool trait v2 entry point.** Execute the tool with the parsed JSON
-    /// `input` and the explicit per-call [`ToolContext`] (session + run +
-    /// approver). Returns a structured [`ToolOutput`]; recoverable problems use
-    /// [`ToolError::InvalidInput`] / [`ToolError::Denied`].
+    /// Execute the tool with the parsed JSON `input` and the explicit per-call
+    /// [`ToolContext`] (session + run + approver). Returns a structured
+    /// [`ToolOutput`]; recoverable problems use [`ToolError::InvalidInput`] /
+    /// [`ToolError::Denied`], which the executor turns into content the model
+    /// can act on rather than retrying.
     ///
-    /// During the v2 migration this has a default that bridges to the legacy
-    /// [`execute`](Tool::execute): an unmigrated tool implements `execute` and
-    /// inherits this bridge; a migrated tool overrides `call` and leaves
-    /// `execute` as its (never-called) default. Once every tool is migrated,
-    /// `execute` and this default are removed and `call` becomes required.
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        // Bridge to the legacy string API. `Value::String` carries a raw
-        // (non-JSON) arg string the executor wrapped; `Null` is the no-arg call.
-        let legacy = match input {
-            Value::Null => String::new(),
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        self.execute(legacy)
-            .await
-            .map(ToolOutput::text)
-            .map_err(ToolError::Failed)
-    }
+    /// Arguments are decoded with [`parse_args`] — one canonical
+    /// "rewrite the arguments" error instead of each tool's own phrasing.
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 
-    /// Legacy string-in/string-out execution (tool trait v1). Unmigrated tools
-    /// implement this; migrated tools implement [`call`](Tool::call) instead and
-    /// leave this default, which is never invoked for them.
-    async fn execute(&self, _input: String) -> anyhow::Result<String> {
-        unimplemented!("this tool implements `Tool::call`, not the legacy `execute`")
-    }
-
-    /// Whether `execute` is safe to retry after a transient failure whose
+    /// Whether `call` is safe to retry after a transient failure whose
     /// side-effect status is *ambiguous* — a timeout or 5xx that may already
     /// have landed and applied server-side. Read-only tools (`web_fetch`,
     /// `web_search`) return `true`; any tool that can mutate external state

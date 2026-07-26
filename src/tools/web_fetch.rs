@@ -213,15 +213,15 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::Approver;
+    use crate::domain::approval::{Approver, Decision};
     use crate::domain::context::{SessionContext, ToolContext};
     use std::sync::Arc;
 
     struct DenyAll;
     #[async_trait]
     impl Approver for DenyAll {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            false
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::deny()
         }
     }
 

@@ -60,7 +60,7 @@ use crate::{
     agent::{
         daemon::DreamSweep,
         gateway::Channel,
-        interaction::{ApprovalState, CancelState, Decision, GatewayDispatcher},
+        interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher},
     },
     config::ApiConfig,
     domain::{
@@ -1151,7 +1151,7 @@ async fn get_interactions(
 /// executing runs to completion (see `domain::cancel`). The turn's reply becomes
 /// `CANCELLED_REPLY`, which is what lands in the transcript.
 async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>) -> Json<Value> {
-    let denied = state.approvals.resolve(&session, Decision::Deny);
+    let denied = state.approvals.resolve(&session, Answer::Deny(None));
     let answered = state.clarify.resolve(&session, CANCELLED_REPLY);
     let cancelled = state.cancels.cancel(&session);
     if cancelled {
@@ -1168,14 +1168,21 @@ async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>)
 struct ApprovalDecisionBody {
     /// `"once"` | `"session"` | `"deny"`.
     decision: String,
+    /// Optional reason for a denial, relayed to the model so it can correct the
+    /// call instead of retrying it (ignored for the two allow decisions).
+    #[serde(default)]
+    feedback: Option<String>,
 }
 
-/// Map the wire decision string to a [`Decision`]. `None` = unrecognized.
-fn parse_decision(s: &str) -> Option<Decision> {
+/// Map the wire decision string to an [`Answer`], attaching `feedback` to a
+/// denial. `None` = unrecognized.
+fn parse_decision(s: &str, feedback: Option<String>) -> Option<Answer> {
     match s {
-        "once" => Some(Decision::Once),
-        "session" => Some(Decision::Session),
-        "deny" => Some(Decision::Deny),
+        "once" => Some(Answer::Once),
+        "session" => Some(Answer::Session),
+        "deny" => Some(Answer::Deny(
+            feedback.filter(|text| !text.trim().is_empty()),
+        )),
         _ => None,
     }
 }
@@ -1186,7 +1193,7 @@ async fn resolve_approval(
     Path(session): Path<String>,
     Json(body): Json<ApprovalDecisionBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let decision = parse_decision(&body.decision).ok_or_else(|| {
+    let decision = parse_decision(&body.decision, body.feedback).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown decision `{}` (want once|session|deny)",
             body.decision
@@ -1362,11 +1369,28 @@ mod tests {
 
     #[test]
     fn parse_decision_maps_known_strings_and_rejects_others() {
-        assert_eq!(parse_decision("once"), Some(Decision::Once));
-        assert_eq!(parse_decision("session"), Some(Decision::Session));
-        assert_eq!(parse_decision("deny"), Some(Decision::Deny));
-        assert_eq!(parse_decision("approve"), None);
-        assert_eq!(parse_decision(""), None);
+        assert_eq!(parse_decision("once", None), Some(Answer::Once));
+        assert_eq!(parse_decision("session", None), Some(Answer::Session));
+        assert_eq!(parse_decision("deny", None), Some(Answer::Deny(None)));
+        assert_eq!(parse_decision("approve", None), None);
+        assert_eq!(parse_decision("", None), None);
+    }
+
+    #[test]
+    fn deny_feedback_rides_along_but_blank_is_dropped() {
+        assert_eq!(
+            parse_decision("deny", Some("用 trash".into())),
+            Some(Answer::Deny(Some("用 trash".into())))
+        );
+        assert_eq!(
+            parse_decision("deny", Some("   ".into())),
+            Some(Answer::Deny(None))
+        );
+        // An allow ignores feedback entirely.
+        assert_eq!(
+            parse_decision("once", Some("ignored".into())),
+            Some(Answer::Once)
+        );
     }
 
     // The interactions state round-trip (register → pending_info/pending_question

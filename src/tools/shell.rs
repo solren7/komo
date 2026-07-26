@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
 use crate::domain::{
-    approval::{ActionRef, ApprovalRequest},
+    approval::{ActionRef, ApprovalRequest, Decision},
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
@@ -253,10 +253,16 @@ impl Tool for ShellTool {
             .with_action(action),
             None => ApprovalRequest::safe(summary).with_action(action),
         };
-        if !ctx.approve(&request).await {
-            return Ok(ToolOutput::text(
-                "Command rejected by user; nothing was run.",
-            ));
+        // A denial may carry the user's reason ("use trash instead of rm") —
+        // hand it back so the next round is a corrected command, not a retry.
+        if let Decision::Deny { feedback } = ctx.decide(&request).await {
+            return Ok(ToolOutput::text(match feedback {
+                Some(reason) => format!(
+                    "Command rejected by the user; nothing was run. \
+                     They said: {reason}\nAct on that instead of retrying the same command."
+                ),
+                None => "Command rejected by user; nothing was run.".to_string(),
+            }));
         }
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -330,7 +336,7 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{Approver, Risk};
+    use crate::domain::approval::{Approver, Decision, Risk};
     use crate::domain::context::{SessionContext, ToolContext};
     use std::sync::Mutex;
 
@@ -341,16 +347,25 @@ mod tests {
     struct AlwaysApprove;
     #[async_trait::async_trait]
     impl Approver for AlwaysApprove {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            true
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::Allow
         }
     }
 
     struct AlwaysReject;
     #[async_trait::async_trait]
     impl Approver for AlwaysReject {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            false
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::deny()
+        }
+    }
+
+    /// Refuses, but explains why (`/deny <理由>` / the TUI's reason prompt).
+    struct RejectWithReason(&'static str);
+    #[async_trait::async_trait]
+    impl Approver for RejectWithReason {
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::deny_because(self.0)
         }
     }
 
@@ -362,9 +377,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Approver for Recording {
-        async fn approve(&self, request: &ApprovalRequest) -> bool {
+        async fn decide(&self, request: &ApprovalRequest) -> Decision {
             *self.risk.lock().unwrap() = Some(request.risk);
-            self.approve
+            self.approve.into()
         }
     }
 
@@ -398,6 +413,22 @@ mod tests {
             .unwrap();
         assert!(out.text.contains("rejected"));
         assert!(!out.text.contains("--- stdout ---"));
+    }
+
+    #[tokio::test]
+    async fn a_denial_reason_is_relayed_to_the_model() {
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "rm -f /tmp/komo_shell_reason" }),
+                &ctx_with(Arc::new(RejectWithReason("用 trash 代替 rm"))),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("用 trash 代替 rm"), "got: {}", out.text);
+        // And it must be told not to just try again.
+        assert!(out.text.contains("instead of retrying"));
+        assert!(!out.text.contains("--- stdout ---"), "nothing ran");
     }
 
     #[tokio::test]

@@ -38,6 +38,15 @@ const IDENTITY: &str = "You are Komo, a concise and helpful personal agent. \
 const TIME_GUIDANCE: &str = "Use the `time` tool when you need the exact current \
     date and time; never invent a timestamp.";
 
+/// Gated on the `read` tool. Two habits worth stating: page instead of giving
+/// up on a long file, and don't shell out for what `read` already does (a `cat`
+/// through `shell` loses the line numbers `write` edits depend on, and asks for
+/// a shell approval the read never needed).
+const READ_GUIDANCE: &str = "Use `read` for file contents and directory listings — \
+    not `cat`/`ls` through `shell`. When a file is longer than one page, `read` \
+    tells you the next offset: keep reading with `offset` until you have what you \
+    need, rather than concluding from the first page alone.";
+
 /// Gated on any of the state-backed tools (`session` / `memory` / `skill`).
 const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, \
     conversation history, memories, or skills — refer to Komo's database, not the \
@@ -250,6 +259,9 @@ impl SystemPromptBuilder {
         // Tool-aware guidance: only inject when the tool is loaded.
         if self.has("time") {
             parts.push(TIME_GUIDANCE.to_string());
+        }
+        if self.has("read") {
+            parts.push(READ_GUIDANCE.to_string());
         }
         if self.has("session") || self.has("memory") || self.has("skill") {
             parts.push(STATE_GUIDANCE.to_string());

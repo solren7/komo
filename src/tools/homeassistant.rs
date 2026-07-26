@@ -1,12 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::domain::{
-    approval::{ActionRef, ApprovalRequest, Approver},
-    tool::Tool,
+    approval::{ActionRef, ApprovalRequest, Decision},
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 /// Cap on the textual size of a tool result (entity/service lists are large).
@@ -67,11 +68,10 @@ pub struct HomeAssistantTool {
     client: reqwest::Client,
     base_url: String,
     token: String,
-    approver: Arc<dyn Approver>,
 }
 
 impl HomeAssistantTool {
-    pub fn new(base_url: String, token: String, approver: Arc<dyn Approver>) -> Self {
+    pub fn new(base_url: String, token: String) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(HTTP_TIMEOUT)
@@ -79,7 +79,6 @@ impl HomeAssistantTool {
                 .expect("failed to build reqwest client"),
             base_url,
             token,
-            approver,
         }
     }
 
@@ -177,10 +176,18 @@ impl Tool for HomeAssistantTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: HassArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid homeassistant arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: HassArgs = parse_args(&input)?;
+        Ok(ToolOutput::text(self.run(args, ctx).await?))
+    }
+}
 
+impl HomeAssistantTool {
+    /// The action dispatch, kept as one `String`-returning helper rather than
+    /// wrapping ~20 return points in `ToolOutput::text`. Every arm's text is
+    /// already model-facing prose (refusals included — HA refusals are terminal
+    /// answers, not errors), and there is no structured view to expose yet.
+    async fn run(&self, args: HassArgs, ctx: &ToolContext) -> anyhow::Result<String> {
         match args.action.as_str() {
             "list_entities" => {
                 let states = self.get_json("/api/states").await?;
@@ -277,8 +284,8 @@ impl Tool for HomeAssistantTool {
                             domain: domain.to_string(),
                             service: service.to_string(),
                         });
-                if !self.approver.approve(&request).await {
-                    return Ok("Service call rejected by user; nothing was changed.".to_string());
+                if let Decision::Deny { feedback } = ctx.decide(&request).await {
+                    return Ok(refusal("Service call", feedback));
                 }
 
                 let resp = self
@@ -362,8 +369,8 @@ impl Tool for HomeAssistantTool {
                             domain: "automation".to_string(),
                             service: "save".to_string(),
                         });
-                if !self.approver.approve(&request).await {
-                    return Ok("Automation save rejected by user; nothing was changed.".to_string());
+                if let Decision::Deny { feedback } = ctx.decide(&request).await {
+                    return Ok(refusal("Automation save", feedback));
                 }
 
                 let resp = self
@@ -407,10 +414,8 @@ impl Tool for HomeAssistantTool {
                     domain: "automation".to_string(),
                     service: "delete".to_string(),
                 });
-                if !self.approver.approve(&request).await {
-                    return Ok(
-                        "Automation delete rejected by user; nothing was changed.".to_string()
-                    );
+                if let Decision::Deny { feedback } = ctx.decide(&request).await {
+                    return Ok(refusal("Automation delete", feedback));
                 }
 
                 let resp = self
@@ -441,6 +446,17 @@ impl Tool for HomeAssistantTool {
                 "unknown action `{other}` (expected list_entities/get_state/list_services/call_service/list_automations/get_automation/save_automation/delete_automation)"
             )),
         }
+    }
+}
+
+/// A refusal, carrying the reason the user gave (if any) so the model adjusts
+/// rather than re-asking for the same action.
+fn refusal(what: &str, feedback: Option<String>) -> String {
+    match feedback {
+        Some(reason) => {
+            format!("{what} rejected by the user; nothing was changed. They said: {reason}")
+        }
+        None => format!("{what} rejected by user; nothing was changed."),
     }
 }
 
@@ -652,7 +668,6 @@ fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver};
 
     fn states() -> Value {
         json!([
@@ -740,75 +755,58 @@ mod tests {
 
     // ── call_service guards ───────────────────────────────────────────────
 
-    struct DenyAll;
-    #[async_trait]
-    impl Approver for DenyAll {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            false
-        }
+    /// Unreachable base_url: every test here is refused *before* any HTTP.
+    fn tool() -> HomeAssistantTool {
+        HomeAssistantTool::new("http://127.0.0.1:1".to_string(), "token".to_string())
     }
 
-    struct AllowAll;
-    #[async_trait]
-    impl Approver for AllowAll {
-        async fn approve(&self, _request: &ApprovalRequest) -> bool {
-            true
-        }
+    /// The approver now rides on the turn's context, not the tool.
+    fn allow() -> ToolContext {
+        crate::tools::test_support::approving_ctx("cli:test")
     }
 
-    fn tool(approver: Arc<dyn Approver>) -> HomeAssistantTool {
-        // Unreachable base_url: every test here is refused *before* any HTTP.
-        HomeAssistantTool::new(
-            "http://127.0.0.1:1".to_string(),
-            "token".to_string(),
-            approver,
-        )
+    fn deny() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
     }
 
     #[tokio::test]
     async fn call_service_blocked_domain_refused_even_when_approved() {
         // AllowAll proves the blocklist sits below approval: still refused.
-        let out = tool(Arc::new(AllowAll))
-            .execute(
-                json!({"action": "call_service", "domain": "shell_command",
-                       "service": "run", "data": {"command": "rm -rf /"}})
-                .to_string(),
-            )
+        let out = tool()
+            .call(json!({"action": "call_service", "domain": "shell_command", "service": "run", "data": {"command": "rm -rf /"}}), &allow())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("blocked for security"));
     }
 
     #[tokio::test]
     async fn call_service_invalid_domain_refused() {
-        let out = tool(Arc::new(AllowAll))
-            .execute(
-                json!({"action": "call_service", "domain": "../../api/config",
-                       "service": "get"})
-                .to_string(),
+        let out = tool()
+            .call(
+                json!({"action": "call_service", "domain": "../../api/config", "service": "get"}),
+                &allow(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("invalid service domain"));
     }
 
     #[tokio::test]
     async fn call_service_rejected_when_approval_denied() {
-        let out = tool(Arc::new(DenyAll))
-            .execute(
-                json!({"action": "call_service", "domain": "light",
-                       "service": "turn_on", "entity_id": "light.kitchen"})
-                .to_string(),
-            )
+        let out = tool()
+            .call(json!({"action": "call_service", "domain": "light", "service": "turn_on", "entity_id": "light.kitchen"}), &deny())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("rejected by user"));
     }
 
     #[tokio::test]
     async fn unknown_action_errors() {
-        let err = tool(Arc::new(DenyAll))
-            .execute(json!({"action": "bogus"}).to_string())
+        let err = tool()
+            .call(json!({"action": "bogus"}), &deny())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown action"));
@@ -890,45 +888,40 @@ mod tests {
 
     #[tokio::test]
     async fn save_automation_blocked_service_refused_even_when_approved() {
-        let out = tool(Arc::new(AllowAll))
-            .execute(
-                json!({"action": "save_automation", "id": "1", "config": {
-                    "action": [{"service": "command_line.run"}]}})
-                .to_string(),
-            )
+        let out = tool()
+            .call(json!({"action": "save_automation", "id": "1", "config": { "action": [{"service": "command_line.run"}]}}), &allow())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("blocked service domain"));
     }
 
     #[tokio::test]
     async fn save_automation_rejected_when_approval_denied() {
-        let out = tool(Arc::new(DenyAll))
-            .execute(
-                json!({"action": "save_automation", "id": "1", "config": {
-                    "alias": "ok", "action": [{"service": "light.turn_on"}]}})
-                .to_string(),
-            )
+        let out = tool()
+            .call(json!({"action": "save_automation", "id": "1", "config": { "alias": "ok", "action": [{"service": "light.turn_on"}]}}), &deny())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("rejected by user"));
     }
 
     #[tokio::test]
     async fn delete_automation_rejected_when_approval_denied() {
-        let out = tool(Arc::new(DenyAll))
-            .execute(json!({"action": "delete_automation", "id": "1"}).to_string())
+        let out = tool()
+            .call(json!({"action": "delete_automation", "id": "1"}), &deny())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("rejected by user"));
     }
 
     #[tokio::test]
     async fn save_automation_invalid_id_errors() {
-        let err = tool(Arc::new(AllowAll))
-            .execute(
-                json!({"action": "save_automation", "id": "../x", "config": {"action": []}})
-                    .to_string(),
+        let err = tool()
+            .call(
+                json!({"action": "save_automation", "id": "../x", "config": {"action": []}}),
+                &allow(),
             )
             .await
             .unwrap_err();

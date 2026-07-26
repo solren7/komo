@@ -2,13 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     agent::daemon::next_occurrence_local,
     domain::{
+        context::ToolContext,
         reminder::{Reminder, ReminderRepository, ReminderStatus},
-        tool::Tool,
+        tool::{Tool, ToolError, ToolOutput, parse_args},
     },
 };
 
@@ -84,21 +85,21 @@ impl Tool for ReminderTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: ReminderArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid reminder arguments: {e}"))?;
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: ReminderArgs = parse_args(&input)?;
 
         match args.action.as_str() {
             "create" => {
-                let message = args
-                    .message
-                    .ok_or_else(|| anyhow::anyhow!("`message` is required for action=create"))?;
+                let message = args.message.ok_or_else(|| {
+                    ToolError::InvalidInput("`message` is required for action=create".to_string())
+                })?;
 
                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
                 match (args.after, args.at, args.cron) {
                     (Some(after), _, _) => {
-                        let delay = parse_after(&after)?;
+                        let delay = parse_after(&after)
+                            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
                         let run_at = now + delay.as_secs() as i64;
                         let reminder = Reminder::new(message, run_at);
                         let id = reminder.id.clone();
@@ -106,40 +107,47 @@ impl Tool for ReminderTool {
                             .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
                             .unwrap_or_else(|| run_at.to_string());
                         self.reminders.save(&reminder).await?;
-                        Ok(format!(
+                        Ok(ToolOutput::text(format!(
                             "Reminder {id} set for {fire_time}. \
                              Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
+                        .with_structured(json!({ "id": id, "run_at": run_at })))
                     }
                     (_, Some(at), _) => {
-                        let dt = chrono::DateTime::parse_from_rfc3339(&at)
-                            .map_err(|e| anyhow::anyhow!("invalid `at` time `{at}`: {e}"))?;
+                        let dt = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| {
+                            ToolError::InvalidInput(format!("invalid `at` time `{at}`: {e}"))
+                        })?;
                         let run_at = dt.timestamp();
                         let reminder = Reminder::new(message, run_at);
                         let id = reminder.id.clone();
                         let fire_time = dt.with_timezone(&chrono::Local).to_rfc3339();
                         self.reminders.save(&reminder).await?;
-                        Ok(format!(
+                        Ok(ToolOutput::text(format!(
                             "Reminder {id} set for {fire_time}. \
                              Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
+                        .with_structured(json!({ "id": id, "run_at": run_at })))
                     }
                     (_, _, Some(cron)) => {
-                        let run_at = next_occurrence_local(&cron, now)
-                            .map_err(|e| anyhow::anyhow!("invalid `cron` expression: {e}"))?;
+                        let run_at = next_occurrence_local(&cron, now).map_err(|e| {
+                            ToolError::InvalidInput(format!("invalid `cron` expression: {e}"))
+                        })?;
                         let reminder = Reminder::recurring(message, run_at, cron.clone());
                         let id = reminder.id.clone();
                         let next_time = chrono::DateTime::from_timestamp(run_at, 0)
                             .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
                             .unwrap_or_else(|| run_at.to_string());
                         self.reminders.save(&reminder).await?;
-                        Ok(format!(
+                        Ok(ToolOutput::text(format!(
                             "Recurring reminder {id} set: {cron} (next at {next_time}). \
                              Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
+                        .with_structured(
+                            json!({ "id": id, "run_at": run_at, "schedule": cron }),
+                        ))
                     }
-                    (None, None, None) => Err(anyhow::anyhow!(
-                        "one of `after`, `at`, or `cron` is required for action=create"
+                    (None, None, None) => Err(ToolError::InvalidInput(
+                        "one of `after`, `at`, or `cron` is required for action=create".to_string(),
                     )),
                 }
             }
@@ -147,7 +155,7 @@ impl Tool for ReminderTool {
             "list" => {
                 let pending = self.reminders.list_pending().await?;
                 if pending.is_empty() {
-                    return Ok("No pending reminders.".to_string());
+                    return Ok(ToolOutput::text("No pending reminders."));
                 }
                 let lines: Vec<String> = pending
                     .iter()
@@ -165,22 +173,23 @@ impl Tool for ReminderTool {
                         }
                     })
                     .collect();
-                Ok(lines.join("\n"))
+                Ok(ToolOutput::text(lines.join("\n"))
+                    .with_title(format!("{} pending reminders", pending.len())))
             }
 
             "cancel" => {
-                let id = args
-                    .id
-                    .ok_or_else(|| anyhow::anyhow!("`id` is required for action=cancel"))?;
+                let id = args.id.ok_or_else(|| {
+                    ToolError::InvalidInput("`id` is required for action=cancel".to_string())
+                })?;
                 self.reminders
                     .set_status(&id, ReminderStatus::Cancelled)
                     .await?;
-                Ok(format!("Reminder {id} cancelled."))
+                Ok(ToolOutput::text(format!("Reminder {id} cancelled.")))
             }
 
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected create/list/cancel)"
-            )),
+            ))),
         }
     }
 }
@@ -289,17 +298,22 @@ mod tests {
         (t, repo)
     }
 
+    fn ctx() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
+    }
+
     #[tokio::test]
     async fn reminder_tool_create_persists_pending() {
         let (t, repo) = tool();
         let result = t
-            .execute(
-                json!({"action": "create", "message": "drink water", "after": "1m"}).to_string(),
+            .call(
+                json!({"action": "create", "message": "drink water", "after": "1m"}),
+                &ctx(),
             )
             .await
             .unwrap();
-        assert!(result.contains("set for"));
-        assert!(result.contains("gateway"));
+        assert!(result.text.contains("set for"));
+        assert!(result.text.contains("gateway"));
         let pending = repo.reminders.lock().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].status, ReminderStatus::Pending);
@@ -309,11 +323,14 @@ mod tests {
     #[tokio::test]
     async fn reminder_tool_cancel_sets_status() {
         let (t, repo) = tool();
-        t.execute(json!({"action": "create", "message": "foo", "after": "5m"}).to_string())
-            .await
-            .unwrap();
+        t.call(
+            json!({"action": "create", "message": "foo", "after": "5m"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
         let id = repo.reminders.lock().unwrap()[0].id.clone();
-        t.execute(json!({"action": "cancel", "id": id}).to_string())
+        t.call(json!({"action": "cancel", "id": id}), &ctx())
             .await
             .unwrap();
         assert_eq!(
@@ -327,15 +344,15 @@ mod tests {
         let (t, repo) = tool();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let result = t
-            .execute(
-                json!({"action": "create", "message": "take medication", "cron": "0 9 * * *"})
-                    .to_string(),
+            .call(
+                json!({"action": "create", "message": "take medication", "cron": "0 9 * * *"}),
+                &ctx(),
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Recurring"));
-        assert!(result.contains("0 9 * * *"));
+        assert!(result.text.contains("Recurring"));
+        assert!(result.text.contains("0 9 * * *"));
 
         let rems = repo.reminders.lock().unwrap();
         assert_eq!(rems.len(), 1);
@@ -348,12 +365,14 @@ mod tests {
     async fn reminder_tool_rejects_invalid_cron() {
         let (t, repo) = tool();
         let result = t
-            .execute(
-                json!({"action": "create", "message": "foo", "cron": "not a cron"}).to_string(),
+            .call(
+                json!({"action": "create", "message": "foo", "cron": "not a cron"}),
+                &ctx(),
             )
             .await;
 
-        assert!(result.is_err());
+        // A bad cron is the model's mistake to fix, not a transient failure.
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
         assert!(repo.reminders.lock().unwrap().is_empty());
     }
 }

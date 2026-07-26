@@ -6,13 +6,14 @@
 //! service-layer concerns: the per-turn [`ToolTurnContext`] bundle the runtime
 //! hands the executor, and the ambient-session task-local.
 //!
-//! The `SESSION` task-local survives only as an internal compatibility seam:
-//! the approvers (`ChatApprover`, `PolicyApprover`) resolve a prompt against the
-//! current conversation without threading a context parameter through the
-//! `Approver` trait, so the executor installs the turn's session around each
-//! spawned tool task and they read [`current_session`]. Migrated tools read
-//! `ctx.session` instead. The run context is purely explicit — no ambient state
-//! decides whether a turn is ledgered.
+//! The `SESSION` task-local now serves **only the approvers**: `ChatApprover`
+//! and `PolicyApprover` resolve a prompt against the current conversation
+//! without threading a context parameter through the domain `Approver` trait, so
+//! the executor installs the turn's session around each spawned tool task and
+//! they read [`current_session`]. **No tool reads it** — every tool takes its
+//! session from the explicit `ctx.session` (tool trait v2). The run context is
+//! likewise purely explicit: no ambient state decides whether a turn is
+//! ledgered.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

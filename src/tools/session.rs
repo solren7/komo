@@ -2,10 +2,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 
-use crate::domain::{repository::SessionRepository, tool::Tool};
+use crate::domain::{
+    context::ToolContext,
+    repository::SessionRepository,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
+};
 
 #[derive(Deserialize)]
 struct SessionArgs {
@@ -52,16 +56,18 @@ impl Tool for SessionTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: SessionArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid session arguments: {e}"))?;
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: SessionArgs = parse_args(&input)?;
         let sessions = self.sessions.list().await?;
 
         match args.action.as_str() {
-            "count" => Ok(format!("{} stored sessions", sessions.len())),
+            "count" => Ok(
+                ToolOutput::text(format!("{} stored sessions", sessions.len()))
+                    .with_structured(json!({ "count": sessions.len() })),
+            ),
             "list" => {
                 if sessions.is_empty() {
-                    return Ok("no stored sessions".to_string());
+                    return Ok(ToolOutput::text("no stored sessions"));
                 }
                 let lines: Vec<String> = sessions
                     .iter()
@@ -79,13 +85,16 @@ impl Tool for SessionTool {
                         )
                     })
                     .collect();
-                Ok(format!(
+                Ok(ToolOutput::text(format!(
                     "{} sessions:\n{}",
                     sessions.len(),
                     lines.join("\n")
                 ))
+                .with_title(format!("{} sessions", sessions.len())))
             }
-            other => anyhow::bail!("unknown session action `{other}` (expected: count | list)"),
+            other => Err(ToolError::InvalidInput(format!(
+                "unknown session action `{other}` (expected: count | list)"
+            ))),
         }
     }
 }
@@ -119,34 +128,39 @@ mod tests {
         }
     }
 
+    fn ctx() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
+    }
+
     #[tokio::test]
     async fn count_reports_number_of_sessions() {
         let repo = Arc::new(FakeRepo(vec![Session::new("a"), Session::new("b")]));
         let out = SessionTool::new(repo)
-            .execute(r#"{"action":"count"}"#.to_string())
+            .call(json!({"action":"count"}), &ctx())
             .await
             .unwrap();
-        assert_eq!(out, "2 stored sessions");
+        assert_eq!(out.text, "2 stored sessions");
     }
 
     #[tokio::test]
     async fn list_includes_session_ids() {
         let repo = Arc::new(FakeRepo(vec![Session::new("abc-123")]));
         let out = SessionTool::new(repo)
-            .execute(r#"{"action":"list"}"#.to_string())
+            .call(json!({"action":"list"}), &ctx())
             .await
             .unwrap();
-        assert!(out.contains("abc-123"));
-        assert!(out.contains("0 user turns"));
+        assert!(out.text.contains("abc-123"));
+        assert!(out.text.contains("0 user turns"));
     }
 
     #[tokio::test]
-    async fn unknown_action_errors() {
+    async fn unknown_action_is_invalid_input() {
         let repo = Arc::new(FakeRepo(Vec::new()));
         let err = SessionTool::new(repo)
-            .execute(r#"{"action":"drop"}"#.to_string())
+            .call(json!({"action":"drop"}), &ctx())
             .await
             .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
         assert!(err.to_string().contains("unknown session action"));
     }
 }

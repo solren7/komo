@@ -36,8 +36,11 @@ mod tests {
     struct DenyAll;
     #[async_trait]
     impl crate::domain::approval::Approver for DenyAll {
-        async fn approve(&self, _r: &crate::domain::approval::ApprovalRequest) -> bool {
-            false
+        async fn decide(
+            &self,
+            _r: &crate::domain::approval::ApprovalRequest,
+        ) -> crate::domain::approval::Decision {
+            crate::domain::approval::Decision::deny()
         }
     }
 

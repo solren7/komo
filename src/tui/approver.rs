@@ -15,16 +15,17 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::domain::approval::{ApprovalRequest, Approver, Risk};
+use crate::domain::approval::{ApprovalRequest, Approver, Decision, Risk};
 
 /// The user's answer to an approval modal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     /// Allow this one action.
     Once,
     /// Allow and remember the scope key for the rest of the session.
     Session,
-    Deny,
+    /// Refuse, optionally with a reason the agent is told (typed after `n`).
+    Deny(Option<String>),
 }
 
 /// One approval rendered as a modal. `reply` is taken (`Option`) when the
@@ -52,14 +53,14 @@ impl TuiApprover {
 
 #[async_trait]
 impl Approver for TuiApprover {
-    async fn approve(&self, request: &ApprovalRequest) -> bool {
+    async fn decide(&self, request: &ApprovalRequest) -> Decision {
         if request.risk == Risk::Safe {
-            return true;
+            return Decision::Allow;
         }
         if let Some(key) = &request.scope_key
             && self.session_allowed.lock().unwrap().contains(key)
         {
-            return true;
+            return Decision::Allow;
         }
 
         let (tx, rx) = oneshot::channel();
@@ -71,18 +72,19 @@ impl Approver for TuiApprover {
         };
         // The TUI gone (channel closed) means no one can answer: deny.
         if self.prompts.send(prompt).is_err() {
-            return false;
+            return Decision::deny();
         }
         match rx.await {
-            Ok(Answer::Once) => true,
+            Ok(Answer::Once) => Decision::Allow,
             Ok(Answer::Session) => {
                 if let Some(key) = &request.scope_key {
                     self.session_allowed.lock().unwrap().insert(key.clone());
                 }
-                true
+                Decision::Allow
             }
-            // Explicit deny, or the modal was dropped unanswered (quit).
-            Ok(Answer::Deny) | Err(_) => false,
+            Ok(Answer::Deny(feedback)) => Decision::Deny { feedback },
+            // The modal was dropped unanswered (quit).
+            Err(_) => Decision::deny(),
         }
     }
 }
@@ -102,7 +104,12 @@ mod tests {
     async fn safe_requests_never_prompt() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let approver = TuiApprover::new(tx);
-        assert!(approver.approve(&ApprovalRequest::safe("read")).await);
+        assert!(
+            approver
+                .decide(&ApprovalRequest::safe("read"))
+                .await
+                .is_allowed()
+        );
         assert!(rx.try_recv().is_err(), "no modal for a safe action");
     }
 
@@ -113,13 +120,18 @@ mod tests {
 
         // First request prompts; answer "session".
         let a = approver.clone();
-        let fut = tokio::spawn(async move { a.approve(&normal("run", Some("shell:ls"))).await });
+        let fut = tokio::spawn(async move { a.decide(&normal("run", Some("shell:ls"))).await });
         let mut prompt = rx.recv().await.expect("modal shown");
         prompt.reply.take().unwrap().send(Answer::Session).unwrap();
-        assert!(fut.await.unwrap());
+        assert!(fut.await.unwrap().is_allowed());
 
         // Same scope key again: allowed with no modal.
-        assert!(approver.approve(&normal("run", Some("shell:ls"))).await);
+        assert!(
+            approver
+                .decide(&normal("run", Some("shell:ls")))
+                .await
+                .is_allowed()
+        );
         assert!(rx.try_recv().is_err(), "cached scope must not re-prompt");
     }
 
@@ -128,9 +140,25 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let approver = std::sync::Arc::new(TuiApprover::new(tx));
         let a = approver.clone();
-        let fut = tokio::spawn(async move { a.approve(&normal("rm -rf", None)).await });
+        let fut = tokio::spawn(async move { a.decide(&normal("rm -rf", None)).await });
         let prompt = rx.recv().await.expect("modal shown");
         drop(prompt); // quit without answering
-        assert!(!fut.await.unwrap());
+        assert_eq!(fut.await.unwrap(), Decision::deny());
+    }
+
+    #[tokio::test]
+    async fn a_denial_reason_reaches_the_caller() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = std::sync::Arc::new(TuiApprover::new(tx));
+        let a = approver.clone();
+        let fut = tokio::spawn(async move { a.decide(&normal("rm x", None)).await });
+        let mut prompt = rx.recv().await.expect("modal shown");
+        prompt
+            .reply
+            .take()
+            .unwrap()
+            .send(Answer::Deny(Some("用 trash".into())))
+            .unwrap();
+        assert_eq!(fut.await.unwrap().feedback(), Some("用 trash"));
     }
 }

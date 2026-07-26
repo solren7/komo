@@ -30,10 +30,11 @@ use crate::{
         tool_execution::{ToolExecutionConfig, ToolExecutor},
     },
     tools::{
-        ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool, file::FileTool,
-        homeassistant::HomeAssistantTool, memory::MemoryTool, reminder::ReminderTool,
-        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
-        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
+        ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
+        homeassistant::HomeAssistantTool, memory::MemoryTool, read::ReadTool,
+        reminder::ReminderTool, session::SessionTool, shell::ShellTool, skill::SkillTool,
+        task::TaskTool, time::TimeTool, todo::TodoTool, web_fetch::WebFetchTool,
+        web_search::WebSearchTool, write::WriteTool,
     },
 };
 
@@ -180,7 +181,8 @@ pub async fn build(
         )
         .with_approver(approver.clone());
         tools.register(Arc::new(TimeTool));
-        tools.register(Arc::new(FileTool::new(workspace.clone())));
+        tools.register(Arc::new(ReadTool::new(workspace.clone())));
+        tools.register(Arc::new(WriteTool::new(workspace.clone())));
         tools.register(Arc::new(ShellTool::new(workspace.clone())));
         tools.register(Arc::new(WebFetchTool::new()));
         tools.register(Arc::new(WebSearchTool::new()));
@@ -189,7 +191,7 @@ pub async fn build(
         // Scheduled jobs from inside a conversation. Every mutation is gated
         // through this tool set's approver — a chat-authored job is
         // model-authored, unlike one added with `komo cron add`.
-        tools.register(Arc::new(CronTool::new(cron_jobs.clone(), approver.clone())));
+        tools.register(Arc::new(CronTool::new(cron_jobs.clone())));
         tools.register(Arc::new(TaskTool::new(kanban.clone())));
         tools.register(Arc::new(TodoTool::new(db.clone())));
         tools.register(Arc::new(AskUserTool::new(clarify.clone())));
@@ -198,7 +200,6 @@ pub async fn build(
             tools.register(Arc::new(HomeAssistantTool::new(
                 ha.base_url.clone(),
                 ha.token.clone(),
-                approver.clone(),
             )));
         }
         tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
@@ -206,7 +207,6 @@ pub async fn build(
         tools.register(Arc::new(SkillTool::new(
             skills.clone(),
             skill_store.clone(),
-            approver.clone(),
         )));
         tools
     };
@@ -341,13 +341,11 @@ pub async fn build(
     briefing_tools.register(Arc::new(SkillTool::new(
         skills.clone(),
         skill_store.clone(),
-        briefing_approver.clone(),
     )));
     if let Some(ha) = &config.runtime.homeassistant_tool {
         briefing_tools.register(Arc::new(HomeAssistantTool::new(
             ha.base_url.clone(),
             ha.token.clone(),
-            briefing_approver.clone(),
         )));
     }
     let briefing_tool_names = briefing_tools
@@ -397,9 +395,15 @@ struct UnattendedDeny;
 
 #[async_trait::async_trait]
 impl Approver for UnattendedDeny {
-    async fn approve(&self, request: &crate::domain::approval::ApprovalRequest) -> bool {
+    async fn decide(
+        &self,
+        request: &crate::domain::approval::ApprovalRequest,
+    ) -> crate::domain::approval::Decision {
         tracing::warn!(summary = %request.summary,
             "briefing: denied (unattended; add an `unattended = true` policy rule to grant)");
-        false
+        crate::domain::approval::Decision::deny_because(
+            "这是无人值守的后台任务，没有人能批准这一步。只有配置了 \
+             `unattended = true` 的 [policy] 允许规则才会放行；请改用不需要审批的做法。",
+        )
     }
 }

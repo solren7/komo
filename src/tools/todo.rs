@@ -4,9 +4,9 @@
 //! `TodoWrite` — full-list replace on write, list order is priority, at most one
 //! item `in_progress`.
 //!
-//! The session is read from the ambient turn context (`current_session`), the
-//! same task-local the chat approver uses. With no session in context (aux
-//! sub-agents, maintenance sweeps) the tool is inert.
+//! The session comes from the call's explicit [`ToolContext`]. With no real
+//! session (aux sub-agents, maintenance sweeps — a detached context) the tool
+//! is inert.
 
 use std::sync::Arc;
 
@@ -174,7 +174,7 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver};
+    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
     use crate::domain::context::{SessionContext, ToolContext};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -182,8 +182,8 @@ mod tests {
     struct DenyAll;
     #[async_trait]
     impl Approver for DenyAll {
-        async fn approve(&self, _r: &ApprovalRequest) -> bool {
-            false
+        async fn decide(&self, _r: &ApprovalRequest) -> Decision {
+            Decision::deny()
         }
     }
 

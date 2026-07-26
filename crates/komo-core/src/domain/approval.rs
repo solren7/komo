@@ -22,15 +22,11 @@ pub enum Risk {
 pub enum ActionRef {
     /// A shell command (`shell` tool). Matched against the full command line.
     Shell { command: String },
-    /// A filesystem access (`file` tool). Matched against the path.
+    /// A filesystem access (`read` / `write`). Matched against the path.
     File { path: PathBuf, write: bool },
-    /// An outbound network fetch (`web_fetch`). Matched against the URL's host.
-    ///
-    /// Constructed by no tool yet — `web_fetch` runs un-gated — but it is *not*
-    /// dead: the policy layer matches it (`domain::policy`) and config exposes a
-    /// `network` rule category, so the capability is wired end-to-end and waiting
-    /// only for a tool to route network access through the approver.
-    #[allow(dead_code)]
+    /// An outbound network fetch (`web_fetch`). Matched against the URL's host
+    /// at dot boundaries, so a `network` deny rule can blackhole a domain
+    /// without catching look-alikes.
     Network { url: String },
     /// A Home Assistant service call, matched as `domain.service`.
     Service { domain: String, service: String },
@@ -95,6 +91,58 @@ impl ApprovalRequest {
     }
 }
 
+/// The answer to an [`ApprovalRequest`]: proceed, or don't — and when the user
+/// declined, optionally *why*.
+///
+/// The feedback arm is the point of this type existing rather than a bare
+/// `bool`. A denial with no explanation tells the model only that it failed;
+/// one carrying "别用 `rm`，用 `trash`" tells it what to do instead, so the next
+/// round is a corrected attempt rather than a retry of the same call. Borrowed
+/// from opencode v2's `PermissionV2.CorrectedError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny { feedback: Option<String> },
+}
+
+impl Decision {
+    /// Deny with no explanation (a bare `n`, a timeout, an auto-deny).
+    pub fn deny() -> Self {
+        Decision::Deny { feedback: None }
+    }
+
+    /// Deny, handing the model a reason it can act on.
+    pub fn deny_because(reason: impl Into<String>) -> Self {
+        Decision::Deny {
+            feedback: Some(reason.into()),
+        }
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Decision::Allow)
+    }
+
+    /// The denial's explanation, if the user (or a policy rule) gave one.
+    pub fn feedback(&self) -> Option<&str> {
+        match self {
+            Decision::Deny {
+                feedback: Some(text),
+            } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+impl From<bool> for Decision {
+    fn from(allowed: bool) -> Self {
+        if allowed {
+            Decision::Allow
+        } else {
+            Decision::deny()
+        }
+    }
+}
+
 /// Gate for sensitive, side-effecting actions (e.g. running a shell command or
 /// writing a file).
 ///
@@ -102,11 +150,21 @@ impl ApprovalRequest {
 /// concrete implementation that prompts the user. Tools that perform risky
 /// actions depend on an `Arc<dyn Approver>` rather than on any I/O directly.
 ///
-/// `approve` is async: an interactive approver reads a TTY, but a chat-channel
+/// `decide` is async: an interactive approver reads a TTY, but a chat-channel
 /// approver sends an approval prompt to the conversation and awaits the user's
 /// reply on a later turn (see `agent::interaction::ChatApprover`).
 #[async_trait::async_trait]
 pub trait Approver: Send + Sync {
-    /// Ask the user to approve `request`. Returns `true` if it may proceed.
-    async fn approve(&self, request: &ApprovalRequest) -> bool;
+    /// Ask the user to approve `request`. See [`Decision`] — a denial may carry
+    /// a reason for the model.
+    async fn decide(&self, request: &ApprovalRequest) -> Decision;
+
+    /// [`decide`](Approver::decide) reduced to a yes/no, for callers that have
+    /// nothing to do with a denial's reason.
+    ///
+    /// A pure projection — **do not override it**. Anything that varies the
+    /// answer belongs in `decide`, or the two entry points disagree.
+    async fn approve(&self, request: &ApprovalRequest) -> bool {
+        self.decide(request).await.is_allowed()
+    }
 }

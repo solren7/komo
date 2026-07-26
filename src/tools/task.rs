@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::domain::{
+    context::ToolContext,
     task::{Task, TaskRepository, TaskStatus, parse_task_status},
-    tool::Tool,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 #[derive(Deserialize)]
@@ -127,59 +128,64 @@ impl Tool for TaskTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: TaskArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid task arguments: {e}"))?;
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: TaskArgs = parse_args(&input)?;
 
         match args.action.as_str() {
             "capture" => {
-                let title = args
-                    .title
-                    .ok_or_else(|| anyhow::anyhow!("`title` is required for action=capture"))?;
+                let title = args.title.ok_or_else(|| {
+                    ToolError::InvalidInput("`title` is required for action=capture".to_string())
+                })?;
                 let mut task = Task::new(title);
                 if let Some(note) = args.note {
                     task.note = note;
                 }
                 if let Some(status) = args.status {
-                    task.status = parse_task_status(&status)?;
+                    task.status = parse_task_status(&status)
+                        .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
                 }
                 if let Some(waiting_on) = args.waiting_on {
                     task.waiting_on = waiting_on;
                 }
                 if let Some(due) = args.due {
-                    task.due_at = Some(parse_due(&due)?);
+                    task.due_at =
+                        Some(parse_due(&due).map_err(|e| ToolError::InvalidInput(e.to_string()))?);
                 }
                 if let Some(board) = args.board {
                     task.board = board;
                 }
                 self.tasks.save(&task).await?;
-                Ok(format!("Captured: {}", render(&task)))
+                Ok(ToolOutput::text(format!("Captured: {}", render(&task)))
+                    .with_structured(json!({ "id": task.id, "status": task.status.as_str() })))
             }
 
             "list" => {
                 let mut open = self.tasks.list_open().await?;
                 if let Some(status) = args.status {
-                    let wanted = parse_task_status(&status)?;
+                    let wanted = parse_task_status(&status)
+                        .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
                     open.retain(|t| t.status == wanted);
                 }
                 if let Some(board) = &args.board {
                     open.retain(|t| &t.board == board);
                 }
                 if open.is_empty() {
-                    return Ok("No open tasks.".to_string());
+                    return Ok(ToolOutput::text("No open tasks."));
                 }
-                Ok(open.iter().map(render).collect::<Vec<_>>().join("\n"))
+                Ok(
+                    ToolOutput::text(open.iter().map(render).collect::<Vec<_>>().join("\n"))
+                        .with_title(format!("{} open tasks", open.len())),
+                )
             }
 
             "update" => {
-                let id = args
-                    .id
-                    .ok_or_else(|| anyhow::anyhow!("`id` is required for action=update"))?;
-                let mut task = self
-                    .tasks
-                    .find(&id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("no task with id `{id}`"))?;
+                let id = args.id.ok_or_else(|| {
+                    ToolError::InvalidInput("`id` is required for action=update".to_string())
+                })?;
+                let mut task =
+                    self.tasks.find(&id).await?.ok_or_else(|| {
+                        ToolError::InvalidInput(format!("no task with id `{id}`"))
+                    })?;
                 if let Some(title) = args.title {
                     task.title = title;
                 }
@@ -187,7 +193,8 @@ impl Tool for TaskTool {
                     task.note = note;
                 }
                 if let Some(status) = args.status {
-                    task.status = parse_task_status(&status)?;
+                    task.status = parse_task_status(&status)
+                        .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
                     if task.status == TaskStatus::Done && task.completed_at.is_none() {
                         task.completed_at = Some(time::OffsetDateTime::now_utc().unix_timestamp());
                     }
@@ -196,7 +203,8 @@ impl Tool for TaskTool {
                     task.waiting_on = waiting_on;
                 }
                 if let Some(due) = args.due {
-                    task.due_at = Some(parse_due(&due)?);
+                    task.due_at =
+                        Some(parse_due(&due).map_err(|e| ToolError::InvalidInput(e.to_string()))?);
                     // A moved deadline should notify again.
                     task.due_notified_at = None;
                 }
@@ -204,27 +212,28 @@ impl Tool for TaskTool {
                     task.board = board;
                 }
                 self.tasks.update(&task).await?;
-                Ok(format!("Updated: {}", render(&task)))
+                Ok(ToolOutput::text(format!("Updated: {}", render(&task)))
+                    .with_structured(json!({ "id": task.id, "status": task.status.as_str() })))
             }
 
             "complete" => {
-                let id = args
-                    .id
-                    .ok_or_else(|| anyhow::anyhow!("`id` is required for action=complete"))?;
-                let mut task = self
-                    .tasks
-                    .find(&id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("no task with id `{id}`"))?;
+                let id = args.id.ok_or_else(|| {
+                    ToolError::InvalidInput("`id` is required for action=complete".to_string())
+                })?;
+                let mut task =
+                    self.tasks.find(&id).await?.ok_or_else(|| {
+                        ToolError::InvalidInput(format!("no task with id `{id}`"))
+                    })?;
                 task.status = TaskStatus::Done;
                 task.completed_at = Some(time::OffsetDateTime::now_utc().unix_timestamp());
                 self.tasks.update(&task).await?;
-                Ok(format!("Completed: {}", task.title))
+                Ok(ToolOutput::text(format!("Completed: {}", task.title))
+                    .with_structured(json!({ "id": task.id, "status": "done" })))
             }
 
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected capture/list/update/complete)"
-            )),
+            ))),
         }
     }
 }
@@ -294,13 +303,18 @@ mod tests {
         (TaskTool::new(repo.clone()), repo)
     }
 
+    fn ctx() -> ToolContext {
+        crate::tools::test_support::detached_ctx("cli:test")
+    }
+
     #[tokio::test]
     async fn capture_defaults_to_inbox() {
         let (tool, repo) = tool();
         let reply = tool
-            .execute(r#"{"action":"capture","title":"review PR"}"#.to_string())
+            .call(json!({"action":"capture","title":"review PR"}), &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(reply.contains("[inbox] review PR"), "{reply}");
         assert_eq!(repo.rows.lock().unwrap().len(), 1);
     }
@@ -308,9 +322,9 @@ mod tests {
     #[tokio::test]
     async fn capture_with_waiting_on_records_commitment() {
         let (tool, repo) = tool();
-        tool.execute(
-            r#"{"action":"capture","title":"weekly report","status":"waiting","waiting_on":"boss"}"#
-                .to_string(),
+        tool.call(
+            json!({"action":"capture","title":"weekly report","status":"waiting","waiting_on":"boss"}),
+            &ctx(),
         )
         .await
         .unwrap();
@@ -322,14 +336,15 @@ mod tests {
     #[tokio::test]
     async fn complete_sets_done_and_completed_at() {
         let (tool, repo) = tool();
-        tool.execute(r#"{"action":"capture","title":"x"}"#.to_string())
+        tool.call(json!({"action":"capture","title":"x"}), &ctx())
             .await
             .unwrap();
         let id = repo.rows.lock().unwrap()[0].id.clone();
         let reply = tool
-            .execute(format!(r#"{{"action":"complete","id":"{id}"}}"#))
+            .call(json!({"action":"complete","id":id}), &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(reply.contains("Completed"), "{reply}");
         let rows = repo.rows.lock().unwrap();
         assert_eq!(rows[0].status, TaskStatus::Done);
@@ -339,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn update_due_resets_notification_guard() {
         let (tool, repo) = tool();
-        tool.execute(r#"{"action":"capture","title":"x"}"#.to_string())
+        tool.call(json!({"action":"capture","title":"x"}), &ctx())
             .await
             .unwrap();
         let id = {
@@ -347,9 +362,10 @@ mod tests {
             rows[0].due_notified_at = Some(100);
             rows[0].id.clone()
         };
-        tool.execute(format!(
-            r#"{{"action":"update","id":"{id}","due":"2099-01-01T09:00:00+08:00"}}"#
-        ))
+        tool.call(
+            json!({"action":"update","id":id,"due":"2099-01-01T09:00:00+08:00"}),
+            &ctx(),
+        )
         .await
         .unwrap();
         let rows = repo.rows.lock().unwrap();
@@ -360,27 +376,35 @@ mod tests {
     #[tokio::test]
     async fn list_filters_by_status_and_hides_closed() {
         let (tool, _repo) = tool();
-        tool.execute(r#"{"action":"capture","title":"a"}"#.to_string())
+        tool.call(json!({"action":"capture","title":"a"}), &ctx())
             .await
             .unwrap();
-        tool.execute(r#"{"action":"capture","title":"b","status":"todo"}"#.to_string())
-            .await
-            .unwrap();
+        tool.call(
+            json!({"action":"capture","title":"b","status":"todo"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
         let reply = tool
-            .execute(r#"{"action":"list","status":"todo"}"#.to_string())
+            .call(json!({"action":"list","status":"todo"}), &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(reply.contains("b"), "{reply}");
         assert!(!reply.contains("[inbox] a"), "{reply}");
     }
 
     #[tokio::test]
-    async fn unknown_status_is_an_error() {
+    async fn unknown_status_is_invalid_input() {
         let (tool, _repo) = tool();
         let err = tool
-            .execute(r#"{"action":"capture","title":"x","status":"urgent"}"#.to_string())
+            .call(
+                json!({"action":"capture","title":"x","status":"urgent"}),
+                &ctx(),
+            )
             .await
             .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
         assert!(err.to_string().contains("unknown task status"));
     }
 }

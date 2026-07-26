@@ -31,7 +31,7 @@ use tracing::{info, warn};
 
 use crate::{
     domain::{
-        approval::{ApprovalRequest, Approver, Risk},
+        approval::{ApprovalRequest, Approver, Decision, Risk},
         cancel::CancelSignal,
         gateway::{MessageHandler, ReplySink, WeChatLogin},
         home::HomeRepository,
@@ -47,13 +47,15 @@ use crate::{
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The user's answer to an approval prompt.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Decision {
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Answer {
     /// Allow this one action.
     Once,
     /// Allow this action and remember its scope key for the rest of the session.
     Session,
-    Deny,
+    /// Refuse. `/deny <理由>` carries the reason through to the model (see
+    /// [`Decision`]) so the next round can correct the call rather than repeat it.
+    Deny(Option<String>),
 }
 
 /// The human-facing description of a pending approval, stored alongside the
@@ -158,7 +160,7 @@ impl CancelSignal for WatchCancel {
 /// between [`ChatApprover`] (registers/awaits) and [`GatewayDispatcher`]
 /// (resolves on `/approve`, clears on `/new`).
 pub struct ApprovalState {
-    pending: Mutex<HashMap<String, (oneshot::Sender<Decision>, PendingApproval)>>,
+    pending: Mutex<HashMap<String, (oneshot::Sender<Answer>, PendingApproval)>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session serialization gate. A round's tool calls now run
     /// concurrently (`AgentRuntime::run_agent_loop`), so two side-effecting
@@ -197,7 +199,7 @@ impl ApprovalState {
     /// approver awaits. Replaces any prior pending approval (its sender drops,
     /// which the old waiter reads as a denial). `info` is the structured prompt
     /// stored for the interactions poll.
-    fn register(&self, session: &str, info: PendingApproval) -> oneshot::Receiver<Decision> {
+    fn register(&self, session: &str, info: PendingApproval) -> oneshot::Receiver<Answer> {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -209,7 +211,7 @@ impl ApprovalState {
     /// Deliver `decision` to the approver waiting on `session`. Returns whether
     /// one was actually waiting (so the dispatcher can tell the user there was
     /// nothing to approve).
-    pub fn resolve(&self, session: &str, decision: Decision) -> bool {
+    pub fn resolve(&self, session: &str, decision: Answer) -> bool {
         match self.pending.lock().unwrap().remove(session) {
             Some((tx, _info)) => tx.send(decision).is_ok(),
             None => false,
@@ -293,34 +295,38 @@ impl ChatApprover {
 
 #[async_trait]
 impl Approver for ChatApprover {
-    async fn approve(&self, request: &ApprovalRequest) -> bool {
+    async fn decide(&self, request: &ApprovalRequest) -> Decision {
         if request.risk == Risk::Safe {
-            return true;
+            return Decision::Allow;
         }
         let Some(ctx) = current_session() else {
             warn!(summary = %request.summary, "approval auto-denied (no chat session in context)");
-            return false;
+            return Decision::deny_because(
+                "这一步需要用户批准，但当前上下文没有可以应答的会话（后台任务 / 子代理）",
+            );
         };
 
         // Trusted turn (a `komo chat` routed over the gateway's loopback api
         // channel): the CLI user is the host operator, so run without prompting.
         // The api channel only builds a trusted context for loopback callers.
         if ctx.auto_approve {
-            return true;
+            return Decision::Allow;
         }
 
         // No human to answer (HTTP API, detached REPL context): deny rather than
         // prompt a sink no one reads and wait out the timeout.
         if !ctx.interactive {
             warn!(summary = %request.summary, "approval auto-denied (non-interactive session)");
-            return false;
+            return Decision::deny_because(
+                "这一步需要用户批准，但当前会话是非交互的，没有人能应答",
+            );
         }
 
         // Already approved this kind of action for the session?
         if let Some(key) = &request.scope_key
             && self.state.is_session_approved(&ctx.session_id, key)
         {
-            return true;
+            return Decision::Allow;
         }
 
         // Serialize concurrent approvals for this session (a round's tools run
@@ -333,31 +339,32 @@ impl Approver for ChatApprover {
         if let Some(key) = &request.scope_key
             && self.state.is_session_approved(&ctx.session_id, key)
         {
-            return true;
+            return Decision::Allow;
         }
 
         if let Err(error) = ctx.sink.send(&prompt(request)).await {
             warn!(%error, "failed to send approval prompt; denying");
-            return false;
+            return Decision::deny();
         }
 
         let rx = self
             .state
             .register(&ctx.session_id, PendingApproval::from_request(request));
         match tokio::time::timeout(self.state.timeout, rx).await {
-            Ok(Ok(Decision::Once)) => true,
-            Ok(Ok(Decision::Session)) => {
+            Ok(Ok(Answer::Once)) => Decision::Allow,
+            Ok(Ok(Answer::Session)) => {
                 if let Some(key) = &request.scope_key {
                     self.state.remember(&ctx.session_id, key);
                 }
-                true
+                Decision::Allow
             }
-            // Explicit deny, or the sender was dropped (superseded / cleared).
-            Ok(Ok(Decision::Deny)) | Ok(Err(_)) => false,
+            Ok(Ok(Answer::Deny(feedback))) => Decision::Deny { feedback },
+            // The sender was dropped (superseded / cleared).
+            Ok(Err(_)) => Decision::deny(),
             Err(_) => {
                 self.state.forget_pending(&ctx.session_id);
                 let _ = ctx.sink.send("审批超时，已自动拒绝。").await;
-                false
+                Decision::deny_because("审批超时（5 分钟内无人应答），已自动拒绝")
             }
         }
     }
@@ -371,7 +378,10 @@ fn prompt(request: &ApprovalRequest) -> String {
     if let Some(detail) = &request.detail {
         s.push_str(&format!("\n（{detail}）"));
     }
-    s.push_str("\n回复 /approve 批准本次 · /approve session 批准本会话内同类操作 · /deny 拒绝");
+    s.push_str(
+        "\n回复 /approve 批准本次 · /approve session 批准本会话内同类操作 · \
+         /deny 拒绝（可写理由：/deny 用 trash 代替 rm）",
+    );
     s
 }
 
@@ -381,8 +391,9 @@ pub enum Command {
     /// Start a fresh session (clear context + approval state).
     New,
     /// Resolve a pending approval.
-    Approve(Decision),
-    Deny,
+    Approve(Answer),
+    /// Refuse a pending approval, optionally with a reason relayed to the agent.
+    Deny(Option<String>),
     /// Make this chat the home channel for proactive output.
     SetHome,
     /// Provision the WeChat channel by QR (delivered to this chat).
@@ -426,11 +437,20 @@ pub fn classify(text: &str) -> Command {
         });
     }
 
+    // `/deny <理由>` takes free text, so it is split off the *original* message
+    // (the reason keeps its case) before the exact-match table below.
+    let (verb, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((verb, rest)) => (verb, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if matches!(verb.to_lowercase().as_str(), "/deny" | "/no" | "/n") {
+        return Command::Deny((!rest.is_empty()).then(|| rest.to_string()));
+    }
+
     match lower.as_str() {
         "/new" | "/clear" | "/reset" => Command::New,
-        "/approve" | "/yes" | "/y" | "/ok" => Command::Approve(Decision::Once),
-        "/approve session" | "/approve all" => Command::Approve(Decision::Session),
-        "/deny" | "/no" | "/n" => Command::Deny,
+        "/approve" | "/yes" | "/y" | "/ok" => Command::Approve(Answer::Once),
+        "/approve session" | "/approve all" => Command::Approve(Answer::Session),
         "/sethome" | "/home" => Command::SetHome,
         "/wechat" | "/wechat login" | "/weixin" => Command::WechatLogin,
         _ => Command::Plain(text.to_string()),
@@ -516,18 +536,24 @@ impl GatewayDispatcher {
         sink: Arc<dyn ReplySink>,
     ) {
         match classify(&text) {
-            Command::Approve(decision) => {
-                let acked = self.approvals.resolve(session_id, decision);
-                let reply = match (acked, decision) {
-                    (true, Decision::Session) => "✅ 已批准（本会话内同类操作将自动放行）",
-                    (true, _) => "✅ 已批准",
+            Command::Approve(answer) => {
+                let session_wide = answer == Answer::Session;
+                let acked = self.approvals.resolve(session_id, answer);
+                let reply = match (acked, session_wide) {
+                    (true, true) => "✅ 已批准（本会话内同类操作将自动放行）",
+                    (true, false) => "✅ 已批准",
                     (false, _) => "当前没有待审批的操作。",
                 };
                 let _ = sink.send(reply).await;
             }
-            Command::Deny => {
-                let reply = if self.approvals.resolve(session_id, Decision::Deny) {
-                    "已拒绝。"
+            Command::Deny(reason) => {
+                let explained = reason.is_some();
+                let reply = if self.approvals.resolve(session_id, Answer::Deny(reason)) {
+                    if explained {
+                        "已拒绝，理由已转达。"
+                    } else {
+                        "已拒绝。"
+                    }
                 } else {
                     "当前没有待审批的操作。"
                 };
@@ -848,12 +874,12 @@ mod tests {
     fn classify_matches_commands_case_insensitively() {
         assert_eq!(classify("/new"), Command::New);
         assert_eq!(classify("  /CLEAR "), Command::New);
-        assert_eq!(classify("/approve"), Command::Approve(Decision::Once));
+        assert_eq!(classify("/approve"), Command::Approve(Answer::Once));
         assert_eq!(
             classify("/approve session"),
-            Command::Approve(Decision::Session)
+            Command::Approve(Answer::Session)
         );
-        assert_eq!(classify("/deny"), Command::Deny);
+        assert_eq!(classify("/deny"), Command::Deny(None));
         assert_eq!(classify("/sethome"), Command::SetHome);
         assert_eq!(classify(" /SetHome "), Command::SetHome);
         assert_eq!(classify("/wechat login"), Command::WechatLogin);
@@ -864,6 +890,21 @@ mod tests {
             classify("/approve the budget"),
             Command::Plain("/approve the budget".to_string())
         );
+    }
+
+    #[test]
+    fn deny_takes_a_free_text_reason_for_the_model() {
+        assert_eq!(
+            classify("/deny 用 trash 代替 rm"),
+            Command::Deny(Some("用 trash 代替 rm".to_string()))
+        );
+        // The verb is case-insensitive; the reason keeps its case.
+        assert_eq!(
+            classify("/DENY Use Trash"),
+            Command::Deny(Some("Use Trash".to_string()))
+        );
+        // Whitespace-only argument is the same as a bare `/deny`.
+        assert_eq!(classify("/deny    "), Command::Deny(None));
     }
 
     #[test]
@@ -890,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_false_when_nothing_pending() {
         let state = ApprovalState::new();
-        assert!(!state.resolve("s1", Decision::Once));
+        assert!(!state.resolve("s1", Answer::Once));
     }
 
     fn sample_pending() -> PendingApproval {
@@ -910,8 +951,8 @@ mod tests {
             state.pending_info("s1").map(|p| p.summary),
             Some("run shell command: ls".to_string())
         );
-        assert!(state.resolve("s1", Decision::Session));
-        assert_eq!(rx.await.unwrap(), Decision::Session);
+        assert!(state.resolve("s1", Answer::Session));
+        assert_eq!(rx.await.unwrap(), Answer::Session);
         // Cleared once resolved.
         assert!(state.pending_info("s1").is_none());
     }

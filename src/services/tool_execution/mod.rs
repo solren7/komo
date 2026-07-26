@@ -29,7 +29,7 @@ pub use context::{
     with_session,
 };
 
-use crate::domain::approval::{ApprovalRequest, Approver};
+use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::events::TurnEvent;
 use crate::domain::llm::{ToolCallReq, ToolOutcome};
 use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
@@ -281,11 +281,11 @@ impl ToolExecutionCore {
         }
 
         // Parse the model's JSON arguments once, here, so every tool sees a
-        // typed `Value` (and `parse_args` can produce the canonical
-        // `InvalidInput` error). Non-JSON args and the empty (no-arg) call are
-        // preserved: an unparseable string is wrapped as `Value::String` so the
-        // legacy bridge in `Tool::call` can hand the original text back to an
-        // unmigrated tool; migrated tools reject it via `parse_args`.
+        // typed `Value` and `parse_args` can produce the canonical
+        // `InvalidInput` error. Args that aren't JSON at all (a model emitting
+        // bare text) become a `Value::String`, which every tool's `parse_args`
+        // rejects with that same canonical error — the text is preserved in it
+        // so the model can see what it sent.
         let value = serde_json::from_str::<serde_json::Value>(&input)
             .unwrap_or_else(|_| serde_json::Value::String(input.clone()));
 
@@ -507,8 +507,8 @@ struct DenyAllApprover;
 
 #[async_trait::async_trait]
 impl Approver for DenyAllApprover {
-    async fn approve(&self, _request: &ApprovalRequest) -> bool {
-        false
+    async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+        Decision::deny_because("没有配置审批入口（executor 未安装 approver）")
     }
 }
 
@@ -531,7 +531,18 @@ mod tests {
 
     use super::*;
     use crate::domain::run::{Run, RunRepository, RunStep};
+    use crate::domain::tool::ToolOutput;
     use async_trait::async_trait;
+    use serde_json::Value;
+
+    /// Render args as the tool's *payload* rather than as JSON: these tests pass
+    /// bare text (the non-JSON arg path), and asserting on `"x"` with quotes
+    /// would be asserting about serde, not about the executor.
+    fn arg_text(v: &Value) -> String {
+        v.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())
+    }
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -602,8 +613,8 @@ mod tests {
         fn description(&self) -> &'static str {
             "echoes its input"
         }
-        async fn execute(&self, input: String) -> anyhow::Result<String> {
-            Ok(format!("echoed: {input}"))
+        async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text(format!("echoed: {}", arg_text(&input))))
         }
     }
 
@@ -619,8 +630,8 @@ mod tests {
         fn redact_args(&self, _args: &str) -> String {
             "[redacted]".to_string()
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
-            Ok("done".into())
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("done"))
         }
     }
 
@@ -633,7 +644,7 @@ mod tests {
         fn description(&self) -> &'static str {
             "always panics"
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             panic!("kaboom");
         }
     }
@@ -659,12 +670,12 @@ mod tests {
         fn idempotent(&self) -> bool {
             self.idempotent
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             if n < self.fail_times {
-                Err(anyhow::anyhow!("{}", self.error_msg))
+                Err(ToolError::Failed(anyhow::anyhow!("{}", self.error_msg)))
             } else {
-                Ok("ok".into())
+                Ok(ToolOutput::text("ok"))
             }
         }
     }
@@ -909,8 +920,8 @@ mod tests {
         fn description(&self) -> &'static str {
             "returns a large result"
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
-            Ok("x".repeat(10_000))
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x".repeat(10_000)))
         }
     }
 
@@ -958,9 +969,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "never returns"
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok("unreachable".into())
+            Ok(ToolOutput::text("unreachable"))
         }
     }
 

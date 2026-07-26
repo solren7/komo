@@ -151,7 +151,7 @@ impl Tool for AskUserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver};
+    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
     use crate::domain::context::{SessionContext, ToolContext};
     use crate::domain::gateway::ReplySink;
     use std::sync::Mutex;
@@ -171,8 +171,8 @@ mod tests {
     struct DenyAll;
     #[async_trait]
     impl Approver for DenyAll {
-        async fn approve(&self, _r: &ApprovalRequest) -> bool {
-            false
+        async fn decide(&self, _r: &ApprovalRequest) -> Decision {
+            Decision::deny()
         }
     }
 

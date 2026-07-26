@@ -4,23 +4,31 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::domain::approval::{ApprovalRequest, Approver, Risk};
+use crate::domain::approval::{ApprovalRequest, Approver, Decision, Risk};
 
 /// What the user answered at the approval prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
     /// Allow this one action only.
     Once,
     /// Allow this action and remember its scope key for the rest of the session.
     Session,
-    Deny,
+    /// Refuse. A denial answered as `n: <reason>` carries the reason to the
+    /// model, so it can correct the call instead of retrying it verbatim.
+    Deny(Option<String>),
 }
 
 fn parse_answer(input: &str) -> Answer {
-    match input.trim().to_lowercase().as_str() {
+    let trimmed = input.trim();
+    // A reason may follow the verb after `:` or whitespace (`n: use trash`).
+    let (verb, rest) = match trimmed.split_once([':', ' ']) {
+        Some((verb, rest)) => (verb, rest.trim()),
+        None => (trimmed, ""),
+    };
+    match verb.to_lowercase().as_str() {
         "y" | "yes" => Answer::Once,
         "s" | "session" => Answer::Session,
-        _ => Answer::Deny,
+        _ => Answer::Deny((!rest.is_empty()).then(|| rest.to_string())),
     }
 }
 
@@ -54,9 +62,9 @@ impl Default for CliApprover {
 
 #[async_trait]
 impl Approver for CliApprover {
-    async fn approve(&self, request: &ApprovalRequest) -> bool {
+    async fn decide(&self, request: &ApprovalRequest) -> Decision {
         if request.risk == Risk::Safe {
-            return true;
+            return Decision::Allow;
         }
 
         // Session cache: the user already said "allow for this session" for
@@ -65,7 +73,7 @@ impl Approver for CliApprover {
             && self.session_allowed.lock().unwrap().contains(key)
         {
             println!("✓ auto-approved (session): {}", request.summary);
-            return true;
+            return Decision::Allow;
         }
 
         // Serialize concurrent prompts onto the single TTY (a round's tools run
@@ -76,7 +84,7 @@ impl Approver for CliApprover {
         if let Some(key) = &request.scope_key
             && self.session_allowed.lock().unwrap().contains(key)
         {
-            return true;
+            return Decision::Allow;
         }
 
         // The prompt + stdin read is blocking; run it off the async runtime.
@@ -84,26 +92,26 @@ impl Approver for CliApprover {
         let answer = tokio::task::spawn_blocking(move || {
             print!("{prompt}");
             if io::stdout().flush().is_err() {
-                return Answer::Deny;
+                return Answer::Deny(None);
             }
             let mut answer = String::new();
             if io::stdin().read_line(&mut answer).is_err() {
-                return Answer::Deny;
+                return Answer::Deny(None);
             }
             parse_answer(&answer)
         })
         .await
-        .unwrap_or(Answer::Deny);
+        .unwrap_or(Answer::Deny(None));
 
         match answer {
-            Answer::Once => true,
+            Answer::Once => Decision::Allow,
             Answer::Session => {
                 if let Some(key) = &request.scope_key {
                     self.session_allowed.lock().unwrap().insert(key.clone());
                 }
-                true
+                Decision::Allow
             }
-            Answer::Deny => false,
+            Answer::Deny(feedback) => Decision::Deny { feedback },
         }
     }
 }
@@ -117,11 +125,13 @@ fn prompt_text(request: &ApprovalRequest) -> String {
             if let Some(detail) = &request.detail {
                 s.push_str(&format!("\n   ({detail})"));
             }
-            s.push_str("\n   Approve? [y]es once / [s]ession / [N]o ");
+            s.push_str(
+                "\n   Approve? [y]es once / [s]ession / [N]o (`n: reason` tells the agent why) ",
+            );
             s
         }
         Risk::Normal => format!(
-            "\n⚠  Approve request to {}? [y]es once / [s]ession / [N]o ",
+            "\n⚠  Approve request to {}? [y]es once / [s]ession / [N]o (`n: reason` tells the agent why) ",
             request.summary
         ),
     }
@@ -142,9 +152,22 @@ mod tests {
         assert_eq!(parse_answer("YES"), Answer::Once);
         assert_eq!(parse_answer("s\n"), Answer::Session);
         assert_eq!(parse_answer("Session"), Answer::Session);
-        assert_eq!(parse_answer(""), Answer::Deny);
-        assert_eq!(parse_answer("n"), Answer::Deny);
-        assert_eq!(parse_answer("whatever"), Answer::Deny);
+        assert_eq!(parse_answer(""), Answer::Deny(None));
+        assert_eq!(parse_answer("n"), Answer::Deny(None));
+        assert_eq!(parse_answer("whatever"), Answer::Deny(None));
+    }
+
+    #[test]
+    fn a_denial_can_carry_a_reason_for_the_model() {
+        assert_eq!(
+            parse_answer("n: use trash instead of rm\n"),
+            Answer::Deny(Some("use trash instead of rm".to_string()))
+        );
+        // Whitespace separator works too, and the reason keeps its case.
+        assert_eq!(
+            parse_answer("no Use Trash"),
+            Answer::Deny(Some("Use Trash".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -152,8 +175,9 @@ mod tests {
         let approver = CliApprover::new();
         assert!(
             approver
-                .approve(&ApprovalRequest::safe("run shell command: ls"))
+                .decide(&ApprovalRequest::safe("run shell command: ls"))
                 .await
+                .is_allowed()
         );
     }
 
@@ -167,6 +191,6 @@ mod tests {
             .insert("file:write".to_string());
         let request =
             ApprovalRequest::normal("write 5 bytes to /tmp/x").with_scope_key("file:write");
-        assert!(approver.approve(&request).await);
+        assert!(approver.decide(&request).await.is_allowed());
     }
 }

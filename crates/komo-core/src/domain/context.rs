@@ -4,14 +4,15 @@
 //! `Approver`) — no I/O — so they live in `domain`. The tool-execution service
 //! re-exports [`SessionContext`] and [`RunContext`] for path stability, adds the
 //! per-turn [`ToolTurnContext`] bundle, and owns the ambient-session task-local
-//! (a compatibility seam for the approvers). [`ToolContext`] is the **explicit**
-//! per-call context handed to `Tool::call` (roadmap: tool trait v2) so a tool
-//! reads its session and requests approval through `ctx`, not an ambient scope.
+//! (now only the approvers read it — see that module). [`ToolContext`] is the
+//! **explicit** per-call context handed to `Tool::call` (tool trait v2): every
+//! tool reads its session and requests approval through `ctx`, never an ambient
+//! scope.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use crate::domain::approval::{ApprovalRequest, Approver};
+use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::ReplySink;
@@ -189,10 +190,22 @@ impl ToolContext {
         }
     }
 
-    /// Ask the wired approver to allow `request`. The executor installs the
-    /// ambient session scope around the tool task, so the concrete approver
-    /// (chat/CLI) still resolves the prompt against the right conversation.
+    /// Ask the wired approver to allow `request`, keeping only the yes/no. The
+    /// executor installs the ambient session scope around the tool task, so the
+    /// concrete approver (chat/CLI) still resolves the prompt against the right
+    /// conversation.
+    ///
+    /// Use [`decide`](Self::decide) instead when the tool's refusal text should
+    /// carry the user's reason back to the model.
     pub async fn approve(&self, request: &ApprovalRequest) -> bool {
-        self.approver.approve(request).await
+        self.decide(request).await.is_allowed()
+    }
+
+    /// Ask the wired approver, keeping the full [`Decision`] — including the
+    /// reason a denial carried, which the tool should pass to the model as
+    /// [`ToolError::Denied`](crate::domain::tool::ToolError::Denied) so the next
+    /// round can correct itself rather than retry verbatim.
+    pub async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        self.approver.decide(request).await
     }
 }

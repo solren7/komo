@@ -31,6 +31,17 @@ impl Workspace {
         self.roots.iter().any(|root| resolved.starts_with(root))
     }
 
+    /// The normalized absolute form of `path`, but only when it lands inside the
+    /// workspace — `None` is the refusal. Relative paths anchor to the first
+    /// root, so a tool can accept `src/main.rs` as readily as an absolute path.
+    pub fn resolve_contained(&self, path: &Path) -> Option<PathBuf> {
+        let resolved = self.resolve(path);
+        self.roots
+            .iter()
+            .any(|root| resolved.starts_with(root))
+            .then_some(resolved)
+    }
+
     fn resolve(&self, path: &Path) -> PathBuf {
         let joined = if path.is_absolute() {
             path.to_path_buf()

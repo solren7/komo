@@ -338,7 +338,7 @@ mod tests {
             repository::SessionRepository,
             run::RunStatus,
             session::Session,
-            tool::Tool,
+            tool::{Tool, ToolError, ToolOutput},
         },
         infra::persistence::db::Db,
         tools::time::TimeTool,
@@ -397,8 +397,18 @@ mod tests {
         fn description(&self) -> &'static str {
             "echoes its input args"
         }
-        async fn execute(&self, input: String) -> anyhow::Result<String> {
-            Ok(format!("echo:{input}"))
+        async fn call(
+            &self,
+            input: serde_json::Value,
+            _ctx: &crate::domain::context::ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            // Echo the payload, not its JSON encoding: the assertion is about
+            // results threading back through the loop.
+            let text = input
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| input.to_string());
+            Ok(ToolOutput::text(format!("echo:{text}")))
         }
     }
 
@@ -412,8 +422,12 @@ mod tests {
         fn description(&self) -> &'static str {
             "always errors"
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
-            anyhow::bail!("boom")
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &crate::domain::context::ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Err(ToolError::Failed(anyhow::anyhow!("boom")))
         }
     }
 
@@ -477,10 +491,14 @@ mod tests {
         fn description(&self) -> &'static str {
             "parks until released"
         }
-        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &crate::domain::context::ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
             self.started.notify_waiters();
             self.released.notified().await;
-            Ok("released".to_string())
+            Ok(ToolOutput::text("released"))
         }
     }
 

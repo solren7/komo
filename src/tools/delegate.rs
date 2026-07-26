@@ -2,9 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::domain::{llm::LlmClient, message::Message, session::Session, tool::Tool};
+use crate::domain::{
+    context::ToolContext,
+    llm::LlmClient,
+    message::Message,
+    session::Session,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
+};
 
 #[derive(Deserialize)]
 struct DelegateArgs {
@@ -49,13 +55,12 @@ impl Tool for DelegateTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: DelegateArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid delegate arguments: {e}"))?;
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: DelegateArgs = parse_args(&input)?;
 
         let mut session = Session::new("delegate");
         session.messages.push(Message::user(&args.task));
-        self.llm.complete(&session).await
+        Ok(ToolOutput::text(self.llm.complete(&session).await?))
     }
 }
 
@@ -76,9 +81,12 @@ mod tests {
     async fn delegates_task_to_sub_agent() {
         let tool = DelegateTool::new(Arc::new(EchoLlm));
         let out = tool
-            .execute(json!({ "task": "summarize X" }).to_string())
+            .call(
+                json!({ "task": "summarize X" }),
+                &crate::tools::test_support::detached_ctx("cli:test"),
+            )
             .await
             .unwrap();
-        assert_eq!(out, "sub-agent handled: summarize X");
+        assert_eq!(out.text, "sub-agent handled: summarize X");
     }
 }

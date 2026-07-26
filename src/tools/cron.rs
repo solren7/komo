@@ -24,16 +24,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     domain::{
-        approval::{ActionRef, ApprovalRequest, Approver},
+        approval::{ActionRef, ApprovalRequest, Decision},
+        context::ToolContext,
         cron::{
             CronAction, CronJob, CronJobRepository, CronJobSpec, CronRunStatus,
             DEFAULT_CRON_JOB_TIMEOUT_SECS,
         },
-        tool::Tool,
+        tool::{Tool, ToolError, ToolOutput, parse_args},
     },
     services::operator_control::actions,
 };
@@ -69,21 +70,26 @@ struct CronArgs {
 /// message.
 pub struct CronTool {
     jobs: Arc<dyn CronJobRepository>,
-    approver: Arc<dyn Approver>,
 }
 
 impl CronTool {
-    pub fn new(jobs: Arc<dyn CronJobRepository>, approver: Arc<dyn Approver>) -> Self {
-        Self { jobs, approver }
+    pub fn new(jobs: Arc<dyn CronJobRepository>) -> Self {
+        Self { jobs }
     }
+}
 
-    /// Gate one management mutation (everything but `add`, which describes its
-    /// own action). One scope key for the family: approving "manage my jobs"
-    /// once per session shouldn't re-prompt per job.
-    async fn approve_manage(&self, summary: String) -> bool {
-        self.approver
-            .approve(&ApprovalRequest::normal(summary).with_scope_key("cron:manage".to_string()))
-            .await
+/// Gate one management mutation (everything but `add`, which describes its own
+/// action). One scope key for the family: approving "manage my jobs" once per
+/// session shouldn't re-prompt per job. Returns the refusal text (carrying the
+/// user's reason, if they gave one) when denied.
+async fn approve_manage(ctx: &ToolContext, summary: String, kept: &str) -> Option<String> {
+    let request = ApprovalRequest::normal(summary).with_scope_key("cron:manage".to_string());
+    match ctx.decide(&request).await {
+        Decision::Allow => None,
+        Decision::Deny { feedback } => Some(match feedback {
+            Some(reason) => format!("Rejected by the user ({reason}); {kept}"),
+            None => format!("Rejected by user; {kept}"),
+        }),
     }
 }
 
@@ -160,18 +166,20 @@ impl Tool for CronTool {
         })
     }
 
-    async fn execute(&self, input: String) -> anyhow::Result<String> {
-        let args: CronArgs = serde_json::from_str(&input)
-            .map_err(|e| anyhow::anyhow!("invalid cron arguments: {e}"))?;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: CronArgs = parse_args(&input)?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         match args.action.as_str() {
             "list" => {
                 let jobs = self.jobs.list().await?;
                 if jobs.is_empty() {
-                    return Ok("No scheduled jobs.".to_string());
+                    return Ok(ToolOutput::text("No scheduled jobs."));
                 }
-                Ok(jobs.iter().map(describe_job).collect::<Vec<_>>().join("\n"))
+                Ok(
+                    ToolOutput::text(jobs.iter().map(describe_job).collect::<Vec<_>>().join("\n"))
+                        .with_title(format!("{} scheduled jobs", jobs.len())),
+                )
             }
 
             "add" => {
@@ -182,17 +190,21 @@ impl Tool for CronTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        ToolError::InvalidInput(
                             "`schedule` is required for action=add — a 5-field cron \
                              expression like \"0 8 * * *\" (local time)"
+                                .to_string(),
                         )
                     })?
                     .to_string();
 
                 let (action, request) = match (args.prompt, args.command) {
-                    (Some(_), Some(_)) => anyhow::bail!(
-                        "pass either `prompt` (agent job) or `command` (program job), not both"
-                    ),
+                    (Some(_), Some(_)) => {
+                        return Err(ToolError::InvalidInput(
+                            "pass either `prompt` (agent job) or `command` (program job), not both"
+                                .to_string(),
+                        ));
+                    }
                     (Some(prompt), None) => {
                         let request = ApprovalRequest::normal(format!(
                             "Schedule agent job `{name}` [{schedule}]: {}",
@@ -232,16 +244,23 @@ impl Tool for CronTool {
                             request,
                         )
                     }
-                    (None, None) => anyhow::bail!(
-                        "action=add needs either `prompt` (an agent job) or `command` \
-                         (a fixed program)"
-                    ),
+                    (None, None) => {
+                        return Err(ToolError::InvalidInput(
+                            "action=add needs either `prompt` (an agent job) or `command` \
+                             (a fixed program)"
+                                .to_string(),
+                        ));
+                    }
                 };
 
-                if !self.approver.approve(&request).await {
-                    return Ok(format!(
-                        "Job `{name}` rejected by user; nothing was scheduled."
-                    ));
+                if let Decision::Deny { feedback } = ctx.decide(&request).await {
+                    return Ok(ToolOutput::text(match feedback {
+                        Some(reason) => format!(
+                            "Job `{name}` rejected by the user; nothing was scheduled. \
+                             They said: {reason}"
+                        ),
+                        None => format!("Job `{name}` rejected by user; nothing was scheduled."),
+                    }));
                 }
 
                 // Shared with `komo cron add` and the api channel: schedule
@@ -256,7 +275,7 @@ impl Tool for CronTool {
                     now,
                 )
                 .await?;
-                Ok(format!(
+                Ok(ToolOutput::text(format!(
                     "Scheduled {} job `{}` [{}] — first run {}. Runs while `komo gateway` \
                      is up; output goes to the home channel.",
                     job.action.kind(),
@@ -264,6 +283,11 @@ impl Tool for CronTool {
                     job.schedule,
                     local_time(job.next_run_at)
                 ))
+                .with_structured(json!({
+                    "name": job.name,
+                    "kind": job.action.kind(),
+                    "schedule": job.schedule,
+                })))
             }
 
             "remove" => {
@@ -271,18 +295,21 @@ impl Tool for CronTool {
                 // Confirm it exists before prompting: "approve deleting a job
                 // that isn't there" is a pointless question.
                 if self.jobs.find_by_name(&name).await?.is_none() {
-                    anyhow::bail!("{}", actions::no_cron_job_message(&name));
+                    return Err(missing_job(&name));
                 }
-                if !self
-                    .approve_manage(format!("Delete scheduled job `{name}`"))
-                    .await
+                if let Some(refusal) = approve_manage(
+                    ctx,
+                    format!("Delete scheduled job `{name}`"),
+                    &format!("job `{name}` was kept."),
+                )
+                .await
                 {
-                    return Ok(format!("Rejected by user; job `{name}` was kept."));
+                    return Ok(ToolOutput::text(refusal));
                 }
                 if !self.jobs.delete(&name).await? {
-                    anyhow::bail!("{}", actions::no_cron_job_message(&name));
+                    return Err(missing_job(&name));
                 }
-                Ok(format!("Removed job `{name}`."))
+                Ok(ToolOutput::text(format!("Removed job `{name}`.")))
             }
 
             action @ ("enable" | "disable") => {
@@ -290,20 +317,21 @@ impl Tool for CronTool {
                 let enabled = action == "enable";
                 let verb = if enabled { "Resume" } else { "Pause" };
                 if self.jobs.find_by_name(&name).await?.is_none() {
-                    anyhow::bail!("{}", actions::no_cron_job_message(&name));
+                    return Err(missing_job(&name));
                 }
-                if !self
-                    .approve_manage(format!("{verb} scheduled job `{name}`"))
-                    .await
+                if let Some(refusal) = approve_manage(
+                    ctx,
+                    format!("{verb} scheduled job `{name}`"),
+                    &format!("job `{name}` was left as it was."),
+                )
+                .await
                 {
-                    return Ok(format!(
-                        "Rejected by user; job `{name}` was left as it was."
-                    ));
+                    return Ok(ToolOutput::text(refusal));
                 }
                 let job = actions::set_cron_enabled(self.jobs.as_ref(), &name, enabled, now)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("{}", actions::no_cron_job_message(&name)))?;
-                Ok(if enabled {
+                    .ok_or_else(|| missing_job(&name))?;
+                Ok(ToolOutput::text(if enabled {
                     format!(
                         "Enabled job `{}` — next run {}.",
                         job.name,
@@ -314,44 +342,53 @@ impl Tool for CronTool {
                         "Disabled job `{}`. It stays listed and can be re-enabled.",
                         job.name
                     )
-                })
+                }))
             }
 
             "run" => {
                 let name = require_name(&args.name)?;
                 if self.jobs.find_by_name(&name).await?.is_none() {
-                    anyhow::bail!("{}", actions::no_cron_job_message(&name));
+                    return Err(missing_job(&name));
                 }
-                if !self
-                    .approve_manage(format!("Run scheduled job `{name}` now"))
-                    .await
+                if let Some(refusal) = approve_manage(
+                    ctx,
+                    format!("Run scheduled job `{name}` now"),
+                    &format!("job `{name}` was not run."),
+                )
+                .await
                 {
-                    return Ok(format!("Rejected by user; job `{name}` was not run."));
+                    return Ok(ToolOutput::text(refusal));
                 }
                 let job = actions::trigger_cron_job(self.jobs.as_ref(), &name, now)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("{}", actions::no_cron_job_message(&name)))?;
-                Ok(format!(
+                    .ok_or_else(|| missing_job(&name))?;
+                Ok(ToolOutput::text(format!(
                     "Job `{}` is due now — the gateway runs it on its next sweep tick \
                      (within a minute) and delivers the output to the home channel.",
                     job.name
-                ))
+                )))
             }
 
-            other => Err(anyhow::anyhow!(
+            other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected list/add/remove/enable/disable/run)"
-            )),
+            ))),
         }
     }
 }
 
-fn require_name(name: &Option<String>) -> anyhow::Result<String> {
+fn require_name(name: &Option<String>) -> Result<String, ToolError> {
     let name = name
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("`name` is required for this action"))?;
+        .ok_or_else(|| ToolError::InvalidInput("`name` is required for this action".to_string()))?;
     Ok(name.to_string())
+}
+
+/// "No such job" is the model naming one that doesn't exist — its mistake to
+/// fix from `action=list`, not a transient failure worth retrying.
+fn missing_job(name: &str) -> ToolError {
+    ToolError::InvalidInput(actions::no_cron_job_message(name))
 }
 
 /// One job as a line the model can relay: name, kind, schedule, state, target,
@@ -419,6 +456,7 @@ fn local_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::approval::Decision;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -475,37 +513,41 @@ mod tests {
     }
 
     #[async_trait]
-    impl Approver for Recorder {
-        async fn approve(&self, request: &ApprovalRequest) -> bool {
+    impl crate::domain::approval::Approver for Recorder {
+        async fn decide(&self, request: &ApprovalRequest) -> Decision {
             self.seen
                 .lock()
                 .unwrap()
                 .push((request.summary.clone(), request.risk));
-            self.allow
+            self.allow.into()
         }
     }
 
     fn tool(allow: bool) -> (CronTool, Arc<FakeJobs>, Arc<Recorder>) {
         let jobs = Arc::new(FakeJobs::default());
         let approver = Recorder::new(allow);
-        let t = CronTool::new(
-            jobs.clone() as Arc<dyn CronJobRepository>,
-            approver.clone() as Arc<dyn Approver>,
-        );
+        let t = CronTool::new(jobs.clone() as Arc<dyn CronJobRepository>);
         (t, jobs, approver)
+    }
+
+    /// Run one call with `rec` as the turn's approver (it now rides on the
+    /// context, not the tool).
+    async fn run(t: &CronTool, args: Value, rec: &Arc<Recorder>) -> Result<ToolOutput, ToolError> {
+        let ctx = ToolContext::new(
+            crate::domain::context::SessionContext::detached("cli:test"),
+            None,
+            rec.clone(),
+        );
+        t.call(args, &ctx).await
     }
 
     #[tokio::test]
     async fn add_agent_job_persists_after_approval() {
-        let (t, jobs, approver) = tool(true);
-        let out = t
-            .execute(
-                json!({"action": "add", "name": "morning-brief", "schedule": "0 8 * * *",
-                       "prompt": "总结我今天的日程", "skills": ["calendar"]})
-                .to_string(),
-            )
+        let (t, jobs, rec) = tool(true);
+        let out = run(&t, json!({"action": "add", "name": "morning-brief", "schedule": "0 8 * * *", "prompt": "总结我今天的日程", "skills": ["calendar"]}), &rec)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("morning-brief"), "{out}");
         assert!(out.contains("first run"), "{out}");
 
@@ -519,22 +561,23 @@ mod tests {
         assert_eq!(skills, &vec!["calendar".to_string()]);
         assert!(stored[0].next_run_at > 0, "schedule was resolved");
 
-        let seen = approver.seen.lock().unwrap();
+        let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, crate::domain::approval::Risk::Normal);
     }
 
     #[tokio::test]
     async fn command_job_is_gated_as_dangerous() {
-        let (t, jobs, approver) = tool(true);
-        t.execute(
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
             json!({"action": "add", "name": "rotate", "schedule": "0 14 * * 5",
-                   "command": "/opt/rotate.py", "args": ["--push"]})
-            .to_string(),
+                   "command": "/opt/rotate.py", "args": ["--push"]}),
+            &rec,
         )
         .await
         .unwrap();
-        let seen = approver.seen.lock().unwrap();
+        let seen = rec.seen.lock().unwrap();
         assert_eq!(seen[0].1, crate::domain::approval::Risk::Dangerous);
         assert!(seen[0].0.contains("/opt/rotate.py --push"), "{}", seen[0].0);
         assert_eq!(jobs.jobs.lock().unwrap().len(), 1);
@@ -542,64 +585,70 @@ mod tests {
 
     #[tokio::test]
     async fn denied_add_stores_nothing() {
-        let (t, jobs, _) = tool(false);
-        let out = t
-            .execute(
-                json!({"action": "add", "name": "x", "schedule": "0 8 * * *", "prompt": "hi"})
-                    .to_string(),
-            )
-            .await
-            .unwrap();
+        let (t, jobs, rec) = tool(false);
+        let out = run(
+            &t,
+            json!({"action": "add", "name": "x", "schedule": "0 8 * * *", "prompt": "hi"}),
+            &rec,
+        )
+        .await
+        .unwrap()
+        .text;
         assert!(out.contains("rejected"), "{out}");
         assert!(jobs.jobs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn add_rejects_bad_schedule_and_missing_action_fields() {
-        let (t, jobs, _) = tool(true);
+        let (t, jobs, rec) = tool(true);
         // A schedule croner can't parse never reaches the store.
         assert!(
-            t.execute(
-                json!({"action": "add", "name": "x", "schedule": "nope", "prompt": "hi"})
-                    .to_string(),
+            run(
+                &t,
+                json!({"action": "add", "name": "x", "schedule": "nope", "prompt": "hi"}),
+                &rec
             )
             .await
             .is_err()
         );
         // Neither prompt nor command.
         assert!(
-            t.execute(json!({"action": "add", "name": "x", "schedule": "0 8 * * *"}).to_string())
-                .await
-                .is_err()
+            run(
+                &t,
+                json!({"action": "add", "name": "x", "schedule": "0 8 * * *"}),
+                &rec
+            )
+            .await
+            .is_err()
         );
         // Both.
         assert!(
-            t.execute(
+            run(
+                &t,
                 json!({"action": "add", "name": "x", "schedule": "0 8 * * *",
-                       "prompt": "hi", "command": "/bin/true"})
-                .to_string(),
+                       "prompt": "hi", "command": "/bin/true"}),
+                &rec
             )
             .await
             .is_err()
         );
         // No schedule at all.
         assert!(
-            t.execute(json!({"action": "add", "name": "x", "prompt": "hi"}).to_string())
-                .await
-                .is_err()
+            run(
+                &t,
+                json!({"action": "add", "name": "x", "prompt": "hi"}),
+                &rec
+            )
+            .await
+            .is_err()
         );
         assert!(jobs.jobs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn add_rejects_a_name_that_is_not_key_shaped() {
-        let (t, jobs, _) = tool(true);
-        let err = t
-            .execute(
-                json!({"action": "add", "name": "morning brief", "schedule": "0 8 * * *",
-                       "prompt": "hi"})
-                .to_string(),
-            )
+        let (t, jobs, rec) = tool(true);
+        let err =             run(&t, json!({"action": "add", "name": "morning brief", "schedule": "0 8 * * *", "prompt": "hi"}), &rec)
             .await
             .unwrap_err()
             .to_string();
@@ -609,35 +658,35 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_duplicate_name() {
-        let (t, _, _) = tool(true);
-        let add = json!({"action": "add", "name": "dup", "schedule": "0 8 * * *", "prompt": "hi"})
-            .to_string();
-        t.execute(add.clone()).await.unwrap();
-        let err = t.execute(add).await.unwrap_err().to_string();
+        let (t, _jobs, rec) = tool(true);
+        let add = json!({"action": "add", "name": "dup", "schedule": "0 8 * * *", "prompt": "hi"});
+        run(&t, add.clone(), &rec).await.unwrap();
+        let err = run(&t, add, &rec).await.unwrap_err().to_string();
         assert!(err.contains("already exists"), "{err}");
     }
 
     #[tokio::test]
     async fn disable_then_enable_recomputes_next_run() {
-        let (t, jobs, _) = tool(true);
-        t.execute(
-            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"})
-                .to_string(),
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"}),
+            &rec,
         )
         .await
         .unwrap();
 
-        let out = t
-            .execute(json!({"action": "disable", "name": "j"}).to_string())
+        let out = run(&t, json!({"action": "disable", "name": "j"}), &rec)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("Disabled"), "{out}");
         assert!(!jobs.jobs.lock().unwrap()[0].enabled);
 
-        let out = t
-            .execute(json!({"action": "enable", "name": "j"}).to_string())
+        let out = run(&t, json!({"action": "enable", "name": "j"}), &rec)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("next"), "{out}");
         let stored = jobs.jobs.lock().unwrap();
         assert!(stored[0].enabled);
@@ -646,17 +695,18 @@ mod tests {
 
     #[tokio::test]
     async fn run_makes_the_job_due_now() {
-        let (t, jobs, _) = tool(true);
-        t.execute(
-            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"})
-                .to_string(),
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"}),
+            &rec,
         )
         .await
         .unwrap();
-        let out = t
-            .execute(json!({"action": "run", "name": "j"}).to_string())
+        let out = run(&t, json!({"action": "run", "name": "j"}), &rec)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("due now"), "{out}");
         assert!(
             jobs.jobs.lock().unwrap()[0].next_run_at
@@ -666,56 +716,52 @@ mod tests {
 
     #[tokio::test]
     async fn denied_management_leaves_the_job_alone() {
-        let (t, jobs, _) = tool(true);
-        t.execute(
-            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"})
-                .to_string(),
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "j", "schedule": "0 8 * * *", "prompt": "hi"}),
+            &rec,
         )
         .await
         .unwrap();
-        // A fresh tool over the same store, this time denying.
-        let denier = CronTool::new(
-            jobs.clone() as Arc<dyn CronJobRepository>,
-            Recorder::new(false) as Arc<dyn Approver>,
-        );
-        let out = denier
-            .execute(json!({"action": "remove", "name": "j"}).to_string())
+        // Same tool and store, but this turn's approver denies.
+        let denier = Recorder::new(false);
+        let out = run(&t, json!({"action": "remove", "name": "j"}), &denier)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("kept"), "{out}");
         assert_eq!(jobs.jobs.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn unknown_job_errors_without_prompting() {
-        let (t, _, approver) = tool(true);
+        let (t, _jobs, rec) = tool(true);
         for action in ["remove", "enable", "disable", "run"] {
-            let err = t
-                .execute(json!({"action": action, "name": "ghost"}).to_string())
+            let err = run(&t, json!({"action": action, "name": "ghost"}), &rec)
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("no cron job named"), "{action}: {err}");
         }
         assert!(
-            approver.seen.lock().unwrap().is_empty(),
+            rec.seen.lock().unwrap().is_empty(),
             "a missing job must not raise an approval prompt"
         );
     }
 
     #[tokio::test]
     async fn list_reports_schedule_state_and_last_outcome() {
-        let (t, jobs, _) = tool(true);
+        let (t, jobs, rec) = tool(true);
         assert_eq!(
-            t.execute(json!({"action": "list"}).to_string())
-                .await
-                .unwrap(),
+            run(&t, json!({"action": "list"}), &rec).await.unwrap().text,
             "No scheduled jobs."
         );
-        t.execute(
+        run(
+            &t,
             json!({"action": "add", "name": "j", "schedule": "0 8 * * *",
-                   "prompt": "a very long prompt that goes on and on"})
-            .to_string(),
+                   "prompt": "a very long prompt that goes on and on"}),
+            &rec,
         )
         .await
         .unwrap();
@@ -725,10 +771,7 @@ mod tests {
             stored[0].last_status = Some(CronRunStatus::Failed);
             stored[0].last_error = "boom\nsecond line".into();
         }
-        let out = t
-            .execute(json!({"action": "list"}).to_string())
-            .await
-            .unwrap();
+        let out = run(&t, json!({"action": "list"}), &rec).await.unwrap().text;
         assert!(out.contains("j (agent) [0 8 * * *]"), "{out}");
         assert!(out.contains("last run"), "{out}");
         assert!(out.contains("failed — boom second line"), "{out}");
@@ -736,9 +779,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_errors() {
-        let (t, _, _) = tool(true);
+        let (t, _jobs, rec) = tool(true);
         assert!(
-            t.execute(json!({"action": "frobnicate"}).to_string())
+            run(&t, json!({"action": "frobnicate"}), &rec)
                 .await
                 .is_err()
         );

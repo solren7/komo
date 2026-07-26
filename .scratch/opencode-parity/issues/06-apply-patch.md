@@ -1,7 +1,20 @@
 # 06 — `apply_patch`：多文件补丁，先统一审批再落盘
 
-Status: ready-for-agent
+Status: done (2026-07-26) — `cargo test` 556 passed
 Phase: 1 工具集 · 依赖: 03 04
+
+## 落地记录
+
+- `services/patch.rs`（新）：v2 `patch.ts` 的 `*** Begin Patch` 语法完整移植 ——
+  add/delete/update、`@@` context、`*** End of File`、heredoc 解包、拒绝
+  `*** Move to:`。定位用逐级放宽的比较（exact → 去尾空白 → trim → 标点归一），
+  因为这个格式没有行号。12 个解析/应用单测。
+- `tools/apply_patch.rs`：先解析、再解析全部路径、**一次审批覆盖整个影响面**，
+  然后顺序落盘。无回滚（v2 也没有），中途失败的错误里明确列出「已经落盘的是哪些，
+  不要重复」。
+- `fs_common::allow_write_batch`（新）：一次 human prompt + 对其余路径做
+  `Risk::Safe` 的**纯策略复核**（保留 `ActionRef::File{write:true}`）。这样既只问
+  一次，又保证任一路径被 deny 规则挡住就整批不写。
 
 ## 目标
 

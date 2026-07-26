@@ -50,6 +50,11 @@ impl Tool for WriteTool {
          lines risks losing the rest."
     }
 
+    /// This call can park on an approval prompt, so it must outlast one.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(crate::domain::tool::APPROVAL_BOUND)
+    }
+
     /// Drop the write body before it reaches the run ledger — it can be
     /// arbitrarily large and may contain secrets. The action, path and a byte
     /// count keep the step readable.

@@ -1,7 +1,17 @@
 # 13 — `shell` 对齐 v2 `bash`：timeout / workdir / 结构化输出
 
-Status: ready-for-agent
+Status: done (2026-07-26) — `cargo test` 556 passed
 Phase: 2 管线 · 依赖: 01（反馈拒绝）· 11（structured 落库）
+
+## 落地记录
+
+- `shell` 新增 `timeout`（毫秒，默认 2min，上限 10min，超限**钳制**而非报错）和
+  `workdir`（workspace 内校验）；`structured = {exit, truncated, timeout}`。
+- **进程组**：`process_group(0)` + 超时 `killpg` —— 原来只 kill `sh`，它启动的
+  子进程会变孤儿继续跑（还占着管道）。回归测试：命令里后台起一个 1 秒后写文件的
+  子进程，超时后等 1.6 秒断言那个文件**没有**被创建。
+- 两层时钟刻意保留：工具自己的 timeout 先触发并给出「用更大的 timeout 重试」，
+  executor 外层只兜底（见 `Tool::max_duration`）。
 
 ## 目标
 

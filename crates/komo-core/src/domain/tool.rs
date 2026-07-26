@@ -77,6 +77,17 @@ impl From<anyhow::Error> for ToolError {
     }
 }
 
+/// The per-call ceiling for a tool that can park on an interactive approval
+/// prompt (`write`, `edit`, `apply_patch`, `shell`, `cron`, `homeassistant`,
+/// `skill install`).
+///
+/// A chat approval waits up to five minutes for the user
+/// (`agent::interaction::APPROVAL_TIMEOUT`), so a shorter ceiling would abort the
+/// call *while the human is still deciding* — the worst possible outcome: the
+/// user approves, and nothing happens. This is that timeout plus room for the
+/// work itself.
+pub const APPROVAL_BOUND: std::time::Duration = std::time::Duration::from_secs(7 * 60);
+
 /// Decode a tool's typed arguments from the JSON `Value` the executor parsed,
 /// mapping a schema mismatch to the canonical [`ToolError::InvalidInput`] — the
 /// one place tool arguments are validated, replacing each tool's hand-rolled
@@ -152,6 +163,23 @@ pub trait Tool: Send + Sync {
     /// Arguments are decoded with [`parse_args`] — one canonical
     /// "rewrite the arguments" error instead of each tool's own phrasing.
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Wall-clock ceiling for **one call** of this tool, overriding the
+    /// executor's default (`tool_timeout_secs`, 120s).
+    ///
+    /// `None` — the default — accepts that ceiling, which exists to catch a
+    /// *hang*. Override it when waiting is the normal case rather than a
+    /// symptom, or the call is killed mid-legitimate-work:
+    ///
+    /// * a whole sub-agent completion (`delegate`) can outlast one round-trip;
+    /// * `shell` honors a caller-supplied `timeout` of up to ten minutes, and its
+    ///   own timeout must fire first so the model gets "retry with a bigger
+    ///   timeout" instead of an opaque abort;
+    /// * anything that prompts for approval has to outlast a human reading it —
+    ///   see [`APPROVAL_BOUND`].
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
 
     /// Whether `call` is safe to retry after a transient failure whose
     /// side-effect status is *ambiguous* — a timeout or 5xx that may already

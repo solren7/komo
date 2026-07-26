@@ -1,0 +1,377 @@
+//! The `grep` tool: search file *contents* by regex.
+//!
+//! The other half of locating code. Output copies opencode v2's shape — a count
+//! line, then `path:` blocks of `Line N: text` — because that is what models
+//! have been trained on, and because it is compact enough that a wide search
+//! still fits in a turn.
+//!
+//! Permission order matters here: the walk collects candidate paths first, the
+//! policy filters them, and only the survivors are opened. A `file` deny rule
+//! therefore prevents the content from being read at all, not merely from being
+//! shown.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::domain::{
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
+    workspace::Workspace,
+};
+use crate::services::search;
+use crate::tools::fs_common;
+
+const DEFAULT_LIMIT: usize = 100;
+const MAX_LIMIT: usize = 1_000;
+/// Per-line preview cap, so one minified line can't fill the whole result.
+const MAX_LINE_CHARS: usize = 400;
+
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    /// Directory or single file to search; defaults to the workspace root.
+    #[serde(default)]
+    path: Option<String>,
+    /// Glob restricting which files are searched, e.g. `*.{ts,tsx}`.
+    #[serde(default)]
+    include: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub struct GrepTool {
+    workspace: Arc<Workspace>,
+}
+
+impl GrepTool {
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for GrepTool {
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents by regular expression, returning file paths, line \
+         numbers and the matching lines. Honors .gitignore and skips binaries. \
+         Narrow with `path` (a directory or one file) and `include` (a file glob \
+         like `*.{ts,tsx}`). Prefer this over `grep`/`rg` through `shell`."
+    }
+
+    fn idempotent(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression to search for in file contents."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search, absolute or relative to the workspace root. Defaults to the root."
+                },
+                "include": {
+                    "type": "string",
+                    "description": "Glob limiting which files are searched, e.g. `*.rs` or `*.{ts,tsx}`."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": format!("Maximum matches to return (default {DEFAULT_LIMIT}, maximum {MAX_LIMIT}).")
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: GrepArgs = parse_args(&input)?;
+        let target = fs_common::resolve(&self.workspace, args.path.as_deref().unwrap_or("."))?;
+
+        if let Some(refusal) = fs_common::allow_read(ctx, &target).await {
+            return Ok(ToolOutput::text(refusal));
+        }
+
+        let matcher = search::compile_regex(&args.pattern).map_err(ToolError::InvalidInput)?;
+        let include = match &args.include {
+            Some(glob) => Some(search::compile_glob(glob).map_err(ToolError::InvalidInput)?),
+            None => None,
+        };
+        let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+        // One file or a whole tree: a single file skips the walk entirely.
+        let is_file = tokio::fs::metadata(&target)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        let root = if is_file {
+            target.parent().unwrap_or(&target).to_path_buf()
+        } else {
+            target.clone()
+        };
+
+        let (candidates, walk_clipped) = if is_file {
+            (vec![target.clone()], false)
+        } else {
+            let walk_root = root.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                search::candidates(
+                    &walk_root,
+                    |p| include.as_ref().is_none_or(|g| g.is_match(p)),
+                    search::MAX_CANDIDATES,
+                )
+            })
+            .await
+            .map_err(|e| ToolError::Failed(anyhow::anyhow!("grep walk failed: {e}")))?;
+            (
+                found.items.into_iter().map(|c| c.path).collect(),
+                found.clipped,
+            )
+        };
+
+        // Filter *before* reading: a denied file's contents are never opened.
+        let mut allowed: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+        for path in candidates {
+            if fs_common::allow_read(ctx, &path).await.is_none() {
+                allowed.push(path);
+            }
+        }
+
+        let searched = allowed.len();
+        let found =
+            tokio::task::spawn_blocking(move || search::search_files(&allowed, &matcher, limit))
+                .await
+                .map_err(|e| ToolError::Failed(anyhow::anyhow!("grep failed: {e}")))?;
+
+        if found.items.is_empty() {
+            return Ok(ToolOutput::text(format!(
+                "No matches for `{}` in {searched} file(s).",
+                args.pattern
+            ))
+            .with_structured(json!({ "matches": 0, "files_searched": searched })));
+        }
+
+        // v2's shape: a count, then one block per file.
+        let mut lines = vec![format!("Found {} matches", found.items.len())];
+        let mut current = String::new();
+        for m in &found.items {
+            let shown = search::display_path(&root, &m.path);
+            if shown != current {
+                if !current.is_empty() {
+                    lines.push(String::new());
+                }
+                current = shown.clone();
+                lines.push(format!("{shown}:"));
+            }
+            lines.push(format!("  Line {}: {}", m.line, clip(&m.text)));
+        }
+        if found.clipped {
+            lines.push(format!(
+                "\n…stopped at {limit} matches. Narrow the pattern, or use `include`/`path`."
+            ));
+        }
+        if walk_clipped {
+            lines.push(format!(
+                "(only the {} most recently modified files were searched)",
+                search::MAX_CANDIDATES
+            ));
+        }
+
+        let files = found
+            .items
+            .iter()
+            .map(|m| m.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        Ok(ToolOutput::text(lines.join("\n"))
+            .with_title(format!(
+                "grep {} ({} matches in {files} files)",
+                args.pattern,
+                found.items.len()
+            ))
+            .with_structured(json!({
+                "matches": found.items.len(),
+                "files_matched": files,
+                "files_searched": searched,
+                "clipped": found.clipped,
+            })))
+    }
+}
+
+/// Clip one preview line at a char boundary.
+fn clip(text: &str) -> String {
+    if text.chars().count() <= MAX_LINE_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX_LINE_CHARS).collect();
+    out.push_str(" …[clipped]");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_support::detached_ctx;
+
+    fn tool_in(tag: &str) -> (GrepTool, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("komo_greptool_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(
+            dir.join("src/main.rs"),
+            "fn main() {\n    let needle = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "// no match here\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "needle in prose\n").unwrap();
+        std::fs::write(dir.join("build/gen.rs"), "let needle = 2;\n").unwrap();
+        (
+            GrepTool::new(Arc::new(Workspace::new(vec![dir.clone()]))),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn reports_path_line_and_text() {
+        let (tool, _dir) = tool_in("basic");
+        let out = tool
+            .call(json!({ "pattern": "needle" }), &detached_ctx("cli:t"))
+            .await
+            .unwrap();
+        assert!(out.text.starts_with("Found "), "{}", out.text);
+        assert!(out.text.contains("src/main.rs:"), "{}", out.text);
+        // Leading indentation is preserved — it is meaningful in code.
+        assert!(
+            out.text.contains("Line 2:     let needle = 1;"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("notes.md:"), "{}", out.text);
+        // Gitignored files are not searched.
+        assert!(!out.text.contains("gen.rs"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn include_limits_which_files_are_searched() {
+        let (tool, _dir) = tool_in("include");
+        let out = tool
+            .call(
+                json!({ "pattern": "needle", "include": "*.rs" }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("src/main.rs"), "{}", out.text);
+        assert!(!out.text.contains("notes.md"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn a_single_file_path_searches_only_that_file() {
+        let (tool, _dir) = tool_in("onefile");
+        let out = tool
+            .call(
+                json!({ "pattern": "needle", "path": "notes.md" }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["files_searched"], 1);
+        assert!(out.text.contains("notes.md"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn no_match_reports_how_many_files_were_searched() {
+        let (tool, _dir) = tool_in("nomatch");
+        let out = tool
+            .call(json!({ "pattern": "zzzz" }), &detached_ctx("cli:t"))
+            .await
+            .unwrap();
+        assert!(out.text.contains("No matches"), "{}", out.text);
+        assert_eq!(out.structured["matches"], 0);
+    }
+
+    #[tokio::test]
+    async fn limit_clips_and_says_it_clipped() {
+        let (tool, _dir) = tool_in("limit");
+        let out = tool
+            .call(
+                json!({ "pattern": "needle", "limit": 1 }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["matches"], 1);
+        assert!(out.text.contains("stopped at 1 matches"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn a_bad_regex_is_invalid_input() {
+        let (tool, _dir) = tool_in("badregex");
+        let err = tool
+            .call(json!({ "pattern": "(unclosed" }), &detached_ctx("cli:t"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+        assert!(err.to_string().contains("invalid regular expression"));
+    }
+
+    /// The exfiltration guard: a `file`/read deny rule must stop grep from
+    /// opening the file, not merely from printing it.
+    #[tokio::test]
+    async fn a_denied_path_is_never_searched() {
+        struct DenySecrets;
+        #[async_trait::async_trait]
+        impl crate::domain::approval::Approver for DenySecrets {
+            async fn decide(
+                &self,
+                r: &crate::domain::approval::ApprovalRequest,
+            ) -> crate::domain::approval::Decision {
+                let secret = match &r.action {
+                    Some(crate::domain::approval::ActionRef::File { path, .. }) => {
+                        path.to_string_lossy().contains("secrets")
+                    }
+                    _ => false,
+                };
+                if secret {
+                    crate::domain::approval::Decision::deny_because("off limits")
+                } else {
+                    crate::domain::approval::Decision::Allow
+                }
+            }
+        }
+
+        let (tool, dir) = tool_in("denied");
+        std::fs::write(dir.join("secrets.env"), "needle = hunter2\n").unwrap();
+        let ctx = crate::domain::context::ToolContext::new(
+            crate::domain::context::SessionContext::detached("cli:t"),
+            None,
+            Arc::new(DenySecrets),
+        );
+        let out = tool
+            .call(json!({ "pattern": "needle" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("src/main.rs"), "{}", out.text);
+        assert!(!out.text.contains("secrets"), "{}", out.text);
+        assert!(!out.text.contains("hunter2"), "{}", out.text);
+    }
+
+    #[test]
+    fn long_lines_are_clipped_on_a_char_boundary() {
+        let clipped = clip(&"界".repeat(MAX_LINE_CHARS + 10));
+        assert!(clipped.ends_with("…[clipped]"));
+    }
+}

@@ -428,11 +428,56 @@ kanban.db connections), and two cross-cutting files at the top level —
 `services/tool_execution/` — the tool-execution module (deepening plan §6): `ToolExecutor` owns the whole pipeline the loop used to assemble by hand
 - `ToolExecutor::execute_round(calls, &ToolTurnContext)` is the external interface: one round of model-requested calls in, order-preserving `ToolOutcome`s out (run concurrently — the interactive approver serializes prompts per session, so approvals stay safe). Unknown tools and tool errors become outcome content the model can recover from. `definitions()` is the read-only catalog view `build_llm` uses for function-calling schemas
 - inside, each call runs the invariant order: claim a ledger seq (the per-turn call budget counts logical calls, not retry attempts) → redact args (`Tool::redact_args`) → execute on a panic-catching task with the session context installed and a `tool` tracing span → map panic/cancel to errors → **transient-error retry** (typed `RetryHint` from `TransientError` preferred, text markers as fallback; connection-level failures retry any tool, ambiguous ones only `Tool::idempotent()` tools, terminal never; retries collapse into one ledger step) → record the `RunStep` best-effort → cap the LLM-facing result at a UTF-8 boundary with a "narrow your query" marker (after the ledger records the original)
-- execution policy is **instance-owned** `ToolExecutionConfig` (`max_result_bytes` from config's `max_tool_result_bytes`; `max_calls_per_turn` = 100 backstop) — no process globals; two executors can carry different policies
+- execution policy is **instance-owned** `ToolExecutionConfig` (`max_result_bytes` from config's `max_tool_result_bytes`; `max_calls_per_turn` = 500 backstop; `max_call_duration` from `tool_timeout_secs`) — no process globals; two executors can carry different policies. The per-call timeout is a **default**, not a law: `Tool::max_duration()` overrides it per tool, because the config value exists to catch a *hang* and several tools legitimately wait — `delegate` runs a whole sub-agent completion (10 min), `shell` honors its own `timeout` argument (up to 10 min, so its ceiling sits above that), and every approval-gated tool must outlast the 5-minute chat approval prompt (`domain::tool::APPROVAL_BOUND`) or it would abort *while the user is still deciding*
 - context is **explicit**: the runtime passes `ToolTurnContext { session, run: Option<RunContext> }` per turn, and each call gets a `ToolContext { session, run, approver }`. `Tool::call(Value, &ToolContext)` is the **only** tool entry point — the old string-in/string-out `Tool::execute` and its bridge are gone. The `SESSION` task-local now serves **only the approvers** (`ChatApprover` / `PolicyApprover` resolve a prompt against the current conversation without a context parameter on the domain `Approver` trait): the dispatcher / api / `handle_input` establish it and the executor re-installs it around each spawned tool task. No tool reads it — session-scoped tools (`todo`, `memory`) take `ctx.session`
 - `infra/rig_tool.rs::RigTool` adapts each `Tool` into a rig `ToolDyn` for schemas and shares the executor's `ToolExecutionCore`, so its trait-required `call` fallback (not on the hot path) carries identical retry/ledger/cap semantics
 
 `tools/time.rs` — first built-in tool; returns RFC 3339 UTC timestamp
+
+`tools/shell.rs` — `sh -c` behind the approver, with a **hardline floor** of
+commands no approval unlocks (`rm -rf /`, `mkfs`, …) and a dangerous-pattern list
+that escalates to a `Risk::Dangerous` prompt. Takes a model-supplied `timeout`
+(ms, default 2 min, max 10 min) and `workdir` (workspace-confined), and reports
+`structured = {exit, truncated, timeout}` alongside the prose. The child runs in
+its **own process group** (`process_group(0)`) so a timeout `killpg`s the whole
+tree — killing `sh` alone left the processes it started running, holding the
+pipes; there is a regression test for exactly that. Two nested clocks, on
+purpose: this tool's own timeout fires first with an actionable "retry with a
+bigger timeout", and the executor's (`Tool::max_duration`, set above this tool's
+maximum) is only there if the inner one somehow doesn't.
+
+`tools/grep.rs` + `tools/glob.rs` + `services/search.rs` — content and filename
+search, built on **ripgrep's own libraries** (`ignore` + `globset` +
+`grep-searcher`/`grep-regex`) rather than shelling out to an `rg` binary: komo
+ships as a single binary and can't assume one exists. `services/search.rs` is the
+blocking walk/match layer (the tools call it inside `spawn_blocking`), and it is
+deliberately split into `candidates` (which paths) and `search_files` (what's in
+them) so the permission policy runs over the paths **before any content is
+read** — a `category = "file", access = "read"` deny rule therefore stops `grep`
+from opening the file, not merely from printing it. The walk honors
+`.gitignore`/`.ignore` (with `require_git(false)`, since a komo workspace need not
+be a repo) and skips hidden entries, `.git/` and binaries, so results don't fill
+up with `target/` and `node_modules/`. `glob` returns paths newest-first; `grep`
+copies v2's output shape (`Found N matches`, then `path:` blocks of
+`Line N: text`, indentation preserved). Both are `Risk::Safe` + `idempotent`.
+
+`tools/edit.rs` + `tools/apply_patch.rs` + `services/diff.rs` +
+`services/patch.rs` — the precise-mutation pair. `edit` replaces an **exact**
+string: it refuses an ambiguous match (with the count) or a missing one (telling
+the model to copy the text verbatim) rather than guessing — **no fuzzy
+matching**, the same call v2 made. It matches in the file's own line-ending
+style (a model that read a CRLF file still sends `\n`) and preserves a BOM.
+`apply_patch` applies v2's `*** Begin Patch` envelope (`services/patch.rs`, ported
+from its `patch.ts`): add/update/delete across files, **one approval for the whole
+blast radius** (`fs_common::allow_write_batch` — one prompt, then a policy-only
+`Risk::Safe` re-check per remaining path, so a deny rule on any target blocks the
+batch before a byte is written). The format carries no line numbers, so chunks are
+located by context with a progressively looser comparison ladder (exact →
+trailing-whitespace → trimmed → punctuation-folded). There is **no rollback**: a
+mid-patch failure leaves earlier operations applied and says exactly which, since
+a model that doesn't know what landed makes things worse. Both tools go through
+`file_mutation::write_if_unchanged` and report a unified diff + line counts via
+`services/diff.rs` (counts inline for the model, full patch in `structured`).
 
 `tools/read.rs` + `tools/write.rs` + `tools/fs_common.rs` — the filesystem pair
 (replacing the old single `file{action}` tool, opencode-v2 shaped). `read` pages a

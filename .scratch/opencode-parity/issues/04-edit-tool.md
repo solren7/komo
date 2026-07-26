@@ -1,7 +1,17 @@
 # 04 — `edit` 工具：精确替换 + stale 保护 + BOM/换行保留 + diff
 
-Status: ready-for-agent
+Status: done (2026-07-26) — `cargo test` 556 passed
 Phase: 1 工具集 · 依赖: 01 03 · 阻塞: 06
+
+## 落地记录
+
+- `tools/edit.rs`：精确替换 + `replaceAll` + 出现次数校验（0 / >1 各自的错误文本
+  照抄 v2，因为那些文本本身就是给模型的修复指引）+ CRLF 匹配（模型永远发 `\n`）
+  + BOM 保留 + stale 保护（复用 03 的 `write_if_unchanged`）。
+- `services/diff.rs`（新）：`similar` 算 unified diff + 增删行数。模型看
+  `+N -M` 与前 6 行 `-`/`+` 预览，完整 patch 进 `structured`（不烧 token）。
+- **不做 fuzzy 匹配**，与 v2 一致。
+- `Snapshot::text()` 加回来了（03 里因为 dead code 删过），edit 需要它取原文。
 
 ## 目标
 

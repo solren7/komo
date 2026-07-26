@@ -118,6 +118,11 @@ impl Tool for CronTool {
          for a plain nudge and `task` for one-off work with no clock."
     }
 
+    /// These calls can park on an approval prompt, so they must outlast one.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(crate::domain::tool::APPROVAL_BOUND)
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

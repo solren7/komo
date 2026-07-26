@@ -52,7 +52,7 @@ use retry::{TOOL_RETRY_BACKOFF_MS, TOOL_RETRY_MAX_ATTEMPTS, should_retry};
 /// out unbounded. Set generously above any legitimate turn. Enforced against
 /// the run-ledger seq, so it applies only to ledgered turns (the main agent),
 /// never to callers without a run context.
-const DEFAULT_MAX_TOOL_CALLS_PER_TURN: i64 = 100;
+const DEFAULT_MAX_TOOL_CALLS_PER_TURN: i64 = 500;
 
 /// Hard ceiling on how many tool calls a *single* round may actually execute.
 /// The per-turn budget bounds the total, but a single malformed round can
@@ -340,7 +340,12 @@ impl ToolExecutionCore {
                 // markers so the retry classifier treats it as terminal — a
                 // wall-clock exhaustion won't succeed on an immediate retry.
                 let abort = join.abort_handle();
-                let joined = match self.config.max_call_duration {
+                // A tool that legitimately waits (a sub-agent completion, a human
+                // reading an approval prompt, a build it was given ten minutes
+                // for) declares its own ceiling; the config default only applies
+                // to tools for which waiting means hanging.
+                let limit = tool.max_duration().or(self.config.max_call_duration);
+                let joined = match limit {
                     Some(d) => match tokio::time::timeout(d, join).await {
                         Ok(r) => r,
                         Err(_) => {
@@ -988,6 +993,76 @@ mod tests {
         let out = one(&executor, call("hang", "{}"), &unledgered()).await;
         assert!(
             out.content.contains("exceeded its 1s execution limit"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    /// A tool that legitimately waits (a sub-agent completion, a human at an
+    /// approval prompt) declares its own ceiling, and the executor honors it over
+    /// the config default — the bug being that `delegate` was killed at 120s
+    /// mid-completion.
+    #[tokio::test(start_paused = true)]
+    async fn a_tools_own_ceiling_overrides_the_config_default() {
+        struct PatientTool;
+        #[async_trait]
+        impl Tool for PatientTool {
+            fn name(&self) -> &'static str {
+                "patient"
+            }
+            fn description(&self) -> &'static str {
+                "waits longer than the default allows"
+            }
+            fn max_duration(&self) -> Option<Duration> {
+                Some(Duration::from_secs(600))
+            }
+            async fn call(&self, _i: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                Ok(ToolOutput::text("finished"))
+            }
+        }
+
+        let executor = executor(
+            vec![Arc::new(PatientTool)],
+            ToolExecutionConfig {
+                // The default would abort this at 1s.
+                max_call_duration: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        let out = one(&executor, call("patient", "{}"), &unledgered()).await;
+        assert_eq!(out.content, "finished");
+    }
+
+    /// …but its ceiling is still a ceiling: a genuine hang inside a patient tool
+    /// is caught, just later.
+    #[tokio::test(start_paused = true)]
+    async fn a_patient_tool_is_still_bounded() {
+        struct PatientButHung;
+        #[async_trait]
+        impl Tool for PatientButHung {
+            fn name(&self) -> &'static str {
+                "patient_hang"
+            }
+            fn description(&self) -> &'static str {
+                "never returns, but claims patience"
+            }
+            fn max_duration(&self) -> Option<Duration> {
+                Some(Duration::from_secs(5))
+            }
+            async fn call(&self, _i: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(ToolOutput::text("unreachable"))
+            }
+        }
+
+        let executor = executor(
+            vec![Arc::new(PatientButHung)],
+            ToolExecutionConfig::default(),
+        );
+        let out = one(&executor, call("patient_hang", "{}"), &unledgered()).await;
+        assert!(
+            out.content.contains("exceeded its 5s execution limit"),
             "got: {}",
             out.content
         );

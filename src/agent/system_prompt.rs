@@ -38,6 +38,21 @@ const IDENTITY: &str = "You are Komo, a concise and helpful personal agent. \
 const TIME_GUIDANCE: &str = "Use the `time` tool when you need the exact current \
     date and time; never invent a timestamp.";
 
+/// Gated on `grep`. Locating comes before reading: a model that starts by
+/// reading whole files burns the turn's budget on the wrong ones.
+const SEARCH_GUIDANCE: &str = "To find code, use `grep` (contents) and `glob` \
+    (filenames) — not `find`/`rg` through `shell`. Search first, then `read` only \
+    the files that matched.";
+
+/// Gated on `edit`. The failure mode this heads off is a model rewriting a whole
+/// file to change three lines, and losing the parts it misremembered.
+const EDIT_GUIDANCE: &str = "To change part of a file use `edit` (exact string \
+    replacement) — or `apply_patch` when the change spans several files, so it \
+    takes one approval instead of one per file. Reserve `write` for creating a \
+    file or genuinely replacing all of it. `edit` requires the text to match \
+    byte for byte, so read the file first and copy it verbatim rather than \
+    reconstructing it from memory.";
+
 /// Gated on the `read` tool. Two habits worth stating: page instead of giving
 /// up on a long file, and don't shell out for what `read` already does (a `cat`
 /// through `shell` loses the line numbers `write` edits depend on, and asks for
@@ -262,6 +277,12 @@ impl SystemPromptBuilder {
         }
         if self.has("read") {
             parts.push(READ_GUIDANCE.to_string());
+        }
+        if self.has("grep") {
+            parts.push(SEARCH_GUIDANCE.to_string());
+        }
+        if self.has("edit") {
+            parts.push(EDIT_GUIDANCE.to_string());
         }
         if self.has("session") || self.has("memory") || self.has("skill") {
             parts.push(STATE_GUIDANCE.to_string());

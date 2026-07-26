@@ -64,6 +64,11 @@ impl Tool for SkillTool {
          installs it after the operator approves."
     }
 
+    /// These calls can park on an approval prompt, so they must outlast one.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(crate::domain::tool::APPROVAL_BOUND)
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

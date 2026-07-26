@@ -42,6 +42,14 @@ impl Tool for DelegateTool {
          not see the main conversation."
     }
 
+    /// A sub-agent runs a full model completion, which routinely outlasts the
+    /// executor's 120s default — and being aborted mid-completion wastes the
+    /// tokens already spent. The LLM client has its own per-request timeout
+    /// (`llm_timeout_secs`), so this only has to be comfortably above it.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(10 * 60))
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

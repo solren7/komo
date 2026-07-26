@@ -102,7 +102,20 @@ fn hardline_pattern(command: &str) -> Option<&'static str> {
 #[derive(Deserialize)]
 struct ShellArgs {
     command: String,
+    /// Wall-clock budget in milliseconds. The model asks for more when it knows
+    /// the command is slow (a build, a test run) rather than losing the work to a
+    /// fixed ceiling.
+    #[serde(default)]
+    timeout: Option<u64>,
+    /// Working directory, relative to the workspace root (default: the root).
+    #[serde(default)]
+    workdir: Option<String>,
 }
+
+/// Default command budget, matching opencode v2's `bash`.
+const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
+/// Ceiling on what the model may ask for.
+const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 
 /// Markers that introduce a secret value as `marker=<secret>` (case-insensitive).
 const SECRET_KEY_MARKERS: &[&str] = &[
@@ -198,6 +211,14 @@ impl Tool for ShellTool {
          confirmation, and a few catastrophic ones are always refused."
     }
 
+    /// The caller may ask for up to [`MAX_TIMEOUT_MS`]; the executor's clock has
+    /// to sit *above* that, or a legitimate long command would be aborted with an
+    /// opaque error instead of this tool's "retry with a bigger timeout". The
+    /// slack also covers a human sitting on the approval prompt.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(MAX_TIMEOUT_MS) + crate::domain::tool::APPROVAL_BOUND)
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -205,6 +226,18 @@ impl Tool for ShellTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to run, e.g. `ls -la`."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": format!(
+                        "Milliseconds to allow before the command (and anything it \
+                         started) is killed. Default {DEFAULT_TIMEOUT_MS}, maximum \
+                         {MAX_TIMEOUT_MS}. Raise it for builds and test runs."
+                    )
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory to run in, relative to the workspace root. Defaults to the root."
                 }
             },
             "required": ["command"]
@@ -265,6 +298,36 @@ impl Tool for ShellTool {
             }));
         }
 
+        let cwd = match &args.workdir {
+            Some(dir) => {
+                let path = self
+                    .workspace
+                    .resolve_contained(std::path::Path::new(dir))
+                    .ok_or_else(|| {
+                        ToolError::Denied(format!(
+                            "workdir `{dir}` is outside the workspace and was blocked."
+                        ))
+                    })?;
+                if !tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    return Err(ToolError::InvalidInput(format!(
+                        "workdir `{dir}` is not a directory."
+                    )));
+                }
+                Some(path)
+            }
+            None => self.workspace.roots().first().cloned(),
+        };
+
+        let timeout = std::time::Duration::from_millis(
+            args.timeout
+                .unwrap_or(DEFAULT_TIMEOUT_MS)
+                .min(MAX_TIMEOUT_MS),
+        );
+
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(&args.command)
@@ -275,12 +338,18 @@ impl Tool for ShellTool {
             // command, dropping the `Child` must kill the process — otherwise
             // `sh` (and its children) would be orphaned and keep running.
             .kill_on_drop(true);
-        if let Some(root) = self.workspace.roots().first() {
-            cmd.current_dir(root);
+        // Own a process *group*, so a timeout can kill the whole tree. Without
+        // this, killing `sh` leaves its children (`sleep`, a dev server, a
+        // compiler) running with the pipe still open.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        if let Some(dir) = &cwd {
+            cmd.current_dir(dir);
         }
         let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to spawn command: {e}")))?;
+        let pgid = child.id().map(|id| id as i32);
 
         // Read both streams concurrently, each bounded to MAX_STREAM_BYTES, so a
         // command emitting unbounded output can't buffer the whole thing into
@@ -302,21 +371,60 @@ impl Tool for ShellTool {
             }
             buf
         };
-        let (out_bytes, err_bytes) = tokio::join!(read_out, read_err);
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to await command: {e}")))?;
+        // Race the command against its budget. Reading the pipes is part of the
+        // race: a command that writes nothing and hangs must time out too.
+        let run = async {
+            let (out, err) = tokio::join!(read_out, read_err);
+            let status = child.wait().await;
+            (out, err, status)
+        };
+        let outcome = tokio::time::timeout(timeout, run).await;
+
+        let (out_bytes, err_bytes, status, timed_out) = match outcome {
+            Ok((out, err, status)) => {
+                let status = status.map_err(|e| {
+                    ToolError::Failed(anyhow::anyhow!("failed to await command: {e}"))
+                })?;
+                (out, err, Some(status), false)
+            }
+            Err(_) => {
+                // Kill the whole group: `sh` alone would leave its children
+                // running (and holding the pipes) forever.
+                kill_group(pgid);
+                (Vec::new(), Vec::new(), None, true)
+            }
+        };
+
+        let exit_code = status.as_ref().and_then(|s| s.code());
+        let clipped = |raw: &[u8]| (raw.len() as u64) >= MAX_STREAM_BYTES;
+        let truncated = clipped(&out_bytes) || clipped(&err_bytes);
+
+        // `structured` carries the machine-readable outcome (`exit`, `truncated`,
+        // `timeout`) so a UI/ledger reader doesn't have to parse the prose.
+        let structured = json!({
+            "exit": exit_code,
+            "truncated": truncated,
+            "timeout": timed_out,
+        });
+
+        if timed_out {
+            return Ok(ToolOutput::text(format!(
+                "Command timed out after {} ms and was killed (along with any \
+                 processes it started). Retry with a larger `timeout` if it \
+                 legitimately takes longer — the maximum is {MAX_TIMEOUT_MS} ms.",
+                timeout.as_millis()
+            ))
+            .with_title(format!("shell (timed out): {}", args.command))
+            .with_structured(structured));
+        }
 
         let stdout = String::from_utf8_lossy(&out_bytes);
         let stderr = String::from_utf8_lossy(&err_bytes);
-        let status = status
-            .code()
+        let status_text = exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string());
 
-        let clipped = |raw: &[u8]| (raw.len() as u64) >= MAX_STREAM_BYTES;
-        let mut result = format!("exit status: {status}");
+        let mut result = format!("exit status: {status_text}");
         if !stdout.trim().is_empty() {
             result.push_str(&format!("\n--- stdout ---\n{}", stdout.trim_end()));
             if clipped(&out_bytes) {
@@ -329,8 +437,25 @@ impl Tool for ShellTool {
                 result.push_str("\n…[stderr truncated at the output limit]");
             }
         }
-        Ok(ToolOutput::text(result).with_title(format!("shell: {}", args.command)))
+        Ok(ToolOutput::text(result)
+            .with_title(format!("shell: {}", args.command))
+            .with_structured(structured))
     }
+}
+
+/// SIGKILL a whole process group. Best-effort: the group is already gone if the
+/// command exited between the timeout firing and this call.
+fn kill_group(pgid: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid {
+        // Safety: a plain syscall with a pid we spawned; an already-reaped group
+        // just returns ESRCH, which is why the result is ignored.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 #[cfg(test)]
@@ -385,6 +510,135 @@ mod tests {
 
     fn workspace() -> Arc<Workspace> {
         Arc::new(Workspace::new(vec![std::env::temp_dir()]))
+    }
+
+    /// A fresh directory under the workspace root, for the workdir/orphan tests.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("komo_shell_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn exit_status_is_also_reported_structurally() {
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "exit 3" }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["exit"], 3);
+        assert_eq!(out.structured["timeout"], false);
+        assert_eq!(out.structured["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn a_slow_command_times_out_and_says_how_to_retry() {
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "sleep 30", "timeout": 200 }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["timeout"], true);
+        assert!(out.text.contains("timed out"), "{}", out.text);
+        // The model needs to know the knob exists, or it will just retry as-is.
+        assert!(out.text.contains("timeout"), "{}", out.text);
+    }
+
+    /// The bug `process_group` + `killpg` fixes: killing `sh` alone leaves the
+    /// processes it started running. Here a backgrounded child would create a
+    /// marker file one second in — it must never get the chance.
+    #[tokio::test]
+    async fn a_timeout_kills_processes_the_command_started() {
+        let dir = scratch("orphan");
+        let marker = dir.join("alive.txt");
+        let tool = ShellTool::new(workspace());
+        let command = format!(
+            "(sleep 1; echo alive > {}) & sleep 30",
+            marker.to_string_lossy()
+        );
+
+        let out = tool
+            .call(
+                json!({ "command": command, "timeout": 200 }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["timeout"], true);
+
+        // Well past when the orphan would have written.
+        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+        assert!(
+            !marker.exists(),
+            "a process started by the command survived the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_runs_the_command_there() {
+        let dir = scratch("workdir");
+        std::fs::write(dir.join("marker.txt"), "x").unwrap();
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "ls", "workdir": dir.to_string_lossy() }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("marker.txt"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn a_workdir_outside_the_workspace_is_denied() {
+        let tool = ShellTool::new(Arc::new(Workspace::new(vec![std::path::PathBuf::from(
+            "/home/user/project",
+        )])));
+        let err = tool
+            .call(
+                json!({ "command": "ls", "workdir": "/etc" }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn a_workdir_that_is_not_a_directory_is_invalid_input() {
+        let dir = scratch("notadir");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let tool = ShellTool::new(workspace());
+        let err = tool
+            .call(
+                json!({ "command": "ls", "workdir": file.to_string_lossy() }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    /// A model asking for an hour gets the ceiling, not an error.
+    #[tokio::test]
+    async fn an_over_large_timeout_is_clamped_not_refused() {
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "true", "timeout": 60 * 60 * 1000 }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.structured["exit"], 0);
     }
 
     #[tokio::test]

@@ -1,10 +1,14 @@
 #[cfg(test)]
 pub mod test_support;
 
+pub mod apply_patch;
 pub mod ask_user;
 pub mod cron;
 pub mod delegate;
+pub mod edit;
 pub mod fs_common;
+pub mod glob;
+pub mod grep;
 pub mod homeassistant;
 pub mod http;
 pub mod memory;

@@ -13,8 +13,16 @@ use super::report::{ConfigIssue, ConfigReport, IssueSeverity, Origin};
 use super::sources::{ConfigSources, KomoEnv, PolicyFileConfig, PolicyRuleFileConfig};
 
 /// Built-in default for `max_turns` when neither `KOMO_MAX_TURNS` nor
-/// config.toml sets one. Multi-file edits easily take 10+ round-trips.
-pub const DEFAULT_MAX_TURNS: usize = 30;
+/// config.toml sets one — the number of model **round-trips** one turn may
+/// spend, not the number of tool calls (a round can call several tools at once).
+///
+/// Sized for the way real work actually goes with the search/edit tools:
+/// locate (`grep`) → read a few pages → edit → re-read → run tests → fix. That
+/// is easily 20 rounds for one file and 60+ across several, and hitting the
+/// ceiling costs the whole turn's momentum — the model is forced to answer from
+/// wherever it happens to be. The cheap protections against a runaway loop are
+/// the per-turn output budget and the per-call timeout, not a tight round count.
+pub const DEFAULT_MAX_TURNS: usize = 120;
 
 /// Built-in per-completion timeout (seconds) when neither `KOMO_LLM_TIMEOUT_SECS`
 /// nor config.toml sets one. A backstop so a hung provider request (rig's
@@ -35,7 +43,12 @@ pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 /// whole turn, so a long tool chain (dozens of rounds, each returning a capped
 /// result) can't silently accumulate past the context window and fail the turn
 /// only after all the side effects have already run. `0` disables the budget.
-pub const DEFAULT_MAX_TURN_RESULT_BYTES: usize = 256 * 1024;
+///
+/// 512 KB is roughly 128k tokens of text — at the edge of a modern context
+/// window, which is the real constraint. Lower would cut off legitimate work
+/// (a dozen paged reads plus a test run), higher would just move the failure
+/// from "budget note" to "provider rejects the request".
+pub const DEFAULT_MAX_TURN_RESULT_BYTES: usize = 512 * 1024;
 
 /// Built-in per-tool-call wall-clock timeout (seconds) when neither
 /// `KOMO_TOOL_TIMEOUT_SECS` nor config.toml sets one. A backstop so a tool that
@@ -43,6 +56,12 @@ pub const DEFAULT_MAX_TURN_RESULT_BYTES: usize = 256 * 1024;
 /// timeout of its own) fails the call cleanly instead of wedging the whole turn
 /// — and, since the loop can't finish, the session — indefinitely. Generous
 /// enough for a slow build or a large download; `0` disables the timeout.
+///
+/// This is only the **default**: a tool that legitimately takes longer overrides
+/// it with [`Tool::max_duration`](komo_core::domain::tool::Tool::max_duration)
+/// — `delegate` runs a whole sub-agent completion, `shell` honors its own
+/// `timeout` argument up to ten minutes, and every approval-gated tool has to
+/// outlast a human reading a prompt.
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 
 /// Built-in default for `max_history_messages` when neither

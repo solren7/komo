@@ -1,6 +1,10 @@
 # PRD: opencode v2 工具体系对齐（工具集 + 执行管线 + 权限模型）
 
-Status: ready-for-agent — 分 5 期、16 个 issue，见 `issues/`
+Status: in-progress — 7/16 已落地（01 02 03 04 05 06 13），见 `issues/`
+
+已落地后 komo 的工具集对 v2 的 12 个内建**已无缺失工具**，只余功能缺口：
+`webfetch` 的 format/mime 白名单（07）、`skill view` 的文件清单（08）、
+`question` 的多问多选（09）。管线（10-12、14）与权限（15）两期未动。
 
 ## 背景
 

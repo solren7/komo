@@ -1,6 +1,9 @@
 pub mod clarify;
+pub mod diff;
 pub mod file_mutation;
 pub mod memory_enrichment;
 pub mod operator_control;
+pub mod patch;
+pub mod search;
 pub mod skill_registry;
 pub mod tool_execution;

@@ -82,6 +82,50 @@ pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Opt
     }
 }
 
+/// Approve a mutation that spans **several** files with a single prompt.
+///
+/// `summary` should name every target, because that is the one thing the human
+/// sees. The subtlety is the second pass: after the human grants the batch, each
+/// remaining path is still evaluated at `Risk::Safe` — never prompting, but
+/// keeping `ActionRef::File{write:true}`, so a `[policy]` deny rule covering any
+/// one of them still blocks it. Without that pass, approving a patch would be
+/// approving paths the policy fences off; with a prompt per path, a five-file
+/// patch would ask five times.
+///
+/// Returns the refusal text naming the path that was blocked.
+pub async fn allow_write_batch(
+    ctx: &ToolContext,
+    paths: &[PathBuf],
+    summary: String,
+) -> Option<String> {
+    let first = paths.first()?;
+    if let Some(refusal) = allow_write(ctx, first, summary).await {
+        return Some(refusal);
+    }
+    for path in paths.iter().skip(1) {
+        let request = ApprovalRequest::safe(format!("write {}", path.display())).with_action(
+            ActionRef::File {
+                path: path.clone(),
+                write: true,
+            },
+        );
+        if let Decision::Deny { feedback } = ctx.decide(&request).await {
+            return Some(match feedback {
+                Some(reason) => format!(
+                    "Blocked before anything was written: {} is not writable ({reason}).",
+                    path.display()
+                ),
+                None => format!(
+                    "Blocked before anything was written: {} is not writable \
+                     under the permission policy.",
+                    path.display()
+                ),
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,11 +30,11 @@ use crate::{
         tool_execution::{ToolExecutionConfig, ToolExecutor},
     },
     tools::{
-        ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
-        homeassistant::HomeAssistantTool, memory::MemoryTool, read::ReadTool,
-        reminder::ReminderTool, session::SessionTool, shell::ShellTool, skill::SkillTool,
-        task::TaskTool, time::TimeTool, todo::TodoTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool, write::WriteTool,
+        apply_patch::ApplyPatchTool, ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
+        edit::EditTool, glob::GlobTool, grep::GrepTool, homeassistant::HomeAssistantTool,
+        memory::MemoryTool, read::ReadTool, reminder::ReminderTool, session::SessionTool,
+        shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool, todo::TodoTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteTool,
     },
 };
 
@@ -183,6 +183,10 @@ pub async fn build(
         tools.register(Arc::new(TimeTool));
         tools.register(Arc::new(ReadTool::new(workspace.clone())));
         tools.register(Arc::new(WriteTool::new(workspace.clone())));
+        tools.register(Arc::new(EditTool::new(workspace.clone())));
+        tools.register(Arc::new(ApplyPatchTool::new(workspace.clone())));
+        tools.register(Arc::new(GrepTool::new(workspace.clone())));
+        tools.register(Arc::new(GlobTool::new(workspace.clone())));
         tools.register(Arc::new(ShellTool::new(workspace.clone())));
         tools.register(Arc::new(WebFetchTool::new()));
         tools.register(Arc::new(WebSearchTool::new()));

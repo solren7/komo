@@ -1,7 +1,20 @@
 # 05 — `grep` / `glob`：ripgrep 库栈，不依赖外部二进制
 
-Status: ready-for-agent
+Status: done (2026-07-26) — `cargo test` 556 passed
 Phase: 1 工具集 · 依赖: 01（审批反馈；可与 03/04 并行）
+
+## 落地记录
+
+- 依赖按计划用 ripgrep 库栈：`ignore` + `globset` + `grep-searcher` + `grep-regex`，
+  **不调外部 `rg`**。
+- `services/search.rs`（新）：阻塞的 walk/match 层，工具在 `spawn_blocking` 里调。
+  刻意拆成 `candidates`（哪些路径）+ `search_files`（内容），**这样权限策略能在
+  读取内容之前过一遍路径** —— 有专门的测试证明 `file`/read deny 规则让 grep
+  根本不打开那个文件（而不是读了再不显示）。
+- 关键细节：`ignore` 默认只在 git 仓库里认 `.gitignore`，加了
+  `require_git(false)` —— komo 的 workspace 不一定是 repo。
+- `glob` 按 mtime 倒序；`grep` 输出照抄 v2 形状（`Found N matches` + `path:` 块 +
+  `Line N: text`，保留缩进）。两者都 `Risk::Safe` + `idempotent`。
 
 ## 目标
 

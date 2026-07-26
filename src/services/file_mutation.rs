@@ -23,6 +23,16 @@ impl Snapshot {
         self.0.is_some()
     }
 
+    /// The snapshot decoded as text, with any UTF-8 BOM stripped — the form an
+    /// `edit` matches against (the model never sends a BOM, and
+    /// [`write_if_unchanged`] puts it back). `None` when the file was absent or
+    /// isn't valid UTF-8.
+    pub fn text(&self) -> Option<String> {
+        let bytes = self.0.as_deref()?;
+        let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+        String::from_utf8(body.to_vec()).ok()
+    }
+
     /// Whether the snapshot starts with a UTF-8 BOM.
     fn had_bom(&self) -> bool {
         self.0

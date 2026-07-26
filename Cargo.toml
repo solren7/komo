@@ -71,6 +71,17 @@ unicode-width = "0.2.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 tracing-appender = "0.2.5"
 libc = "0.2.189"
+# `grep`/`glob` are built on ripgrep's own component libraries rather than
+# shelling out to an `rg` binary: komo ships as a single binary and can't assume
+# one exists on the host (or in a container). `ignore` is the .gitignore-aware
+# parallel walker, `globset` the glob matcher, `grep-searcher`/`grep-regex` the
+# line searcher — all BurntSushi's, all what ripgrep itself is assembled from.
+ignore = "0.4.31"
+globset = "0.4.19"
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+# Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
+similar = "3.1.1"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,

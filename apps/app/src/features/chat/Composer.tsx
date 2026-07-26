@@ -136,10 +136,10 @@ function ContextProgress({ capacity, used }: { capacity?: number | null; used?: 
  *  ArrowUp on an empty draft recalls previously sent messages (terminal-style
  *  history); the hook reads the composer runtime, so this must render inside the
  *  runtime provider. */
-export function Composer() {
+export function Composer({ workspace }: { workspace: string }) {
   const history = unstable_useComposerInputHistory();
   const aui = useAui();
-  const mode = useMode();
+  const mode = useMode(workspace);
   const setMode = useAppStore((s) => s.setMode);
   const status = useQuery({ queryKey: qk.status, queryFn: fetchStatus, staleTime: 30_000 });
   const model = status.data?.model ?? "当前模型";
@@ -199,14 +199,14 @@ export function Composer() {
               <button
                 type="button"
                 className={cn(TOOL, mode === "interactive" && "bg-muted text-foreground")}
-                onClick={() => setMode("interactive")}
+                onClick={() => setMode(workspace, "interactive")}
               >
                 交互
               </button>
               <button
                 type="button"
                 className={cn(TOOL, mode === "trusted" && "bg-muted text-foreground")}
-                onClick={() => setMode("trusted")}
+                onClick={() => setMode(workspace, "trusted")}
               >
                 信任
               </button>

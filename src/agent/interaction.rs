@@ -745,6 +745,7 @@ impl GatewayDispatcher {
         let this = self.clone();
         let ctx = SessionContext {
             session_id: session.clone(),
+            workspace_root: None,
             sink: sink.clone(),
             // A chat channel has a human who can answer an approval prompt.
             interactive: true,

@@ -1,12 +1,13 @@
 import { useConnection } from "@/shared/api/use-connection";
-import { useAppStore, useMode } from "@/shared/store";
+import { useAppStore, useMode, useWorkspace } from "@/shared/store";
 import { Badge } from "@/shared/ui/badge";
 import { Switch } from "@/shared/ui/switch";
 import { StatusTab } from "./status";
 
 export function GeneralTab() {
   const { connected } = useConnection();
-  const mode = useMode();
+  const workspace = useWorkspace();
+  const mode = useMode(workspace);
   const setMode = useAppStore((s) => s.setMode);
   return (
     <div className="flex flex-col">
@@ -19,7 +20,7 @@ export function GeneralTab() {
         </div>
         <Switch
           checked={mode === "trusted"}
-          onCheckedChange={(v) => setMode(v ? "trusted" : "interactive")}
+          onCheckedChange={(v) => setMode(workspace, v ? "trusted" : "interactive")}
         />
       </label>
 

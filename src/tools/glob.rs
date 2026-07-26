@@ -84,7 +84,7 @@ impl Tool for GlobTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: GlobArgs = parse_args(&input)?;
-        let root = fs_common::resolve(&self.workspace, args.path.as_deref().unwrap_or("."))?;
+        let root = fs_common::resolve(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
 
         // The search root is the read being requested: one `ActionRef::File`
         // check, so a `file`/`access = "read"` deny rule fences off a directory

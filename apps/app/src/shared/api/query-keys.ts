@@ -6,6 +6,7 @@ export const qk = {
   sessions: ["sessions"] as const,
   sessionHistory: (session: string) => ["session-history", session] as const,
   status: ["status"] as const,
+  workspaces: ["workspaces"] as const,
   tasks: ["tasks"] as const,
   memories: (status: string) => ["memories", status] as const,
   runs: (limit: number) => ["runs", limit] as const,

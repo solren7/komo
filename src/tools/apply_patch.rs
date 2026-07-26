@@ -115,7 +115,7 @@ impl Tool for ApplyPatchTool {
         // anywhere in the patch refuses the whole patch, with nothing applied.
         let mut targets: Vec<(PathBuf, &patch::Hunk)> = Vec::with_capacity(hunks.len());
         for hunk in &hunks {
-            targets.push((fs_common::resolve(&self.workspace, hunk.path())?, hunk));
+            targets.push((fs_common::resolve(&self.workspace, ctx, hunk.path())?, hunk));
         }
 
         // One prompt for the whole blast radius.

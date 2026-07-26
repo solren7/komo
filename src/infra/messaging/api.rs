@@ -30,6 +30,7 @@
 //! are off, so the bearer key remains the sole thing that grants access.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -116,6 +117,10 @@ struct AppState {
     /// host operator behind a loopback socket. `X-Komo-Trusted` (auto-approve)
     /// stays loopback-only regardless of this flag.
     remote_interactive: bool,
+    /// Server-owned workspace catalog exposed to the authenticated local GUI.
+    workspace_home: Arc<PathBuf>,
+    /// Process workspace used when the UI selects the default entry.
+    default_workspace: Arc<PathBuf>,
 }
 
 /// The HTTP API channel. Holds the listen config and the shared handler state.
@@ -139,6 +144,8 @@ impl ApiChannel {
         model: String,
         approvals: Arc<ApprovalState>,
         clarify: Arc<ClarifyState>,
+        workspace_home: PathBuf,
+        default_workspace: PathBuf,
     ) -> Self {
         Self {
             bind: config.bind.clone(),
@@ -156,6 +163,8 @@ impl ApiChannel {
                 clarify,
                 cancels: Arc::new(CancelState::new()),
                 remote_interactive: config.remote_interactive,
+                workspace_home: Arc::new(workspace_home),
+                default_workspace: Arc::new(default_workspace),
             },
         }
     }
@@ -259,6 +268,7 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("x-komo-session-id"),
             HeaderName::from_static("x-komo-trusted"),
             HeaderName::from_static("x-komo-interactive"),
+            HeaderName::from_static("x-komo-workspace"),
         ])
         .max_age(std::time::Duration::from_secs(600))
 }
@@ -310,6 +320,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/status", get(status))
+        .route("/api/workspaces", get(list_workspaces))
         .route("/api/home", get(get_home))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
@@ -505,13 +516,21 @@ async fn chat_completions(
     let trusted = is_loopback && headers.contains_key("x-komo-trusted");
     let interactive =
         (is_loopback || state.remote_interactive) && headers.contains_key("x-komo-interactive");
-    let ctx = if trusted {
+    let mut ctx = if trusted {
         SessionContext::trusted(&session_id)
     } else if interactive {
         SessionContext::interactive_http(&session_id)
     } else {
         SessionContext::detached(&session_id)
     };
+    // Workspace selection is local-operator-only, like trusted mode. The client
+    // sends an opaque id; the gateway resolves it through its own catalog and
+    // never accepts a filesystem path from the request.
+    if is_loopback {
+        if let Some(root) = resolve_workspace(&state, &headers) {
+            ctx = ctx.with_workspace(root);
+        }
+    }
     // Every api turn is interruptible: the caller holds the connection, so it is
     // the one surface with somewhere to put a stop button. The slot is dropped
     // when the turn ends (below / in `stream_turn`) so a late cancel can't hit
@@ -557,6 +576,69 @@ async fn chat_completions(
         }))
         .into_response())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceEntry {
+    id: String,
+    name: String,
+    path: PathBuf,
+}
+
+fn workspace_entries(state: &AppState) -> Vec<WorkspaceEntry> {
+    let mut entries = vec![WorkspaceEntry {
+        id: "__default__".to_string(),
+        name: state
+            .default_workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("默认 workspace")
+            .to_string(),
+        path: state.default_workspace.as_ref().clone(),
+    }];
+    if let Ok(children) = std::fs::read_dir(state.workspace_home.as_ref()) {
+        for child in children.flatten() {
+            let path = child.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = child.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            // Header values are deliberately conservative. The path itself is
+            // always discovered server-side and is never copied from the id.
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                continue;
+            }
+            entries.push(WorkspaceEntry {
+                name: id.clone(),
+                id,
+                path,
+            });
+        }
+    }
+    entries[1..].sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+fn resolve_workspace(state: &AppState, headers: &axum::http::HeaderMap) -> Option<PathBuf> {
+    let id = headers.get("x-komo-workspace")?.to_str().ok()?;
+    workspace_entries(state)
+        .into_iter()
+        .find_map(|entry| (entry.id == id).then_some(entry.path))
+}
+
+async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
+    let workspaces = workspace_entries(&state)
+        .into_iter()
+        .map(|entry| json!({ "id": entry.id, "name": entry.name, "path": entry.path }))
+        .collect::<Vec<_>>();
+    Json(json!({ "workspaces": workspaces }))
 }
 
 /// One item on the SSE stream for a streaming turn.

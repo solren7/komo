@@ -35,6 +35,8 @@ export interface KomoChatRequest {
   header: string;
   message: string;
   mode: Mode;
+  /** Opaque id resolved by the gateway's server-owned workspace catalog. */
+  workspace?: string;
 }
 
 export interface KomoChatResponse {

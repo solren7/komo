@@ -91,7 +91,7 @@ impl Tool for WriteTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: WriteArgs = parse_args(&input)?;
-        let path = fs_common::resolve(&self.workspace, &args.path)?;
+        let path = fs_common::resolve(&self.workspace, ctx, &args.path)?;
 
         // Snapshot *before* prompting: that is what makes the post-approval
         // comparison meaningful.

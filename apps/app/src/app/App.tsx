@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MoonIcon, SunIcon } from "lucide-react";
 
 import { useConnection } from "@/shared/api/use-connection";
@@ -7,13 +7,27 @@ import { Button } from "@/shared/ui/button";
 import { ChatView } from "@/features/chat/ChatView";
 import { SessionList } from "@/features/sessions/SessionList";
 import { SettingsModal } from "@/features/settings/SettingsModal";
+import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
 
 export function App() {
   const connection = useConnection();
   const session = useAppStore((s) => s.session);
+  const workspace = useAppStore((s) => s.workspace);
   const theme = useTheme();
   const toggleTheme = useAppStore((s) => s.toggleTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [openThreads, setOpenThreads] = useState<Record<string, { session: string; workspace: string }>>(
+    () => ({ [`${workspace}\u0000${session}`]: { session, workspace } }),
+  );
+  const activeThread = `${workspace}\u0000${session}`;
+
+  useEffect(() => {
+    setOpenThreads((current) =>
+      current[activeThread]
+        ? current
+        : { ...current, [activeThread]: { session, workspace } },
+    );
+  }, [activeThread, session, workspace]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
@@ -21,7 +35,7 @@ export function App() {
 
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
-          <span className="truncate text-sm font-medium text-muted-foreground">对话</span>
+          <WorkspacePicker />
           <div className="flex-1" />
           <Button
             variant="ghost"
@@ -39,9 +53,13 @@ export function App() {
           </div>
         )}
 
-        {/* Keyed by session: switching sessions remounts the thread with its
-            own history rather than trying to reconcile two transcripts. */}
-        <ChatView key={session} />
+        {/* Keep visited runtimes mounted. assistant-ui aborts a request when its
+            runtime unmounts, so navigation must only hide a running thread. */}
+        {Object.entries(openThreads).map(([key, thread]) => (
+          <div key={key} className={key === activeThread ? "flex min-h-0 flex-1" : "hidden"}>
+            <ChatView session={thread.session} workspace={thread.workspace} />
+          </div>
+        ))}
       </section>
 
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}

@@ -105,7 +105,7 @@ impl Tool for ReadTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: ReadArgs = parse_args(&input)?;
-        let path = fs_common::resolve(&self.workspace, &args.path)?;
+        let path = fs_common::resolve(&self.workspace, ctx, &args.path)?;
 
         if let Some(refusal) = fs_common::allow_read(ctx, &path).await {
             return Ok(ToolOutput::text(refusal));

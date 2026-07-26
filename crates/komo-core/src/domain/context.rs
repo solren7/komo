@@ -9,6 +9,7 @@
 //! tool reads its session and requests approval through `ctx`, never an ambient
 //! scope.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -25,6 +26,10 @@ use crate::domain::run::RunRepository;
 #[derive(Clone)]
 pub struct SessionContext {
     pub session_id: String,
+    /// Optional filesystem root selected by a local UI for this turn. HTTP
+    /// adapters must resolve this from a server-owned workspace catalog; tools
+    /// never accept a client-supplied path directly.
+    pub workspace_root: Option<PathBuf>,
     pub sink: Arc<dyn ReplySink>,
     /// Whether a human can answer a mid-turn approval prompt on this channel.
     /// Chat channels set this `true`; non-interactive callers (the detached
@@ -59,6 +64,7 @@ impl SessionContext {
     pub fn detached(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
+            workspace_root: None,
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: false,
@@ -76,6 +82,7 @@ impl SessionContext {
     pub fn trusted(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
+            workspace_root: None,
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: true,
@@ -94,6 +101,7 @@ impl SessionContext {
     pub fn interactive_http(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
+            workspace_root: None,
             sink: Arc::new(NoopSink),
             interactive: true,
             auto_approve: false,
@@ -112,6 +120,12 @@ impl SessionContext {
     /// Attach a [`CancelSignal`], making this turn interruptible.
     pub fn with_cancel(mut self, cancel: Arc<dyn CancelSignal>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Attach the server-resolved workspace selected for this turn.
+    pub fn with_workspace(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
         self
     }
 

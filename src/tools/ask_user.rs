@@ -180,6 +180,7 @@ mod tests {
     fn interactive_ctx(session: &str, sent: Arc<Mutex<Vec<String>>>) -> ToolContext {
         let session = SessionContext {
             session_id: session.to_string(),
+            workspace_root: None,
             sink: Arc::new(RecordingSink { sent }),
             interactive: true,
             auto_approve: false,

@@ -84,6 +84,7 @@ export interface TurnRequest {
   session: string;
   message: string;
   mode: Mode;
+  workspace?: string;
 }
 
 export interface TurnResult {
@@ -157,6 +158,7 @@ export async function runTurn(
         header: headerFor(req.session),
         message: req.message,
         mode: req.mode,
+        workspace: req.workspace,
       },
       {
         onToolEvent: (event) => {

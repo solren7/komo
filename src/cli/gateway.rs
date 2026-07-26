@@ -373,6 +373,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             rt.model.model.clone(),
             approvals.clone(),
             wired.clarify.clone(),
+            rt.home.join("workspaces"),
+            std::env::current_dir().unwrap_or_else(|_| rt.home.clone()),
         )));
         channels.push("api");
     }

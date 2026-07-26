@@ -20,12 +20,22 @@ use crate::domain::{
 /// the workspace root; anything that lands outside it is refused as
 /// [`ToolError::Denied`] — the workspace whitelist is a floor, not a prompt (no
 /// approval unlocks it, matching `shell`'s hardline patterns).
-pub fn resolve(workspace: &Arc<Workspace>, path: &str) -> Result<PathBuf, ToolError> {
-    workspace.resolve_contained(Path::new(path)).ok_or_else(|| {
+pub fn resolve(
+    workspace: &Arc<Workspace>,
+    ctx: &ToolContext,
+    path: &str,
+) -> Result<PathBuf, ToolError> {
+    let selected = ctx
+        .session
+        .workspace_root
+        .as_ref()
+        .map(|root| Workspace::new(vec![root.clone()]));
+    let effective = selected.as_ref().unwrap_or(workspace.as_ref());
+    effective.resolve_contained(Path::new(path)).ok_or_else(|| {
         ToolError::Denied(format!(
             "path `{path}` is outside the workspace and was blocked. \
                  Only paths under {} are available.",
-            workspace
+            effective
                 .roots()
                 .iter()
                 .map(|r| r.display().to_string())
@@ -129,6 +139,7 @@ pub async fn allow_write_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_support::detached_ctx;
 
     fn ws(root: &str) -> Arc<Workspace> {
         Arc::new(Workspace::new(vec![PathBuf::from(root)]))
@@ -136,15 +147,28 @@ mod tests {
 
     #[test]
     fn relative_paths_anchor_to_the_workspace_root() {
-        let resolved = resolve(&ws("/home/u/p"), "src/main.rs").unwrap();
+        let resolved = resolve(&ws("/home/u/p"), &detached_ctx("test"), "src/main.rs").unwrap();
         assert_eq!(resolved, PathBuf::from("/home/u/p/src/main.rs"));
     }
 
     #[test]
     fn escapes_are_denied_not_merely_reported() {
-        let err = resolve(&ws("/home/u/p"), "../secret").unwrap_err();
+        let err = resolve(&ws("/home/u/p"), &detached_ctx("test"), "../secret").unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)));
         // The message names the allowed root so the model can retry sensibly.
         assert!(err.to_string().contains("/home/u/p"));
+    }
+
+    #[test]
+    fn selected_workspace_overrides_the_process_default() {
+        let mut session = crate::domain::context::SessionContext::detached("test");
+        session.workspace_root = Some(PathBuf::from("/home/u/selected"));
+        let ctx = crate::domain::context::ToolContext::new(
+            session,
+            None,
+            std::sync::Arc::new(crate::tools::test_support::SafeOnly),
+        );
+        let resolved = resolve(&ws("/home/u/default"), &ctx, "src/main.rs").unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/u/selected/src/main.rs"));
     }
 }

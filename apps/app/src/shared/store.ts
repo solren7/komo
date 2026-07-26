@@ -1,10 +1,9 @@
-// Client-side state: the active session, the turn trust mode, the theme.
+// Client-side state: active workspace/session, per-workspace trust, and theme.
 // Server-side state lives in react-query, never here.
 //
-// `mode` and `theme` persist (a restart shouldn't silently drop back to
-// interactive/light); `session` deliberately does NOT — every launch starts a
-// fresh session, matching `komo chat` and the TUI. The sidebar is how you get
-// back into an old one.
+// Reopening the UI returns to the same conversation. Each workspace remembers
+// both its last session and its trust mode, so changing projects cannot silently
+// carry an auto-approve decision across the boundary.
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
@@ -16,11 +15,14 @@ import { hostTag } from "./api/runtime";
 
 export interface AppStore {
   session: string;
-  mode: Mode;
+  workspace: string;
+  workspaceSessions: Record<string, string>;
+  workspaceModes: Record<string, Mode>;
   theme: Theme;
   setSession: (id: string) => void;
   startNewSession: () => void;
-  setMode: (mode: Mode) => void;
+  setWorkspace: (id: string) => void;
+  setMode: (workspace: string, mode: Mode) => void;
   toggleTheme: () => void;
 }
 
@@ -30,11 +32,35 @@ export const useAppStore = create<AppStore>()(
       // Seeded by `installHost()` before the first render — the host tag isn't
       // known when this module is imported.
       session: "",
-      mode: "interactive",
+      workspace: "__default__",
+      workspaceSessions: {},
+      workspaceModes: {},
       theme: initialTheme(),
-      setSession: (id) => set({ session: id }),
-      startNewSession: () => set({ session: newSessionId(hostTag()) }),
-      setMode: (mode) => set({ mode }),
+      setSession: (id) =>
+        set((s) => ({
+          session: id,
+          workspaceSessions: { ...s.workspaceSessions, [s.workspace]: id },
+        })),
+      startNewSession: () =>
+        set((s) => {
+          const session = newSessionId(hostTag());
+          return {
+            session,
+            workspaceSessions: { ...s.workspaceSessions, [s.workspace]: session },
+          };
+        }),
+      setWorkspace: (workspace) =>
+        set((s) => {
+          const remembered = { ...s.workspaceSessions, [s.workspace]: s.session };
+          const session = remembered[workspace] || newSessionId(hostTag());
+          return {
+            workspace,
+            session,
+            workspaceSessions: { ...remembered, [workspace]: session },
+          };
+        }),
+      setMode: (workspace, mode) =>
+        set((s) => ({ workspaceModes: { ...s.workspaceModes, [workspace]: mode } })),
       toggleTheme: () =>
         set((s) => {
           const theme: Theme = s.theme === "dark" ? "light" : "dark";
@@ -44,12 +70,19 @@ export const useAppStore = create<AppStore>()(
     }),
     {
       name: "komo.app",
-      // Only client preferences survive a reload.
-      partialize: (s) => ({ mode: s.mode, theme: s.theme }),
+      partialize: (s) => ({
+        session: s.session,
+        workspace: s.workspace,
+        workspaceSessions: s.workspaceSessions,
+        workspaceModes: s.workspaceModes,
+        theme: s.theme,
+      }),
     },
   ),
 );
 
 export const useSession = () => useAppStore((s) => s.session);
-export const useMode = () => useAppStore((s) => s.mode);
+export const useWorkspace = () => useAppStore((s) => s.workspace);
+export const useMode = (workspace?: string) =>
+  useAppStore((s) => s.workspaceModes[workspace ?? s.workspace] ?? "interactive");
 export const useTheme = () => useAppStore((s) => s.theme);

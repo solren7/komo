@@ -128,7 +128,7 @@ impl Tool for EditTool {
             ));
         }
 
-        let path = fs_common::resolve(&self.workspace, &args.path)?;
+        let path = fs_common::resolve(&self.workspace, ctx, &args.path)?;
 
         // Snapshot before prompting: both the match source and the stale guard.
         let before = file_mutation::snapshot(&path).await?;

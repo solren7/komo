@@ -126,11 +126,12 @@ export class HttpKomoClient implements KomoClient {
   // started, which `fetchWithTimeout` could not do.
   async chat(req: KomoChatRequest, options?: ChatOptions): Promise<KomoChatResponse> {
     if (!this.gateway) return { ok: false, error: "未连接" };
-    const { header, message, mode } = req;
+    const { header, message, mode, workspace = "__default__" } = req;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.gateway.key}`,
       "Content-Type": "application/json",
       "X-Komo-Session-Id": header,
+      "X-Komo-Workspace": workspace,
       ...(mode === "trusted" ? { "X-Komo-Trusted": "1" } : { "X-Komo-Interactive": "1" }),
     };
 

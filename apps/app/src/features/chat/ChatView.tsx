@@ -14,7 +14,7 @@ import { qk } from "@/shared/api/query-keys";
 import { getClient } from "@/shared/api/runtime";
 import { useConnection } from "@/shared/api/use-connection";
 import { pushStream } from "@/shared/lib/async";
-import { useMode, useSession } from "@/shared/store";
+import { useMode } from "@/shared/store";
 import type { PendingApproval } from "@/shared/types";
 import { Loading } from "@/shared/ui/loading";
 import { KomorebiSpinner } from "@/shared/ui/komorebi-spinner";
@@ -31,9 +31,8 @@ const textAttachments = new SimpleTextAttachmentAdapter();
 textAttachments.accept += ",.txt,.md,.markdown,.csv,.json,.html,.xml,.css,.log";
 
 /** Loads the session's history, then hands it to the runtime once. */
-export function ChatView() {
+export function ChatView({ session, workspace }: { session: string; workspace: string }) {
   const { connected } = useConnection();
-  const session = useSession();
   const history = useQuery({
     queryKey: qk.sessionHistory(session),
     queryFn: () => loadSessionHistory(session),
@@ -54,12 +53,21 @@ export function ChatView() {
       </div>
     );
   }
-  return <ChatThread initialMessages={history.data ?? []} />;
+  return (
+    <ChatThread session={session} workspace={workspace} initialMessages={history.data ?? []} />
+  );
 }
 
-function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] }) {
-  const session = useSession();
-  const mode = useMode();
+function ChatThread({
+  session,
+  workspace,
+  initialMessages,
+}: {
+  session: string;
+  workspace: string;
+  initialMessages: ThreadMessageLike[];
+}) {
+  const mode = useMode(workspace);
   const qc = useQueryClient();
   const [approval, setApproval] = useState<PendingApproval | null>(null);
   const [question, setQuestion] = useState<string | null>(null);
@@ -88,7 +96,7 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
 
         const feed = pushStream<ToolActivity[]>();
         const turn = runTurn(
-          { session, message: text, mode },
+          { session, message: text, mode, workspace },
           { onTools: feed.push, onApproval: setApproval, onQuestion: setQuestion },
           { client: getClient(), signal: abortSignal },
         ).finally(feed.close);
@@ -122,7 +130,7 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
         };
       },
     }),
-    [session, mode, qc],
+    [session, workspace, mode, qc],
   );
 
   const runtime = useLocalRuntime(adapter, {
@@ -168,7 +176,7 @@ function ChatThread({ initialMessages }: { initialMessages: ThreadMessageLike[] 
 
           {question && <ClarifyBar question={question} onAnswer={answer} />}
 
-          <Composer />
+          <Composer workspace={workspace} />
         </ThreadPrimitive.Root>
 
         {approval && <ApprovalModal req={approval} onDecide={decide} />}

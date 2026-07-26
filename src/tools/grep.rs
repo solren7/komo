@@ -97,7 +97,7 @@ impl Tool for GrepTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: GrepArgs = parse_args(&input)?;
-        let target = fs_common::resolve(&self.workspace, args.path.as_deref().unwrap_or("."))?;
+        let target = fs_common::resolve(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
 
         if let Some(refusal) = fs_common::allow_read(ctx, &target).await {
             return Ok(ToolOutput::text(refusal));

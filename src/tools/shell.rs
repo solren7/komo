@@ -298,10 +298,17 @@ impl Tool for ShellTool {
             }));
         }
 
+        let selected_workspace = ctx
+            .session
+            .workspace_root
+            .as_ref()
+            .map(|root| Workspace::new(vec![root.clone()]));
+        let workspace = selected_workspace
+            .as_ref()
+            .unwrap_or(self.workspace.as_ref());
         let cwd = match &args.workdir {
             Some(dir) => {
-                let path = self
-                    .workspace
+                let path = workspace
                     .resolve_contained(std::path::Path::new(dir))
                     .ok_or_else(|| {
                         ToolError::Denied(format!(
@@ -319,7 +326,7 @@ impl Tool for ShellTool {
                 }
                 Some(path)
             }
-            None => self.workspace.roots().first().cloned(),
+            None => workspace.roots().first().cloned(),
         };
 
         let timeout = std::time::Duration::from_millis(

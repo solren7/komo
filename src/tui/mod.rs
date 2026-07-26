@@ -286,6 +286,7 @@ async fn event_loop(
                             cl.begin_turn(&session_id);
                             SessionContext {
                                 session_id: session_id.clone(),
+                                workspace_root: None,
                                 sink: Arc::new(ChannelSink { tx: sink_tx.clone() }),
                                 interactive: true,
                                 auto_approve: false,

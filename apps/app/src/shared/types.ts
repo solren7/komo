@@ -95,3 +95,9 @@ export interface Interactions {
 /** Turn trust mode: interactive suspends on approval/clarify, trusted
  *  auto-approves side-effecting tools (what `komo chat` does). */
 export type Mode = "interactive" | "trusted";
+
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  path: string;
+}

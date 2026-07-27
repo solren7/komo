@@ -48,6 +48,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
@@ -523,9 +524,10 @@ async fn chat_completions(
     } else {
         SessionContext::detached(&session_id)
     };
-    // Workspace selection is local-operator-only, like trusted mode. The client
-    // sends an opaque id; the gateway resolves it through its own catalog and
-    // never accepts a filesystem path from the request.
+    // Workspace selection is local-operator-only, like trusted mode: the client
+    // sends an opaque id, resolved either through the gateway's own catalog or —
+    // for a folder the desktop shell picked via the native dialog — decoded from
+    // it. A remote caller can therefore never widen its filesystem root.
     if is_loopback {
         if let Some(root) = resolve_workspace(&state, &headers) {
             ctx = ctx.with_workspace(root);
@@ -628,9 +630,33 @@ fn workspace_entries(state: &AppState) -> Vec<WorkspaceEntry> {
 
 fn resolve_workspace(state: &AppState, headers: &axum::http::HeaderMap) -> Option<PathBuf> {
     let id = headers.get("x-komo-workspace")?.to_str().ok()?;
-    workspace_entries(state)
+    let catalogued = workspace_entries(state)
         .into_iter()
-        .find_map(|entry| (entry.id == id).then_some(entry.path))
+        .find_map(|entry| (entry.id == id).then_some(entry.path));
+    if catalogued.is_some() {
+        return catalogued;
+    }
+    // Not in the catalog: the desktop shell may have attached a folder the
+    // operator chose through the native OS dialog. Only the loopback branch
+    // above calls this, so widening the root stays a host-operator act — the
+    // same boundary that grants `X-Komo-Trusted`.
+    resolve_folder_workspace(id)
+}
+
+/// Decode a `folder:<base64url path>` workspace id into an existing directory.
+///
+/// The opaque encoding is what lets an arbitrary Unicode path ride in an
+/// ASCII-only header. Canonicalizing before the `is_dir` check means a
+/// nonexistent path, a file, or anything that doesn't decode yields `None`, and
+/// the caller falls back to the process workspace.
+fn resolve_folder_workspace(id: &str) -> Option<PathBuf> {
+    let encoded = id.strip_prefix("folder:")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
@@ -1476,6 +1502,35 @@ mod tests {
             .await
             .unwrap();
         assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn folder_workspace_id_resolves_an_existing_directory() {
+        let path = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(path.to_string_lossy().as_bytes());
+        assert_eq!(
+            resolve_folder_workspace(&format!("folder:{encoded}")),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn folder_workspace_id_rejects_non_directories_and_garbage() {
+        assert_eq!(resolve_folder_workspace("not-a-folder-id"), None);
+        assert_eq!(resolve_folder_workspace("folder:not+base64"), None);
+
+        // A path that doesn't exist: the id decodes, the canonicalize doesn't.
+        let missing = std::env::temp_dir().join(format!("komo-missing-{}", uuid::Uuid::now_v7()));
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(missing.to_string_lossy().as_bytes());
+        assert_eq!(resolve_folder_workspace(&format!("folder:{encoded}")), None);
+
+        // An existing *file* is not a workspace either.
+        let file = std::env::current_dir().unwrap().join("Cargo.toml");
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(file.to_string_lossy().as_bytes());
+        assert_eq!(resolve_folder_workspace(&format!("folder:{encoded}")), None);
     }
 
     #[test]

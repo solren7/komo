@@ -101,3 +101,8 @@ export interface WorkspaceInfo {
   name: string;
   path: string;
 }
+
+/** A folder the host picked through its native directory dialog. Only a host
+ *  with OS access supplies one (the desktop shell); the web build has none, and
+ *  the picker entry then never renders. */
+export type FolderPicker = () => Promise<{ name: string; path: string } | null>;

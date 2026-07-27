@@ -1,5 +1,6 @@
-// The preload bridge exposed on `window.komoBridge`. Gateway discovery only —
-// the renderer's HttpKomoClient (from @komo/app) does all HTTP itself.
+// The preload bridge exposed on `window.komoBridge`: gateway discovery plus the
+// native directory dialog — the renderer's HttpKomoClient (from @komo/app) does
+// all HTTP itself.
 
 import type { Gateway } from "@komo/app";
 
@@ -8,6 +9,8 @@ declare global {
     komoBridge: {
       /** The current gateway endpoint, or null when none is running. */
       gateway(): Promise<Gateway | null>;
+      /** Open the OS directory dialog; null when the operator cancels. */
+      chooseWorkspace(): Promise<{ name: string; path: string } | null>;
     };
   }
 

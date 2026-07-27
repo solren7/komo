@@ -20,7 +20,13 @@ const resolveGateway = async (): Promise<Gateway | null> => {
   return __KOMO_DEV_PROXY_TARGET__ === found.base ? { ...found, base: "" } : found;
 };
 
-installHost({ client: new HttpKomoClient(resolveGateway), tag: "desktop" });
+installHost({
+  client: new HttpKomoClient(resolveGateway),
+  tag: "desktop",
+  // Only the desktop host has an OS dialog, so only here does the workspace
+  // picker offer a folder outside the gateway's catalog.
+  chooseFolder: () => window.komoBridge.chooseWorkspace(),
+});
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

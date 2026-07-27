@@ -8,7 +8,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-import type { Mode } from "./types";
+import type { Mode, WorkspaceInfo } from "./types";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
 import { newSessionId } from "./lib/session-id";
 import { hostTag } from "./api/runtime";
@@ -18,12 +18,28 @@ export interface AppStore {
   workspace: string;
   workspaceSessions: Record<string, string>;
   workspaceModes: Record<string, Mode>;
+  /** Folders picked through the host's native dialog, keyed by workspace id.
+   *  They are not in the gateway's catalog, so the client is what remembers
+   *  them — hence persisted, like every other workspace-keyed slice here. */
+  pickedWorkspaces: Record<string, WorkspaceInfo>;
   theme: Theme;
   setSession: (id: string) => void;
   startNewSession: () => void;
   setWorkspace: (id: string) => void;
+  addWorkspace: (workspace: WorkspaceInfo) => void;
   setMode: (workspace: string, mode: Mode) => void;
   toggleTheme: () => void;
+}
+
+/** Move to `workspace`, parking the current session under the workspace being
+ *  left and resuming (or minting) that workspace's own. */
+function switchWorkspace(
+  s: AppStore,
+  workspace: string,
+): Pick<AppStore, "workspace" | "session" | "workspaceSessions"> {
+  const remembered = { ...s.workspaceSessions, [s.workspace]: s.session };
+  const session = remembered[workspace] || newSessionId(hostTag());
+  return { workspace, session, workspaceSessions: { ...remembered, [workspace]: session } };
 }
 
 export const useAppStore = create<AppStore>()(
@@ -35,6 +51,7 @@ export const useAppStore = create<AppStore>()(
       workspace: "__default__",
       workspaceSessions: {},
       workspaceModes: {},
+      pickedWorkspaces: {},
       theme: initialTheme(),
       setSession: (id) =>
         set((s) => ({
@@ -49,16 +66,15 @@ export const useAppStore = create<AppStore>()(
             workspaceSessions: { ...s.workspaceSessions, [s.workspace]: session },
           };
         }),
-      setWorkspace: (workspace) =>
-        set((s) => {
-          const remembered = { ...s.workspaceSessions, [s.workspace]: s.session };
-          const session = remembered[workspace] || newSessionId(hostTag());
-          return {
-            workspace,
-            session,
-            workspaceSessions: { ...remembered, [workspace]: session },
-          };
-        }),
+      setWorkspace: (workspace) => set((s) => switchWorkspace(s, workspace)),
+      // Picking a folder both registers and selects it: the operator went
+      // through a native dialog to name it, so anything short of switching
+      // there would be a second click for the same intent.
+      addWorkspace: (workspace) =>
+        set((s) => ({
+          pickedWorkspaces: { ...s.pickedWorkspaces, [workspace.id]: workspace },
+          ...switchWorkspace(s, workspace.id),
+        })),
       setMode: (workspace, mode) =>
         set((s) => ({ workspaceModes: { ...s.workspaceModes, [workspace]: mode } })),
       toggleTheme: () =>
@@ -75,6 +91,7 @@ export const useAppStore = create<AppStore>()(
         workspace: s.workspace,
         workspaceSessions: s.workspaceSessions,
         workspaceModes: s.workspaceModes,
+        pickedWorkspaces: s.pickedWorkspaces,
         theme: s.theme,
       }),
     },

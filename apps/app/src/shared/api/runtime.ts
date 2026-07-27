@@ -4,14 +4,17 @@
 // through every component would be ceremony.
 
 import type { HostTag } from "../lib/session-id";
+import type { FolderPicker } from "../types";
 import type { KomoClient } from "./types";
 
 let client: KomoClient | null = null;
 let tag: HostTag = "web";
+let folderPicker: FolderPicker | null = null;
 
-export function installClient(next: KomoClient, host: HostTag): void {
+export function installClient(next: KomoClient, host: HostTag, picker?: FolderPicker): void {
   client = next;
   tag = host;
+  folderPicker = picker ?? null;
 }
 
 export function getClient(): KomoClient {
@@ -21,4 +24,9 @@ export function getClient(): KomoClient {
 
 export function hostTag(): HostTag {
   return tag;
+}
+
+/** The host's native directory dialog, or null when it has none. */
+export function getFolderPicker(): FolderPicker | null {
+  return folderPicker;
 }

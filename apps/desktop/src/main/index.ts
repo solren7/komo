@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 
 interface Gateway {
   base: string;
@@ -45,6 +45,18 @@ function registerIpc(): void {
   // The renderer's GatewayResolver: hand it the current endpoint, or null when
   // no gateway is running. Health-probing and all requests happen renderer-side.
   ipcMain.handle("komo:gateway", () => readGateway());
+  // The native directory dialog behind the workspace picker's "choose another
+  // folder". Only main can open it; the renderer gets back a name + path and
+  // sends the path to the gateway as an opaque `folder:` workspace id.
+  ipcMain.handle("komo:choose-workspace", async () => {
+    const result = await dialog.showOpenDialog({
+      title: "选择 workspace 文件夹",
+      properties: ["openDirectory", "createDirectory"],
+    });
+    const selected = result.filePaths[0];
+    if (result.canceled || !selected) return null;
+    return { name: path.basename(selected) || selected, path: selected };
+  });
 }
 
 function createWindow(): void {

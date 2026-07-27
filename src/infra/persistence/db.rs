@@ -306,13 +306,17 @@ impl SessionRepository for Db {
         };
         // Pull the most recent `limit` messages via the `session_id` index
         // (ORDER BY ... DESC LIMIT pushes both down to SQL), then restore
-        // chronological order for the caller.
-        let rows = toasty::query!(
-            MessageRecord FILTER .session_id == #id ORDER BY .timestamp DESC LIMIT #limit
+        // chronological order for the caller. Ordering is by id, not
+        // `timestamp`: ids are UUIDv7 (millisecond-ordered) while `timestamp` is
+        // whole seconds, so windowing by the latter could split or scramble a
+        // user/assistant pair created inside the same second.
+        let mut rows = toasty::query!(
+            MessageRecord FILTER .session_id == #id ORDER BY .id DESC LIMIT #limit
         )
         .exec(&mut conn)
         .await?;
-        let mut messages: Vec<Message> = rows
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let messages: Vec<Message> = rows
             .into_iter()
             .map(|r| Message {
                 role: parse_role(&r.role),
@@ -320,7 +324,6 @@ impl SessionRepository for Db {
                 timestamp: r.timestamp,
             })
             .collect();
-        messages.sort_by_key(|m| m.timestamp);
         Ok(Some(Session {
             id: record.id,
             messages,
@@ -586,8 +589,11 @@ impl MessageRepository for Db {
         let Ok(record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
             return Ok(Vec::new());
         };
-        let rows = record.messages().exec(&mut conn).await?;
-        let mut messages: Vec<Message> = rows
+        let mut rows = record.messages().exec(&mut conn).await?;
+        // Same reason as `find_windowed`: `timestamp` is only second-precision,
+        // so a fast turn's messages sort by their UUIDv7 ids instead.
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let messages: Vec<Message> = rows
             .into_iter()
             .map(|r| Message {
                 role: parse_role(&r.role),
@@ -595,7 +601,6 @@ impl MessageRepository for Db {
                 timestamp: r.timestamp,
             })
             .collect();
-        messages.sort_by_key(|m| m.timestamp);
         Ok(messages)
     }
 
@@ -1779,8 +1784,9 @@ mod tests {
         SessionRepository::save(&db, &Session::new(sid))
             .await
             .unwrap();
-        // Six messages with explicit, increasing timestamps (the constructor's
-        // second-precision clock would otherwise collide on a fast loop).
+        // All six messages deliberately share one second-precision timestamp,
+        // the way a fast turn's user/assistant pair does. Insertion order must
+        // still survive, which is what ordering by the UUIDv7 id buys.
         for i in 0..6i64 {
             let msg = Message {
                 role: if i % 2 == 0 {
@@ -1789,7 +1795,7 @@ mod tests {
                     Role::Assistant
                 },
                 content: format!("m{i}"),
-                timestamp: 1_000 + i,
+                timestamp: 1_000,
             };
             MessageRepository::save(&db, sid, &msg).await.unwrap();
         }

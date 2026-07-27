@@ -16,16 +16,14 @@ export function App() {
   const theme = useTheme();
   const toggleTheme = useAppStore((s) => s.toggleTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [openThreads, setOpenThreads] = useState<Record<string, { session: string; workspace: string }>>(
-    () => ({ [`${workspace}\u0000${session}`]: { session, workspace } }),
-  );
+  const [openThreads, setOpenThreads] = useState<
+    Record<string, { session: string; workspace: string }>
+  >(() => ({ [`${workspace}\u0000${session}`]: { session, workspace } }));
   const activeThread = `${workspace}\u0000${session}`;
 
   useEffect(() => {
     setOpenThreads((current) =>
-      current[activeThread]
-        ? current
-        : { ...current, [activeThread]: { session, workspace } },
+      current[activeThread] ? current : { ...current, [activeThread]: { session, workspace } },
     );
   }, [activeThread, session, workspace]);
 

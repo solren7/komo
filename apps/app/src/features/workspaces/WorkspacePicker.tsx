@@ -4,7 +4,7 @@ import { FolderIcon } from "lucide-react";
 import { qk } from "@/shared/api/query-keys";
 import { getFolderPicker } from "@/shared/api/runtime";
 import { useConnection } from "@/shared/api/use-connection";
-import { useAppStore, useWorkspace } from "@/shared/store";
+import { useAppStore } from "@/shared/store";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/select";
 import { fetchWorkspaces } from "./api";
 
@@ -24,10 +24,14 @@ export function encodeFolder(path: string): string {
   return `folder:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")}`;
 }
 
-export function WorkspacePicker() {
+export function WorkspacePicker({
+  workspace,
+  onWorkspaceChange,
+}: {
+  workspace: string;
+  onWorkspaceChange: (workspace: string) => void;
+}) {
   const { connected } = useConnection();
-  const workspace = useWorkspace();
-  const setWorkspace = useAppStore((s) => s.setWorkspace);
   const addWorkspace = useAppStore((s) => s.addWorkspace);
   const picked = useAppStore((s) => s.pickedWorkspaces);
   const chooseFolder = getFolderPicker();
@@ -41,24 +45,53 @@ export function WorkspacePicker() {
   const items = [...(query.data ?? []), ...Object.values(picked)].filter(
     (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index,
   );
+  // Base UI deliberately renders a SelectValue's raw value unless the root is
+  // given an item catalogue. Folder ids are base64url-encoded paths, so showing
+  // the raw value makes a selected folder look like garbled text.
+  const currentFallback =
+    items.some((item) => item.id === workspace)
+      ? []
+      : [
+          {
+            value: workspace,
+            label:
+              picked[workspace]?.name ??
+              (workspace === "__default__" ? "默认 workspace" : workspace),
+          },
+        ];
+  const selectItems = [
+    ...currentFallback,
+    ...items.map((item) => ({ value: item.id, label: item.name })),
+    ...(chooseFolder ? [{ value: CHOOSE_FOLDER, label: "选择其他文件夹…" }] : []),
+  ];
 
   const choose = async () => {
     const folder = await chooseFolder?.();
     if (!folder) return;
-    addWorkspace({ id: encodeFolder(folder.path), name: folder.name, path: folder.path });
+    const selected = { id: encodeFolder(folder.path), name: folder.name, path: folder.path };
+    addWorkspace(selected);
+    onWorkspaceChange(selected.id);
   };
 
   return (
     <Select
+      items={selectItems}
       value={workspace}
       onValueChange={(value) => {
         if (value === CHOOSE_FOLDER) void choose();
-        else if (value) setWorkspace(value);
+        else if (value) onWorkspaceChange(value);
       }}
     >
-      <SelectTrigger className="h-8 w-[240px]" title="选择 workspace">
+      <SelectTrigger
+        size="sm"
+        className="min-w-0 max-w-[min(12rem,100%)]"
+        title="选择 workspace"
+      >
         <FolderIcon className="size-4" />
-        <SelectValue placeholder={query.isPending ? "加载 workspace…" : "选择 workspace"} />
+        <SelectValue
+          className="min-w-0"
+          placeholder={query.isPending ? "加载 workspace…" : "选择 workspace"}
+        />
       </SelectTrigger>
       <SelectContent>
         {items.map((item) => (

@@ -7,7 +7,6 @@ import { Button } from "@/shared/ui/button";
 import { ChatView } from "@/features/chat/ChatView";
 import { SessionList } from "@/features/sessions/SessionList";
 import { SettingsModal } from "@/features/settings/SettingsModal";
-import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
 
 export function App() {
   const connection = useConnection();
@@ -33,7 +32,6 @@ export function App() {
 
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
-          <WorkspacePicker />
           <div className="flex-1" />
           <Button
             variant="ghost"
@@ -54,7 +52,10 @@ export function App() {
         {/* Keep visited runtimes mounted. assistant-ui aborts a request when its
             runtime unmounts, so navigation must only hide a running thread. */}
         {Object.entries(openThreads).map(([key, thread]) => (
-          <div key={key} className={key === activeThread ? "flex min-h-0 flex-1" : "hidden"}>
+          <div
+            key={key}
+            className={key === activeThread ? "flex min-h-0 min-w-0 flex-1" : "hidden"}
+          >
             <ChatView session={thread.session} workspace={thread.workspace} />
           </div>
         ))}

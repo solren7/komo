@@ -73,6 +73,8 @@ export interface SessionMessage {
 
 export interface SessionSummary {
   id: string;
+  /** Immutable workspace id selected when the session was created. */
+  workspace?: string;
   created_at: number;
   messages: number;
   user_turns: number;

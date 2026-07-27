@@ -150,8 +150,8 @@ function ChatThread({
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <div className="flex min-h-0 flex-1 flex-col">
-        <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <ThreadPrimitive.Root className="flex min-h-0 min-w-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-5">
             <AuiIf condition={(s) => s.thread.isEmpty}>
               <div className="flex flex-1 items-center justify-center py-10 text-muted-foreground">

@@ -17,8 +17,8 @@ import { useConnection } from "@/shared/api/use-connection";
 import { POLL } from "@/shared/config";
 import { fmtTs } from "@/shared/lib/format";
 import { cn } from "@/shared/lib/utils";
-import { useAppStore, useSession } from "@/shared/store";
-import type { SessionSummary } from "@/shared/types";
+import { useAppStore, useNewWorkspace, useSession } from "@/shared/store";
+import type { SessionSummary, WorkspaceInfo } from "@/shared/types";
 import { Button } from "@/shared/ui/button";
 import { IconButton } from "@/shared/ui/icon-button";
 import { Input } from "@/shared/ui/input";
@@ -26,14 +26,25 @@ import { KomoLogo } from "@/shared/ui/komo-logo";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/ui/popover";
 import { fetchSessions, renameSession, setSessionStatus } from "./api";
 import { sessionLabel } from "./labels";
+import { fetchWorkspaces } from "@/features/workspaces/api";
+import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
 
 const ROW = "group flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 transition-colors";
+const DEFAULT_WORKSPACE = "__default__";
+
+function workspaceLabel(id: string, workspaces: WorkspaceInfo[]): string {
+  return workspaces.find((workspace) => workspace.id === id)?.name ??
+    (id === DEFAULT_WORKSPACE ? "默认 workspace" : id);
+}
 
 export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { connected } = useConnection();
   const session = useSession();
-  const setSession = useAppStore((s) => s.setSession);
+  const openSession = useAppStore((s) => s.openSession);
   const startNewSession = useAppStore((s) => s.startNewSession);
+  const newWorkspace = useNewWorkspace();
+  const setNewWorkspace = useAppStore((s) => s.setNewWorkspace);
+  const pickedWorkspaces = useAppStore((s) => s.pickedWorkspaces);
   const qc = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -47,6 +58,14 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
     enabled: connected,
   });
   const sessions = query.data ?? [];
+  const workspacesQuery = useQuery({
+    queryKey: qk.workspaces,
+    queryFn: fetchWorkspaces,
+    enabled: connected,
+  });
+  const workspaces = [...(workspacesQuery.data ?? []), ...Object.values(pickedWorkspaces)].filter(
+    (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index,
+  );
 
   const invalidate = () => void qc.invalidateQueries({ queryKey: qk.sessions });
 
@@ -82,6 +101,19 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
         ? item.status === "archive"
         : item.status !== "archive",
   );
+  const groupedSessions = Array.from(
+    visibleSessions.reduce((groups, item) => {
+      const workspace = item.workspace ?? DEFAULT_WORKSPACE;
+      const entries = groups.get(workspace) ?? [];
+      entries.push(item);
+      groups.set(workspace, entries);
+      return groups;
+    }, new Map<string, SessionSummary[]>()),
+  ).map(([workspace, entries]) => ({
+    workspace,
+    label: workspaceLabel(workspace, workspaces),
+    entries,
+  }));
 
   const renderRow = (item: SessionSummary) => {
     const isOpen = item.id === session;
@@ -115,7 +147,7 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
           <button
             type="button"
             className="min-w-0 flex-1 text-left"
-            onClick={() => setSession(item.id)}
+            onClick={() => openSession(item.id, item.workspace ?? DEFAULT_WORKSPACE)}
             title={item.id}
           >
             <span className="block truncate text-sm">{label}</span>
@@ -194,8 +226,13 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
       </div>
 
       <div className={cn("flex flex-col gap-1 pb-2", collapsed ? "items-center px-2" : "px-3")}>
+        {!collapsed && (
+          <div className="flex min-w-0 px-2 py-1">
+            <WorkspacePicker workspace={newWorkspace} onWorkspaceChange={setNewWorkspace} />
+          </div>
+        )}
         {/* New session only switches the active id — it does NOT add a row. The
-            session appears in the list once the first message creates it. */}
+            selected workspace is persisted with its first message. */}
         <Button
           className={collapsed ? "size-9 px-0" : "w-full"}
           onClick={startNewSession}
@@ -254,7 +291,14 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
           ) : visibleSessions.length === 0 ? (
             <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
           ) : (
-            visibleSessions.map(renderRow)
+            groupedSessions.map((group) => (
+              <section key={group.workspace} className="pt-2 first:pt-0">
+                <h2 className="truncate px-3 pb-1 text-xs font-medium text-muted-foreground" title={group.label}>
+                  {group.label}
+                </h2>
+                {group.entries.map(renderRow)}
+              </section>
+            ))
           )}
         </div>
       )}

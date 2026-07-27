@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
+    /// Immutable workspace id selected when the session was created.
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     pub created_at: i64,
     pub messages: usize,
     pub user_turns: usize,
@@ -24,6 +27,10 @@ pub struct SessionSummary {
     /// from the list). `default` for older-gateway compatibility.
     #[serde(default)]
     pub status: String,
+}
+
+fn default_workspace() -> String {
+    "__default__".to_string()
 }
 
 /// A pairing row without the salted code hash / salt (never leaves the host).

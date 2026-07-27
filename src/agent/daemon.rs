@@ -814,6 +814,7 @@ impl BriefingSweep {
     async fn compose_plain(&self, prompt: &str, now: i64) -> anyhow::Result<String> {
         let session = Session {
             id: "briefing".to_string(),
+            workspace: "__default__".to_string(),
             messages: vec![Message::user(prompt.to_string())],
             created_at: now,
             title: String::new(),

@@ -27,7 +27,6 @@ export function installHost({
     const session = newSessionId(tag);
     useAppStore.setState({
       session,
-      workspaceSessions: { ...store.workspaceSessions, [store.workspace]: session },
     });
   }
   applyTheme(useAppStore.getState().theme);

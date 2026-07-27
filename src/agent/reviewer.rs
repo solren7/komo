@@ -46,6 +46,7 @@ impl Reviewer for ReflectiveReviewer {
         let prompt = review_prompt(session);
         let review_session = Session {
             id: format!("review-{}", session.id),
+            workspace: session.workspace.clone(),
             messages: vec![Message::user(prompt)],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
@@ -432,6 +433,7 @@ mod tests {
     fn session(id: &str) -> Session {
         Session {
             id: id.to_string(),
+            workspace: "__default__".to_string(),
             messages: vec![Message::user(
                 "I'll send Bob the report tomorrow".to_string(),
             )],

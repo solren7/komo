@@ -5,6 +5,10 @@ use super::message::Message;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Immutable workspace identity chosen when the session is first created.
+    /// Older sessions predate workspaces and therefore belong to the default.
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     pub messages: Vec<Message>,
     pub created_at: i64,
     /// Optional operator-set display name (empty = untitled; clients fall back
@@ -22,15 +26,25 @@ pub struct Session {
 pub const SESSION_STATUS_ACTIVE: &str = "active";
 pub const SESSION_STATUS_ARCHIVE: &str = "archive";
 pub const SESSION_STATUS_DELETED: &str = "deleted";
+pub const DEFAULT_WORKSPACE: &str = "__default__";
 
 fn default_status() -> String {
     SESSION_STATUS_ACTIVE.to_string()
 }
 
+fn default_workspace() -> String {
+    DEFAULT_WORKSPACE.to_string()
+}
+
 impl Session {
     pub fn new(id: impl Into<String>) -> Self {
+        Self::with_workspace(id, DEFAULT_WORKSPACE)
+    }
+
+    pub fn with_workspace(id: impl Into<String>, workspace: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            workspace: workspace.into(),
             messages: Vec::new(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),

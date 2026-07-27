@@ -72,6 +72,7 @@ use crate::{
         gateway::MessageHandler,
         memory::{MemoryStatus, parse_memory_status},
         pairing::ApproveOutcome,
+        session::{DEFAULT_WORKSPACE, Session},
     },
     services::{
         clarify::ClarifyState,
@@ -500,6 +501,13 @@ async fn chat_completions(
         req.model.clone()
     };
 
+    let is_loopback = peer.ip().is_loopback();
+    let requested_workspace = requested_workspace(&state, &headers, is_loopback);
+    // A session's workspace is a creation-time choice. Once a row exists, its
+    // stored id wins over every later header so an old conversation can never
+    // silently run tools in a different directory.
+    let workspace = bind_session_workspace(&state, &session_id, &requested_workspace).await?;
+
     // Loopback callers may opt into one of two richer contexts (both ignored on
     // an external bind, where there is no host operator behind the socket):
     //   - `X-Komo-Trusted`: auto-approve side-effecting tools (the CLI user is
@@ -510,7 +518,6 @@ async fn chat_completions(
     //     sink is a no-op — the GUI reads the pending prompt by polling.
     // Trusted wins over interactive if a caller somehow sets both; anyone else
     // gets the detached (auto-deny) context.
-    let is_loopback = peer.ip().is_loopback();
     // Trusted (auto-approve) is loopback-only; interactive may also be granted to
     // keyed remote callers when `remote_interactive` is configured (they resolve
     // approvals/clarify out-of-band, same as the local GUI).
@@ -529,7 +536,7 @@ async fn chat_completions(
     // for a folder the desktop shell picked via the native dialog — decoded from
     // it. A remote caller can therefore never widen its filesystem root.
     if is_loopback {
-        if let Some(root) = resolve_workspace(&state, &headers) {
+        if let Some(root) = resolve_workspace_id(&state, &workspace) {
             ctx = ctx.with_workspace(root);
         }
     }
@@ -628,8 +635,7 @@ fn workspace_entries(state: &AppState) -> Vec<WorkspaceEntry> {
     entries
 }
 
-fn resolve_workspace(state: &AppState, headers: &axum::http::HeaderMap) -> Option<PathBuf> {
-    let id = headers.get("x-komo-workspace")?.to_str().ok()?;
+fn resolve_workspace_id(state: &AppState, id: &str) -> Option<PathBuf> {
     let catalogued = workspace_entries(state)
         .into_iter()
         .find_map(|entry| (entry.id == id).then_some(entry.path));
@@ -641,6 +647,46 @@ fn resolve_workspace(state: &AppState, headers: &axum::http::HeaderMap) -> Optio
     // above calls this, so widening the root stays a host-operator act — the
     // same boundary that grants `X-Komo-Trusted`.
     resolve_folder_workspace(id)
+}
+
+fn requested_workspace(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    is_loopback: bool,
+) -> String {
+    if !is_loopback {
+        return DEFAULT_WORKSPACE.to_string();
+    }
+    headers
+        .get("x-komo-workspace")
+        .and_then(|value| value.to_str().ok())
+        .filter(|id| resolve_workspace_id(state, id).is_some())
+        .unwrap_or(DEFAULT_WORKSPACE)
+        .to_string()
+}
+
+async fn bind_session_workspace(
+    state: &AppState,
+    session_id: &str,
+    requested_workspace: &str,
+) -> Result<String, ApiError> {
+    if let Some(session) = state.actions.sessions.find(session_id).await? {
+        return Ok(session.workspace);
+    }
+    state
+        .actions
+        .sessions
+        .save(&Session::with_workspace(session_id, requested_workspace))
+        .await?;
+    // `save` is idempotent under a concurrent first request. Read back so both
+    // requests honor the workspace chosen by the insert that won the race.
+    Ok(state
+        .actions
+        .sessions
+        .find(session_id)
+        .await?
+        .map(|session| session.workspace)
+        .unwrap_or_else(|| requested_workspace.to_string()))
 }
 
 /// Decode a `folder:<base64url path>` workspace id into an existing directory.

@@ -30,6 +30,8 @@ struct SessionRecord {
     #[key]
     id: String,
     created_at: i64,
+    /// Immutable workspace identity chosen when the session is created.
+    workspace: String,
 
     /// User-turn count already covered by the reflective reviewer (0 = never
     /// reviewed). The review sweep compares this against the live user-turn
@@ -218,6 +220,10 @@ impl Db {
                 ),
                 ("title", "\"title\" text NOT NULL DEFAULT ''"),
                 ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+                (
+                    "workspace",
+                    "\"workspace\" text NOT NULL DEFAULT '__default__'",
+                ),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             const RUN_COLUMNS: &[(&str, &str)] = &[(
@@ -326,6 +332,7 @@ impl SessionRepository for Db {
             .collect();
         Ok(Some(Session {
             id: record.id,
+            workspace: record.workspace,
             messages,
             created_at: record.created_at,
             title: record.title,
@@ -363,6 +370,7 @@ impl SessionRepository for Db {
             let created = toasty::create!(SessionRecord {
                 id: session.id.clone(),
                 created_at: session.created_at,
+                workspace: session.workspace.clone(),
                 reviewed_through: 0,
                 title: session.title.clone(),
                 status: session.status.clone(),
@@ -439,6 +447,7 @@ impl SessionRepository for Db {
             toasty::create!(SessionRecord {
                 id: archived_id.clone(),
                 created_at: live.created_at,
+                workspace: live.workspace.clone(),
                 reviewed_through: prior_reviewed,
                 title: live.title.clone(),
                 status: live.status.clone(),
@@ -1180,6 +1189,7 @@ async fn session_from_record(
     record: SessionRecord,
 ) -> anyhow::Result<Session> {
     let id = record.id.clone();
+    let workspace = record.workspace.clone();
     let created_at = record.created_at;
     let title = record.title.clone();
     let status = record.status.clone();
@@ -1195,6 +1205,7 @@ async fn session_from_record(
     messages.sort_by_key(|m| m.timestamp);
     Ok(Session {
         id,
+        workspace,
         messages,
         created_at,
         title,
@@ -1417,10 +1428,15 @@ mod tests {
         let db = Db::connect(&sqlite_url("komo_session_repo_test.db"))
             .await
             .unwrap();
-        let first = Session::new("first");
+        let first = Session::with_workspace("first", "alpha");
         let second = Session::new("second");
 
         SessionRepository::save(&db, &first).await.unwrap();
+        // A later attempt to reuse the id with another workspace must not
+        // rebind the existing conversation.
+        SessionRepository::save(&db, &Session::with_workspace("first", "beta"))
+            .await
+            .unwrap();
         MessageRepository::save(&db, "first", &Message::user("hello"))
             .await
             .unwrap();
@@ -1429,6 +1445,7 @@ mod tests {
         let rows = SessionRepository::list(&db).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "first");
+        assert_eq!(rows[0].workspace, "alpha");
         assert_eq!(rows[0].user_turns(), 1);
         assert_eq!(rows[1].id, "second");
     }

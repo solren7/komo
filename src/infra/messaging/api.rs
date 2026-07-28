@@ -64,7 +64,7 @@ use crate::{
         gateway::Channel,
         interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher},
     },
-    config::ApiConfig,
+    config::{ApiConfig, ModelEntry},
     domain::{
         cancel::{CANCELLED_REPLY, is_cancelled},
         cron::CronJobSpec,
@@ -104,12 +104,12 @@ struct AppState {
     /// Resolved main model identity (safe, non-secret status metadata).
     provider: Arc<String>,
     model: Arc<String>,
-    /// The models a client may switch a session to, and the reasoning-effort
-    /// levels this provider accepts (empty = no effort knob). Advertised over
+    /// The models a client may switch a session to, each carrying its own
+    /// provider and reasoning-effort levels — with a cross-provider menu those
+    /// differ per entry (codex has three levels, deepseek none). Advertised over
     /// `GET /api/models`; the chat path validates a request against them so an
-    /// unknown id falls back to `model` instead of reaching the provider.
-    models: Arc<Vec<String>>,
-    efforts: Arc<Vec<String>>,
+    /// unknown id falls back to `model` instead of reaching a provider.
+    models: Arc<Vec<ModelEntry>>,
     /// Shared with the gateway dispatcher and the `ChatApprover`: lets a
     /// loopback interactive HTTP turn (the GUI) surface a pending approval over
     /// `GET /api/interactions/{session}` and resolve it over `POST`.
@@ -137,14 +137,12 @@ struct AppState {
 /// `/api/models`, and the chat path's validation can never disagree about what
 /// is on offer. Everything here is non-secret status metadata.
 pub struct ModelMenu {
+    /// The default provider's name (status metadata; each entry names its own).
     provider: String,
     default_model: String,
-    /// Selectable models, the configured default first (always non-empty).
-    models: Vec<String>,
-    /// Reasoning-effort levels this provider accepts; empty = no effort knob,
-    /// which is what lets a client say "unsupported" rather than render a
-    /// switch that changes nothing.
-    efforts: Vec<String>,
+    /// Selectable models, the configured default first (always non-empty). Each
+    /// entry carries its provider and that provider's effort levels.
+    models: Vec<ModelEntry>,
 }
 
 impl ModelMenu {
@@ -152,8 +150,9 @@ impl ModelMenu {
         Self {
             provider: config.provider.name().to_string(),
             default_model: config.model.clone(),
-            models: config.models.clone(),
-            efforts: config.efforts().iter().map(|e| e.to_string()).collect(),
+            // `menu()` drops entries whose provider has no usable credential, so
+            // the UI never offers a model that would error on every turn.
+            models: config.menu(),
         }
     }
 }
@@ -194,7 +193,6 @@ impl ApiChannel {
                 provider: Arc::new(models.provider),
                 model: Arc::new(models.default_model),
                 models: Arc::new(models.models),
-                efforts: Arc::new(models.efforts),
                 approvals,
                 clarify,
                 cancels: Arc::new(CancelState::new()),
@@ -551,7 +549,7 @@ async fn chat_completions(
     // session — the turn itself reads it back off the session row (see
     // `infra::llm::RigLlm::agent_for`), which is also what makes it visible to
     // another client opening the same conversation.
-    if let Some(selection) = requested_model(&state.models, &state.efforts, &headers) {
+    if let Some(selection) = requested_model(&state.models, &state.model, &headers) {
         state
             .actions
             .sessions
@@ -708,16 +706,20 @@ struct ModelSelection {
 }
 
 /// Read `X-Komo-Model` / `X-Komo-Effort` off a chat request, validated against
-/// what this gateway actually advertises (`models` / `efforts`).
+/// what this gateway actually advertises.
 ///
 /// `None` = neither header present, so the session keeps whatever it already
 /// stored (an OpenAI-compatible client that knows nothing about these headers
 /// must not silently reset a conversation's model). Present-but-unknown values
 /// resolve to empty — i.e. the default — rather than being forwarded verbatim,
-/// so a stale UI or a typo can't push a bogus model id at the provider.
+/// so a stale UI or a typo can't push a bogus model id at a provider.
+///
+/// Effort is validated against **the model that will actually run**, not against
+/// a gateway-wide list: switching a session to a provider with no effort scale
+/// clears a stale level instead of storing one that silently does nothing.
 fn requested_model(
-    models: &[String],
-    efforts: &[String],
+    models: &[ModelEntry],
+    default_model: &str,
     headers: &axum::http::HeaderMap,
 ) -> Option<ModelSelection> {
     let header = |name: &str| {
@@ -731,15 +733,25 @@ fn requested_model(
     if model.is_none() && effort.is_none() {
         return None;
     }
-    let advertised = |menu: &[String], value: Option<&str>| {
-        value
-            .filter(|want| menu.iter().any(|known| known == want))
-            .unwrap_or_default()
-            .to_string()
+    // Empty = "run the gateway default", which is a legitimate selection.
+    let chosen = model
+        .filter(|want| models.iter().any(|entry| entry.id == *want))
+        .unwrap_or_default();
+    let effective = if chosen.is_empty() {
+        default_model
+    } else {
+        chosen
     };
+    let allowed = models
+        .iter()
+        .find(|entry| entry.id == effective)
+        .map_or(&[][..], |entry| entry.efforts);
     Some(ModelSelection {
-        model: advertised(models, model),
-        effort: advertised(efforts, effort),
+        model: chosen.to_string(),
+        effort: effort
+            .filter(|level| allowed.contains(level))
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -807,13 +819,22 @@ async fn list_model_menu(State(state): State<AppState>) -> Json<Value> {
     let models = state
         .models
         .iter()
-        .map(|id| json!({ "id": id, "context_window": model_context_window(id) }))
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "provider": entry.provider.name(),
+                "model": entry.model,
+                "context_window": model_context_window(&entry.model),
+                // Per entry, not per gateway: a cross-provider menu mixes models
+                // that have an effort scale with ones that don't.
+                "efforts": entry.efforts,
+            })
+        })
         .collect::<Vec<_>>();
     Json(json!({
         "provider": state.provider.as_ref(),
         "default_model": state.model.as_ref(),
         "models": models,
-        "efforts": state.efforts.as_ref(),
     }))
 }
 
@@ -998,6 +1019,8 @@ fn model_context_window(model: &str) -> Option<u64> {
         Some(200_000)
     } else if model.starts_with("gemini-2.5") || model.starts_with("gemini-3") {
         Some(1_048_576)
+    } else if model.starts_with("deepseek") {
+        Some(128_000)
     } else {
         None
     }
@@ -1691,12 +1714,33 @@ mod tests {
         assert_eq!(resolve_folder_workspace(&format!("folder:{encoded}")), None);
     }
 
-    fn menu() -> (Vec<String>, Vec<String>) {
-        (
-            vec!["gpt-5.5".into(), "gpt-5.4-mini".into()],
-            vec!["low".into(), "medium".into(), "high".into()],
-        )
+    /// A cross-provider menu: the default (codex, three effort levels), another
+    /// codex model, and a deepseek one — which has **no** effort scale. That
+    /// asymmetry is what the effort rules below turn on.
+    fn menu() -> Vec<ModelEntry> {
+        vec![
+            ModelEntry {
+                id: "gpt-5.5".into(),
+                provider: crate::config::Provider::Codex,
+                model: "gpt-5.5".into(),
+                efforts: &["low", "medium", "high"],
+            },
+            ModelEntry {
+                id: "gpt-5.4-mini".into(),
+                provider: crate::config::Provider::Codex,
+                model: "gpt-5.4-mini".into(),
+                efforts: &["low", "medium", "high"],
+            },
+            ModelEntry {
+                id: "deepseek:deepseek-chat".into(),
+                provider: crate::config::Provider::DeepSeek,
+                model: "deepseek-chat".into(),
+                efforts: &[],
+            },
+        ]
     }
+
+    const DEFAULT_MODEL: &str = "gpt-5.5";
 
     fn model_headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
@@ -1713,16 +1757,14 @@ mod tests {
     fn no_model_headers_leaves_the_stored_selection_alone() {
         // An OpenAI-compatible client that knows nothing about these headers must
         // not silently reset a conversation's model.
-        let (models, efforts) = menu();
-        assert!(requested_model(&models, &efforts, &model_headers(&[])).is_none());
+        assert!(requested_model(&menu(), DEFAULT_MODEL, &model_headers(&[])).is_none());
     }
 
     #[test]
     fn advertised_model_and_effort_are_accepted() {
-        let (models, efforts) = menu();
         let selection = requested_model(
-            &models,
-            &efforts,
+            &menu(),
+            DEFAULT_MODEL,
             &model_headers(&[("x-komo-model", "gpt-5.4-mini"), ("x-komo-effort", "high")]),
         )
         .expect("headers present");
@@ -1731,11 +1773,56 @@ mod tests {
     }
 
     #[test]
-    fn unadvertised_values_resolve_to_the_default_not_the_provider() {
-        let (models, efforts) = menu();
+    fn a_qualified_cross_provider_id_is_accepted_verbatim() {
+        // The stored value keeps its `provider:` prefix — that is what routes the
+        // turn to the other backend (`infra::llm::RoutingLlm`).
         let selection = requested_model(
-            &models,
-            &efforts,
+            &menu(),
+            DEFAULT_MODEL,
+            &model_headers(&[("x-komo-model", "deepseek:deepseek-chat")]),
+        )
+        .expect("headers present");
+        assert_eq!(selection.model, "deepseek:deepseek-chat");
+    }
+
+    #[test]
+    fn effort_is_validated_against_the_model_that_will_run() {
+        // deepseek has no effort scale, so a level valid for the codex default
+        // must not survive the switch — storing it would silently do nothing.
+        let selection = requested_model(
+            &menu(),
+            DEFAULT_MODEL,
+            &model_headers(&[
+                ("x-komo-model", "deepseek:deepseek-chat"),
+                ("x-komo-effort", "high"),
+            ]),
+        )
+        .expect("headers present");
+        assert_eq!(selection.model, "deepseek:deepseek-chat");
+        assert_eq!(
+            selection.effort, "",
+            "an effort level the target provider doesn't support must be dropped"
+        );
+    }
+
+    #[test]
+    fn effort_alone_is_validated_against_the_gateway_default_model() {
+        // No model header: the default runs, so *its* levels decide.
+        let selection = requested_model(
+            &menu(),
+            DEFAULT_MODEL,
+            &model_headers(&[("x-komo-effort", "medium")]),
+        )
+        .expect("headers present");
+        assert_eq!(selection.model, "");
+        assert_eq!(selection.effort, "medium");
+    }
+
+    #[test]
+    fn unadvertised_values_resolve_to_the_default_not_the_provider() {
+        let selection = requested_model(
+            &menu(),
+            DEFAULT_MODEL,
             &model_headers(&[
                 ("x-komo-model", "definitely-not-a-model"),
                 ("x-komo-effort", "extreme"),
@@ -1752,10 +1839,9 @@ mod tests {
     #[test]
     fn one_header_alone_clears_the_other() {
         // Sending only a model is a full selection: effort resets to the default.
-        let (models, efforts) = menu();
         let selection = requested_model(
-            &models,
-            &efforts,
+            &menu(),
+            DEFAULT_MODEL,
             &model_headers(&[("x-komo-model", "gpt-5.5")]),
         )
         .expect("headers present");

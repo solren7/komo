@@ -27,7 +27,7 @@ pub use write::{
 };
 
 /// Supported LLM providers (all OpenAI-compatible or natively wired in `rig`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     DeepSeek,
     OpenAi,
@@ -125,6 +125,30 @@ impl Provider {
     }
 }
 
+/// Split a menu id into `(provider, bare model)`.
+///
+/// A `provider:model` prefix qualifies which backend a model runs on, so one
+/// menu can span providers (`deepseek:deepseek-chat`, `codex:gpt-5.6-sol`).
+/// `None` means unqualified — the caller's default provider.
+///
+/// The prefix is only honored when it actually *names a provider*, because model
+/// ids legitimately contain colons (ollama's `llama3:8b`). Splitting on the first
+/// colon unconditionally would mangle those; requiring a known provider name
+/// makes the syntax unambiguous instead of merely conventional. Provider ids
+/// never contain `/`, so openrouter's `deepseek/deepseek-chat` is unaffected.
+pub fn split_model_id(id: &str) -> (Option<Provider>, &str) {
+    let Some((prefix, rest)) = id.split_once(':') else {
+        return (None, id);
+    };
+    match Provider::parse(prefix) {
+        // An empty remainder ("codex:") names no model — treat the whole thing as
+        // a bare id so it fails as an unknown model rather than silently becoming
+        // that provider's default.
+        Ok(provider) if !rest.is_empty() => (Some(provider), rest),
+        _ => (None, id),
+    }
+}
+
 /// One resolved view of everything komo is configured to do, plus the
 /// redacted diagnostics that explain it. Load once per process (or construct
 /// from explicit [`ConfigSources`] in tests) and pass it down — callers never
@@ -194,3 +218,57 @@ pub fn wechat_cred_path() -> PathBuf {
 }
 
 // `komo_home` / `default_home` tests moved to `komo_core::paths` with the code.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_known_provider_prefix_qualifies_the_model() {
+        assert_eq!(
+            split_model_id("deepseek:deepseek-chat"),
+            (Some(Provider::DeepSeek), "deepseek-chat")
+        );
+        assert_eq!(
+            split_model_id("codex:gpt-5.6-sol"),
+            (Some(Provider::Codex), "gpt-5.6-sol")
+        );
+        // Provider aliases work here too, since `Provider::parse` owns the names.
+        assert_eq!(
+            split_model_id("claude:claude-sonnet-4-5"),
+            (Some(Provider::Anthropic), "claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn an_unqualified_id_stays_whole() {
+        assert_eq!(split_model_id("gpt-5.5"), (None, "gpt-5.5"));
+        // OpenRouter model ids carry a slash, never a provider prefix.
+        assert_eq!(
+            split_model_id("deepseek/deepseek-chat"),
+            (None, "deepseek/deepseek-chat")
+        );
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_provider_is_part_of_the_model_id() {
+        // The reason the prefix must name a provider: these are real model ids.
+        assert_eq!(split_model_id("llama3:8b"), (None, "llama3:8b"));
+        assert_eq!(split_model_id("qwen2.5:14b"), (None, "qwen2.5:14b"));
+    }
+
+    #[test]
+    fn a_provider_prefix_with_no_model_is_not_a_split() {
+        // "codex:" would otherwise resolve to that provider with an empty model,
+        // silently becoming its default instead of failing as unknown.
+        assert_eq!(split_model_id("codex:"), (None, "codex:"));
+    }
+
+    #[test]
+    fn every_provider_name_round_trips_through_a_qualified_id() {
+        for provider in Provider::ALL {
+            let id = format!("{}:some-model", provider.name());
+            assert_eq!(split_model_id(&id), (Some(provider), "some-model"));
+        }
+    }
+}

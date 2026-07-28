@@ -19,7 +19,7 @@ use rig::{
 use serde_json::{Value, json};
 
 use crate::{
-    config::{ModelConfig, Provider},
+    config::{ModelConfig, Provider, split_model_id},
     domain::{
         llm::{LlmClient, Step, ToolCallReq, ToolOutcome, TurnDriver},
         message::{Message, Role},
@@ -115,6 +115,55 @@ where
             ),
         },
         None => fut.await,
+    }
+}
+
+/// Cross-provider dispatcher: one type-erased backend per provider, selected by
+/// the session's model id.
+///
+/// This layer exists because [`RigLlm`] is generic over a *single* provider's
+/// model type (`deepseek::CompletionModel` and `openai::CompletionModel` are
+/// unrelated types), so within-provider switching can happen inside one `RigLlm`
+/// but crossing providers cannot. A qualified id (`deepseek:deepseek-chat`) picks
+/// the backend here; the bare remainder picks the model inside it.
+///
+/// An unqualified id — or one naming a provider this gateway has no client for —
+/// falls through to the default backend rather than failing the turn: the api
+/// channel already validates a client's choice against the advertised menu, so
+/// reaching here with something unroutable means config changed under a stored
+/// session, and running on the default is the recoverable answer.
+struct RoutingLlm {
+    by_provider: Vec<(Provider, Arc<dyn LlmClient>)>,
+    default_provider: Provider,
+}
+
+impl RoutingLlm {
+    fn route(&self, session: &Session) -> &Arc<dyn LlmClient> {
+        let wanted = session
+            .model_override()
+            .and_then(|id| split_model_id(id).0)
+            .unwrap_or(self.default_provider);
+        self.backend(wanted)
+            .or_else(|| self.backend(self.default_provider))
+            .expect("routing llm always holds its default provider's backend")
+    }
+
+    fn backend(&self, provider: Provider) -> Option<&Arc<dyn LlmClient>> {
+        self.by_provider
+            .iter()
+            .find(|(p, _)| *p == provider)
+            .map(|(_, backend)| backend)
+    }
+}
+
+#[async_trait]
+impl LlmClient for RoutingLlm {
+    async fn complete(&self, session: &Session) -> anyhow::Result<String> {
+        self.route(session).complete(session).await
+    }
+
+    async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+        self.route(session).begin_turn(session).await
     }
 }
 
@@ -250,8 +299,14 @@ where
         let mut agent = self.agent.clone();
         agent.preamble = Some(preamble);
 
+        // A session's model may be provider-qualified (`deepseek:deepseek-chat`).
+        // Routing on the prefix is `RoutingLlm`'s job — by the time we get here
+        // the provider is already decided, so only the bare id matters. Stripping
+        // it here (rather than rewriting the session upstream) avoids cloning the
+        // whole transcript just to change one field.
         if let Some(name) = session
             .model_override()
+            .map(|id| split_model_id(id).1)
             .filter(|name| *name != self.default_model)
         {
             agent.model = Arc::new(M::make(&self.client, name));
@@ -470,15 +525,58 @@ fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
     }
 }
 
-/// Build an LLM client for the configured provider, exposing `tools` via
-/// function calling. `preamble` is a factory (see [`PreambleFn`]) invoked once
-/// per turn to (re)assemble the system prompt — typically wrapping a
-/// [`crate::agent::system_prompt::SystemPromptBuilder`]. The factory's initial
-/// output is baked into the agent; each turn overrides it. The concrete
-/// provider model type is erased. `enricher` is the optional per-turn memory
-/// enrichment — `Some` only for the main agent, `None` for aux/delegate
-/// sub-agents (they must not be fed the user's memory library).
+/// Build an LLM client covering every provider the configured `models` menu
+/// spans, exposing `tools` via function calling.
+///
+/// With a single-provider menu this is exactly one backend. With a
+/// cross-provider one it is a [`RoutingLlm`] over one backend per provider, and
+/// a session's qualified model id (`deepseek:deepseek-chat`) selects among them —
+/// so switching provider is the same mechanism as switching model, decided per
+/// turn off the session.
+///
+/// `preamble` is a factory (see [`PreambleFn`]) invoked once per turn to
+/// (re)assemble the system prompt — typically wrapping a
+/// [`crate::agent::system_prompt::SystemPromptBuilder`]. `enricher` is the
+/// optional per-turn memory enrichment — `Some` only for the main agent, `None`
+/// for aux/delegate sub-agents (they must not be fed the user's memory library).
 pub fn build_llm(
+    config: &ModelConfig,
+    tools: Option<&crate::services::tool_execution::ToolExecutor>,
+    preamble: PreambleFn,
+    enricher: Option<Arc<MemoryEnricher>>,
+) -> anyhow::Result<Arc<dyn LlmClient>> {
+    let providers = config.menu_providers();
+    // The common case: everything on the menu runs on one provider, so there is
+    // nothing to route between.
+    if providers.len() < 2 {
+        return build_provider_llm(config, tools, preamble, enricher);
+    }
+
+    let mut by_provider = Vec::with_capacity(providers.len());
+    for provider in providers {
+        // Each backend's own default model is the first menu entry naming it —
+        // for the configured provider that is `model` itself (the resolver force-
+        // includes it first), so the default backend keeps its exact identity.
+        let default_model = config
+            .menu()
+            .into_iter()
+            .find(|entry| entry.provider == provider)
+            .map(|entry| entry.model)
+            .unwrap_or_else(|| provider.default_model().to_string());
+        let scoped = config.for_provider(provider, default_model);
+        by_provider.push((
+            provider,
+            build_provider_llm(&scoped, tools, preamble.clone(), enricher.clone())?,
+        ));
+    }
+    Ok(Arc::new(RoutingLlm {
+        by_provider,
+        default_provider: config.provider,
+    }))
+}
+
+/// Build the backend for exactly one provider (the erased `RigLlm`).
+fn build_provider_llm(
     config: &ModelConfig,
     tools: Option<&crate::services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
@@ -633,6 +731,17 @@ where
     }
 }
 
+/// Map a komo message into a rig chat-history message. The system prompt is
+/// supplied via the preamble, and tool outputs are folded into the following
+/// assistant reply, so both `System` and `Tool` roles are skipped here.
+fn to_rig_message(msg: &Message) -> Option<RigMessage> {
+    match msg.role {
+        Role::User => Some(RigMessage::user(msg.content.clone())),
+        Role::Assistant => Some(RigMessage::assistant(msg.content.clone())),
+        Role::System | Role::Tool => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +793,76 @@ mod tests {
         }
     }
 
+    /// A backend that reports which provider it was routed to.
+    struct Tagged(&'static str);
+
+    #[async_trait]
+    impl LlmClient for Tagged {
+        async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    fn router() -> RoutingLlm {
+        RoutingLlm {
+            by_provider: vec![
+                (
+                    Provider::Codex,
+                    Arc::new(Tagged("codex")) as Arc<dyn LlmClient>,
+                ),
+                (
+                    Provider::DeepSeek,
+                    Arc::new(Tagged("deepseek")) as Arc<dyn LlmClient>,
+                ),
+            ],
+            default_provider: Provider::Codex,
+        }
+    }
+
+    fn session_on(model: &str) -> Session {
+        let mut session = Session::new("s");
+        session.model = model.to_string();
+        session
+    }
+
+    #[tokio::test]
+    async fn a_qualified_id_routes_to_that_provider() {
+        let router = router();
+        assert_eq!(
+            router
+                .complete(&session_on("deepseek:deepseek-chat"))
+                .await
+                .unwrap(),
+            "deepseek"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unqualified_or_default_id_stays_on_the_default_provider() {
+        let router = router();
+        for model in ["", "gpt-5.5", "codex:gpt-5.6-sol"] {
+            assert_eq!(
+                router.complete(&session_on(model)).await.unwrap(),
+                "codex",
+                "model {model:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_no_backend_falls_back_to_the_default() {
+        // Config can change under a stored session (a key removed, an entry
+        // dropped), and running on the default beats failing the turn.
+        let router = router();
+        assert_eq!(
+            router
+                .complete(&session_on("anthropic:claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+            "codex"
+        );
+    }
+
     #[test]
     fn merging_params_keeps_unrelated_keys_and_overrides_collisions() {
         let merged = merge_params(
@@ -698,16 +877,5 @@ mod tests {
             merge_params(Some(Value::Null), json!({ "a": 1 })),
             json!({ "a": 1 })
         );
-    }
-}
-
-/// Map a komo message into a rig chat-history message. The system prompt is
-/// supplied via the preamble, and tool outputs are folded into the following
-/// assistant reply, so both `System` and `Tool` roles are skipped here.
-fn to_rig_message(msg: &Message) -> Option<RigMessage> {
-    match msg.role {
-        Role::User => Some(RigMessage::user(msg.content.clone())),
-        Role::Assistant => Some(RigMessage::assistant(msg.content.clone())),
-        Role::System | Role::Tool => None,
     }
 }

@@ -362,12 +362,27 @@ pub async fn resolve_resume(runs: &dyn RunRepository, id: &str) -> anyhow::Resul
     Ok(ResumeTarget::Ready { run, steps, input })
 }
 
+/// Session-id prefix for a sub-agent turn spawned by the `delegate` tool.
+/// Kept next to the projection that filters it so the two can't drift.
+pub const SUBAGENT_SESSION_PREFIX: &str = "delegate:";
+
+/// Is this a sub-agent's scratch session rather than a real conversation?
+pub fn is_subagent_session(id: &str) -> bool {
+    id.starts_with(SUBAGENT_SESSION_PREFIX)
+}
+
 /// Summaries only — a list view never dumps full transcripts.
 pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
     sessions
         .into_iter()
         // Hide soft-deleted sessions from the list; active + archived stay.
         .filter(|s| s.status != komo_core::domain::session::SESSION_STATUS_DELETED)
+        // A sub-agent's session (`delegate` tool) is scratch work, not a
+        // conversation: one delegation per handoff would flood a list whose whole
+        // purpose is "conversations you can reopen". The work is not hidden — each
+        // one is its own ledger run, which is the right lens for it
+        // (`komo run list` / `run inspect`).
+        .filter(|s| !is_subagent_session(&s.id))
         .map(|s| SessionSummary {
             created_at: s.created_at,
             messages: s.messages.len(),
@@ -444,4 +459,49 @@ pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use komo_core::domain::session::{SESSION_STATUS_ARCHIVE, SESSION_STATUS_DELETED};
+
+    fn session(id: &str, status: &str) -> Session {
+        let mut s = Session::new(id);
+        s.status = status.to_string();
+        s
+    }
+
+    #[test]
+    fn the_session_list_hides_deleted_and_subagent_sessions() {
+        let rows = session_summaries(vec![
+            session("api:real", "active"),
+            session("api:archived", SESSION_STATUS_ARCHIVE),
+            session("api:gone", SESSION_STATUS_DELETED),
+            // A `delegate` sub-agent's scratch session: real work, but not a
+            // conversation — it belongs in the run ledger, not this list.
+            session("delegate:019fa7f2-50e7-7f42-9430-ea0e1d88c81e", "active"),
+        ]);
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["api:real", "api:archived"]);
+    }
+
+    #[test]
+    fn only_the_subagent_prefix_is_filtered() {
+        // Don't over-match: a user conversation may legitimately mention the word.
+        assert!(is_subagent_session("delegate:abc"));
+        assert!(!is_subagent_session("api:delegate-notes"));
+        assert!(!is_subagent_session("telegram:12345"));
+        assert!(!is_subagent_session("cron:nightly:1785228839"));
+    }
+
+    #[test]
+    fn a_session_summary_carries_its_model_choice() {
+        let mut s = session("api:one", "active");
+        s.model = "deepseek:deepseek-chat".into();
+        s.effort = "high".into();
+        let rows = session_summaries(vec![s]);
+        assert_eq!(rows[0].model, "deepseek:deepseek-chat");
+        assert_eq!(rows[0].effort, "high");
+    }
 }

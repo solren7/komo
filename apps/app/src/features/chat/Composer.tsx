@@ -22,6 +22,7 @@ import {
   EffortSelect,
   ModelSelect,
   selectedContextWindow,
+  selectedOption,
   useModelMenu,
 } from "@/features/models/ModelPicker";
 import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
@@ -257,10 +258,19 @@ export function Composer({
         <ModelSelect
           menu={menu.data}
           model={choice.model}
-          onModelChange={(model) => setModelChoice(session, { ...choice, model })}
+          // Switching provider can invalidate the effort level (deepseek has no
+          // scale at all), so drop one the new model doesn't offer. The gateway
+          // does the same server-side; doing it here too keeps the control from
+          // showing a level that isn't in force.
+          onModelChange={(model) => {
+            const levels = selectedOption(menu.data, model)?.efforts ?? [];
+            const effort = levels.includes(choice.effort) ? choice.effort : "";
+            setModelChoice(session, { model, effort });
+          }}
         />
         <EffortSelect
           menu={menu.data}
+          model={choice.model}
           effort={choice.effort}
           onEffortChange={(effort) => setModelChoice(session, { ...choice, effort })}
         />

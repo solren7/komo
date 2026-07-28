@@ -173,49 +173,101 @@ pub async fn build(
     // and the unattended cron agent share one definition and can never drift.
     // The executor owns execution policy (result cap, per-turn call budget) as
     // instance config — no process globals.
-    let build_full_tools = |approver: Arc<dyn Approver>| -> ToolExecutor {
-        let mut tools = ToolExecutor::new(
-            ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
-                .with_turn_budget(model_config.max_turn_result_bytes)
-                .with_call_timeout_secs(model_config.tool_timeout_secs),
-        )
-        .with_approver(approver.clone());
-        tools.register(Arc::new(TimeTool));
-        tools.register(Arc::new(ReadTool::new(workspace.clone())));
-        tools.register(Arc::new(WriteTool::new(workspace.clone())));
-        tools.register(Arc::new(EditTool::new(workspace.clone())));
-        tools.register(Arc::new(ApplyPatchTool::new(workspace.clone())));
-        tools.register(Arc::new(GrepTool::new(workspace.clone())));
-        tools.register(Arc::new(GlobTool::new(workspace.clone())));
-        tools.register(Arc::new(ShellTool::new(workspace.clone())));
-        tools.register(Arc::new(WebFetchTool::new()));
-        tools.register(Arc::new(WebSearchTool::new()));
-        tools.register(Arc::new(SessionTool::new(db.clone())));
-        tools.register(Arc::new(ReminderTool::new(db.clone())));
-        // Scheduled jobs from inside a conversation. Every mutation is gated
-        // through this tool set's approver — a chat-authored job is
-        // model-authored, unlike one added with `komo cron add`.
-        tools.register(Arc::new(CronTool::new(cron_jobs.clone())));
-        tools.register(Arc::new(TaskTool::new(kanban.clone())));
-        tools.register(Arc::new(TodoTool::new(db.clone())));
-        tools.register(Arc::new(AskUserTool::new(clarify.clone())));
-        // Home Assistant tool, only when configured (HASS_TOKEN set).
-        if let Some(ha) = &config.runtime.homeassistant_tool {
-            tools.register(Arc::new(HomeAssistantTool::new(
-                ha.base_url.clone(),
-                ha.token.clone(),
+    // `delegate` is passed in rather than built here because the sub-agent it
+    // runs needs a tool set of its own — built by this same closure with
+    // `delegate: None`, which is the structural guard against recursion.
+    let build_full_tools =
+        |approver: Arc<dyn Approver>, delegate: Option<Arc<DelegateTool>>| -> ToolExecutor {
+            let mut tools = ToolExecutor::new(
+                ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
+                    .with_turn_budget(model_config.max_turn_result_bytes)
+                    .with_call_timeout_secs(model_config.tool_timeout_secs),
+            )
+            .with_approver(approver.clone());
+            tools.register(Arc::new(TimeTool));
+            tools.register(Arc::new(ReadTool::new(workspace.clone())));
+            tools.register(Arc::new(WriteTool::new(workspace.clone())));
+            tools.register(Arc::new(EditTool::new(workspace.clone())));
+            tools.register(Arc::new(ApplyPatchTool::new(workspace.clone())));
+            tools.register(Arc::new(GrepTool::new(workspace.clone())));
+            tools.register(Arc::new(GlobTool::new(workspace.clone())));
+            tools.register(Arc::new(ShellTool::new(workspace.clone())));
+            tools.register(Arc::new(WebFetchTool::new()));
+            tools.register(Arc::new(WebSearchTool::new()));
+            tools.register(Arc::new(SessionTool::new(db.clone())));
+            tools.register(Arc::new(ReminderTool::new(db.clone())));
+            // Scheduled jobs from inside a conversation. Every mutation is gated
+            // through this tool set's approver — a chat-authored job is
+            // model-authored, unlike one added with `komo cron add`.
+            tools.register(Arc::new(CronTool::new(cron_jobs.clone())));
+            tools.register(Arc::new(TaskTool::new(kanban.clone())));
+            tools.register(Arc::new(TodoTool::new(db.clone())));
+            tools.register(Arc::new(AskUserTool::new(clarify.clone())));
+            // Home Assistant tool, only when configured (HASS_TOKEN set).
+            if let Some(ha) = &config.runtime.homeassistant_tool {
+                tools.register(Arc::new(HomeAssistantTool::new(
+                    ha.base_url.clone(),
+                    ha.token.clone(),
+                )));
+            }
+            tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
+            if let Some(delegate) = delegate {
+                tools.register(delegate);
+            }
+            tools.register(Arc::new(SkillTool::new(
+                skills.clone(),
+                skill_store.clone(),
             )));
-        }
-        tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
-        tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
-        tools.register(Arc::new(SkillTool::new(
-            skills.clone(),
-            skill_store.clone(),
-        )));
-        tools
-    };
+            tools
+        };
 
-    let tools = build_full_tools(approver.clone());
+    // ── Sub-agent runtime (the `delegate` tool's worker) ─────────────────────
+    // A real agent turn, not a bare completion: the full tool set, so a delegated
+    // subtask can actually search/read/edit — and `delegate`'s `model` argument
+    // picks which model does it (plan on one, apply on another).
+    //
+    // Safety comes from three places, none of them a new mechanism:
+    //   - it is built WITHOUT `delegate`, so a sub-agent cannot spawn another;
+    //   - it shares the **main approver**, and the parent's ambient session
+    //     context is inherited (`AgentRuntime::handle_input` never overrides one),
+    //     so every side effect still prompts the human in the real conversation
+    //     and still resolves against the parent's workspace root;
+    //   - it shares the run ledger, so each delegation is auditable on its own.
+    // No memory enricher: a sub-agent is a worker, not the user's assistant.
+    let subagent_tools = build_full_tools(approver.clone(), None);
+    let subagent_tool_names = subagent_tools
+        .definitions()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    let subagent_builder = Arc::new(
+        SystemPromptBuilder::new(model_config)
+            .tools(subagent_tool_names)
+            .skills_note(skills_note.clone())
+            .workspace_root(Some(root.clone())),
+    );
+    let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
+    let subagent_llm = build_llm(model_config, Some(&subagent_tools), subagent_preamble, None)?;
+    let subagent_runtime = Arc::new(AgentRuntime {
+        llm: subagent_llm,
+        sessions: db.clone(),
+        messages: db.clone(),
+        runs: db.clone(),
+        tool_executor: subagent_tools,
+        max_turns: model_config.max_turns,
+        history_window: model_config.max_history_messages,
+        // A sub-agent's transcript is scratch work, not a conversation to learn
+        // from — the reviewer only ever sees the real one.
+        review: None,
+    });
+    let delegate = Arc::new(DelegateTool::new(
+        subagent_runtime,
+        db.clone(),
+        model_config.menu(),
+        model_config.model.clone(),
+    ));
+
+    let tools = build_full_tools(approver.clone(), Some(delegate));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
     // (gated on the tools actually loaded) + skills catalog, then the workspace
@@ -294,7 +346,12 @@ pub async fn build(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );
-    let cron_tools = build_full_tools(cron_approver);
+    // No `delegate`: the sub-agent runtime carries the *interactive* approver, and
+    // handing that to an unattended job mixes trust models — a cron turn has no
+    // ambient session, so the sub-agent's Risk::Normal actions would be auto-denied
+    // anyway, just less legibly. A cron job that needs a sub-agent should say so
+    // explicitly (its own runtime with the unattended approver), not inherit one.
+    let cron_tools = build_full_tools(cron_approver, None);
     let cron_tool_names = cron_tools
         .definitions()
         .iter()

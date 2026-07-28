@@ -88,20 +88,31 @@ export interface SessionSummary {
   effort?: string;
 }
 
-/** One selectable model. `context_window` is null for ids the gateway has no
- *  known capacity for — it must read as "unknown", never as zero. */
+/** One selectable model.
+ *
+ *  `id` is what the client sends back and what the session stores — it may be
+ *  provider-qualified (`deepseek:deepseek-chat`), which is what routes the turn
+ *  to another backend; `model` is the bare id the provider sees.
+ *  `context_window` is null for ids the gateway has no known capacity for — it
+ *  must read as "unknown", never as zero. `efforts` is **per model**, because a
+ *  cross-provider menu mixes models that have an effort scale with ones that
+ *  don't (codex has three levels, deepseek none). */
 export interface ModelOption {
   id: string;
+  provider: string;
+  model: string;
   context_window: number | null;
+  efforts: string[];
 }
 
-/** What a session may be switched to (`GET /api/models`). An empty `efforts`
- *  means this provider exposes no effort knob at all. */
+/** What a session may be switched to (`GET /api/models`). Models whose provider
+ *  has no configured credential are absent — the gateway never offers one that
+ *  would error on every turn. */
 export interface ModelMenu {
+  /** The default provider's name; each entry names its own. */
   provider: string;
   default_model: string;
   models: ModelOption[];
-  efforts: string[];
 }
 
 export interface PendingApproval {

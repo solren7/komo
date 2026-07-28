@@ -187,10 +187,10 @@ vars. `KOMO_HOME` relocates the whole directory.
 **Per-session model + reasoning effort.** `models = ["a", "b"]` (or
 `KOMO_MODELS=a,b`, comma-separated) declares the menu a client may switch a
 session to; unset it defaults to `model` plus `aux_model`, and `model` is always
-force-included first so the running model can't be unselectable. Everything on
-the menu runs on the one configured provider and key — this is a menu *inside* a
-provider, not a cross-provider router. The gateway advertises the menu plus the
-provider's effort levels over `GET /api/models`
+force-included first so the running model can't be unselectable. An entry may be
+**provider-qualified** (`deepseek:deepseek-chat`) to name a backend other than
+`provider`, so one menu spans providers — see the next section. The gateway
+advertises the menu over `GET /api/models`
 (`api.rs::ModelMenu::from_config`), and a chat turn carries the choice in
 `X-Komo-Model` / `X-Komo-Effort`. Unlike the workspace (creation-locked), the
 choice is **not** locked: the client sends its current selection every turn and
@@ -212,7 +212,62 @@ onto `thinking.budget_tokens` and `max_tokens` is raised to clear the budget;
 DeepSeek advertises **no** levels (its only knob is a thinking on/off flag, and
 squeezing three levels onto a boolean would misreport what the model did) and the
 UI says so rather than showing a dead switch. A test asserts the two halves agree
-— every advertised level must actually map.
+— every advertised level must actually map. Because the levels are per *provider*,
+`/api/models` reports `efforts` **per entry**, not once per gateway, and the chat
+path validates a requested level against *the model that will actually run* — so
+switching a session to deepseek clears a stale `high` instead of storing one that
+silently does nothing.
+
+**Multiple providers in one menu.** A qualified id routes across backends:
+`config::split_model_id` splits `provider:model`, but **only when the prefix names
+a known provider** — model ids legitimately contain colons (`llama3:8b`), so
+requiring a real provider name is what makes the syntax unambiguous rather than
+merely conventional (openrouter's `deepseek/deepseek-chat` uses a slash and is
+unaffected). Keys were already per-provider env vars (`Secrets::key`), so nothing
+new is needed to authenticate: `ModelConfig.keys` carries every configured one and
+`ModelConfig::menu()` **drops** entries whose provider has no credential — offering
+a model that errors on every turn is worse than not offering it. The one exception
+is the configured `model` itself, which always survives, because hiding what the
+gateway is actually running would misreport reality.
+
+`infra/llm.rs::RoutingLlm` is the dispatcher: one type-erased backend per
+provider, picked per turn off the session's qualified id. It exists because
+`RigLlm<M>` is generic over a *single* provider's model type — within-provider
+switching happens inside one `RigLlm` (swap the model handle), but
+`deepseek::CompletionModel` and `openai::CompletionModel` are unrelated types, so
+crossing providers needs erasure. `build_llm` returns a bare backend for a
+single-provider menu and a `RoutingLlm` otherwise, so the common case pays
+nothing. An unroutable id falls through to the default rather than failing the
+turn (config can change under a stored session). `ModelConfig::for_provider`
+builds each backend and deliberately does **not** carry `base_url` to a
+non-default provider — it overrides one specific endpoint, and applying it to
+every backend would silently point deepseek at an OpenAI-compatible proxy.
+
+**Tool-capable sub-agents with a chosen model** (`tools/delegate.rs`). `delegate
+{task, model?}` runs a *real agent turn*, not a bare completion: the full tool
+set, so a handed-off subtask can search/read/edit/run — and `model` picks which
+model does it (plan on one, apply changes on another). The model travels the same
+way a chat session's does: the tool creates a `delegate:<uuid>` session carrying
+it and calls `AgentRuntime::handle_input`, so `RoutingLlm` reads it off the row —
+no separate plumbing for sub-agents.
+
+What makes that safe is that it **inherits the parent's ambient session context
+instead of replacing it**: `handle_input` never overrides an existing one and
+`run_agent_loop` reads it, so a sub-agent's side effects prompt the human in the
+real conversation through the main approver, resolve against the parent's
+workspace root, and stop when the parent turn is cancelled. Recursion is blocked
+*structurally* — wiring builds the sub-agent's tool set with `delegate: None`, so
+a sub-agent has no such tool, rather than relying on a depth counter. Each
+delegation is its own ledger run, so `komo run list` / `run inspect` show exactly
+which tools it called. Two consequences to know: session-scoped tools (`todo`) see
+the **parent's** session id (a sub-agent shares the conversation's working list),
+and `delegate:*` sessions are filtered out of the session list
+(`actions.rs::is_subagent_session`) because they are scratch work, not
+conversations — the run ledger is the right lens. The unattended **cron** agent
+gets no `delegate` (`build_full_tools(..., None)`): the sub-agent runtime carries
+the interactive approver, and handing that to a job with no human mixes trust
+models — a cron job needing a sub-agent should build its own with the unattended
+approver.
 
 **Scheduled cron jobs** (`komo cron`): the gateway runs operator-configured jobs
 on cron schedules and delivers the output through the same `HomeNotifier` as

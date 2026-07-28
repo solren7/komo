@@ -5,12 +5,13 @@
 //! of an early error, so diagnostic consumers (`doctor`) always see the whole
 //! picture while startup paths fail fast via `ConfigSnapshot::validate_*`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use super::Provider;
 use super::report::{ConfigIssue, ConfigReport, IssueSeverity, Origin};
 use super::sources::{ConfigSources, KomoEnv, PolicyFileConfig, PolicyRuleFileConfig};
+use super::{Provider, split_model_id};
 
 /// Built-in default for `max_turns` when neither `KOMO_MAX_TURNS` nor
 /// config.toml sets one — the number of model **round-trips** one turn may
@@ -162,17 +163,35 @@ impl<T> ChannelState<T> {
     }
 }
 
+/// One selectable model, resolved from a (possibly provider-qualified) menu id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    /// The menu id as configured — qualified (`deepseek:deepseek-chat`) or not.
+    /// This is what a client sends back and what is stored on a session.
+    pub id: String,
+    pub provider: Provider,
+    /// The bare model id handed to the provider.
+    pub model: String,
+    /// Reasoning-effort levels valid for *this* entry's provider.
+    pub efforts: &'static [&'static str],
+}
+
 /// Resolved model selection: provider, model id, API key, and optional overrides.
 pub struct ModelConfig {
     pub provider: Provider,
     pub model: String,
     /// The models a client may switch a session to, `model` first. Always
-    /// non-empty (it contains at least `model`). Every entry runs on the one
-    /// configured provider + key, so this is a menu inside that provider, not a
-    /// cross-provider router. The api channel advertises it over `/api/models`
-    /// and validates a client's request against it, so a typo can never reach
-    /// the provider.
+    /// non-empty (it contains at least `model`). An entry may be **qualified**
+    /// (`deepseek:deepseek-chat`) to name a different backend than `provider`, so
+    /// one menu can span providers — see [`split_model_id`] for the syntax and
+    /// [`Self::menu`] for the resolved form. The api channel advertises it over
+    /// `/api/models` and validates a client's request against it, so a typo can
+    /// never reach a provider.
     pub models: Vec<String>,
+    /// API keys for **every** provider that has one configured, not just
+    /// `provider` — a cross-provider menu needs a client per backend. Codex is
+    /// absent by design (OAuth, see [`Provider::uses_api_key`]).
+    pub keys: HashMap<Provider, String>,
     /// Empty for Codex (OAuth via `~/.codex/auth.json`) and when the key is
     /// missing — the latter is recorded as a fatal issue.
     pub api_key: String,
@@ -254,11 +273,76 @@ fn mask_secret(s: &str) -> String {
 }
 
 impl ModelConfig {
-    /// The reasoning-effort levels this provider accepts, in ascending order.
-    /// Empty when the provider exposes no effort knob — the UI then says so
-    /// instead of showing a switch that changes nothing.
-    pub fn efforts(&self) -> &'static [&'static str] {
-        self.provider.efforts()
+    /// The menu resolved into one entry per selectable model, in declared order.
+    ///
+    /// Entries whose provider has no usable credential are **dropped**: offering
+    /// a model that errors on every turn is worse than not offering it. The
+    /// configured `model` is the exception — it always survives, because hiding
+    /// the model the gateway is actually running would misreport reality (its
+    /// missing key is already a startup warning, and the turn's reply says so).
+    pub fn menu(&self) -> Vec<ModelEntry> {
+        let mut out: Vec<ModelEntry> = Vec::new();
+        for id in &self.models {
+            let (qualified, bare) = split_model_id(id);
+            let provider = qualified.unwrap_or(self.provider);
+            let is_default = id == &self.model;
+            if !is_default && !self.has_credential(provider) {
+                continue;
+            }
+            out.push(ModelEntry {
+                id: id.clone(),
+                provider,
+                model: bare.to_string(),
+                efforts: provider.efforts(),
+            });
+        }
+        out
+    }
+
+    /// Is this provider usable — a key present, or Codex (OAuth, validated
+    /// separately by `komo doctor`)?
+    pub fn has_credential(&self, provider: Provider) -> bool {
+        !provider.uses_api_key() || self.keys.contains_key(&provider)
+    }
+
+    /// Every provider the resolved menu actually needs a client for.
+    pub fn menu_providers(&self) -> Vec<Provider> {
+        let mut out = Vec::new();
+        for entry in self.menu() {
+            if !out.contains(&entry.provider) {
+                out.push(entry.provider);
+            }
+        }
+        if !out.contains(&self.provider) {
+            out.push(self.provider);
+        }
+        out
+    }
+
+    /// This config re-pointed at `provider`, running `model`. Used to build one
+    /// backend per provider behind the cross-provider router: the agent-loop
+    /// knobs carry over, only the identity and credential change.
+    ///
+    /// `base_url` deliberately does **not** carry over to a non-default provider —
+    /// it overrides one specific endpoint, and applying it to every backend would
+    /// silently point deepseek at an OpenAI-compatible proxy.
+    pub fn for_provider(&self, provider: Provider, model: String) -> ModelConfig {
+        let default_provider = provider == self.provider;
+        ModelConfig {
+            provider,
+            models: vec![model.clone()],
+            model,
+            api_key: self.keys.get(&provider).cloned().unwrap_or_default(),
+            keys: self.keys.clone(),
+            base_url: default_provider.then(|| self.base_url.clone()).flatten(),
+            aux_model: self.aux_model.clone(),
+            max_turns: self.max_turns,
+            max_tool_result_bytes: self.max_tool_result_bytes,
+            max_turn_result_bytes: self.max_turn_result_bytes,
+            tool_timeout_secs: self.tool_timeout_secs,
+            max_history_messages: self.max_history_messages,
+            llm_timeout_secs: self.llm_timeout_secs,
+        }
     }
 
     /// A variant using the cheaper `aux_model`, falling back to the main model.
@@ -271,6 +355,7 @@ impl ModelConfig {
             models: vec![model.clone()],
             model,
             api_key: self.api_key.clone(),
+            keys: self.keys.clone(),
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
             max_turns: self.max_turns,
@@ -417,6 +502,13 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         .map(|p| (*p, secrets.key(*p).is_some()))
         .collect();
 
+    // Every configured key, not just the active provider's: a cross-provider
+    // `models` menu needs a client per backend (see `ModelConfig::for_provider`).
+    let keys: HashMap<Provider, String> = Provider::ALL
+        .iter()
+        .filter_map(|p| secrets.key(*p).map(|k| (*p, k.to_string())))
+        .collect();
+
     let aux_model = env.aux_model.or(file.aux_model);
     let models = resolve_model_menu(
         &model,
@@ -429,6 +521,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         models,
         model,
         api_key,
+        keys,
         base_url: env.base_url.or(file.base_url),
         aux_model,
         max_turns: env
@@ -1116,12 +1209,108 @@ mod tests {
         );
     }
 
+    /// A codex-default config whose menu also names a deepseek model.
+    fn cross_provider_config(with_deepseek_key: bool) -> ModelConfig {
+        let mut keys = HashMap::new();
+        if with_deepseek_key {
+            keys.insert(Provider::DeepSeek, "sk-ds".to_string());
+        }
+        ModelConfig {
+            provider: Provider::Codex,
+            model: "gpt-5.6-terra".into(),
+            models: vec![
+                "gpt-5.6-terra".into(),
+                "deepseek:deepseek-chat".into(),
+                "gpt-5.4-mini".into(),
+            ],
+            keys,
+            api_key: String::new(),
+            base_url: Some("https://proxy.example".into()),
+            aux_model: None,
+            max_turns: DEFAULT_MAX_TURNS,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,
+            tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
+            max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
+            llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
+        }
+    }
+
+    #[test]
+    fn menu_resolves_qualified_ids_to_their_own_provider_and_efforts() {
+        let menu = cross_provider_config(true).menu();
+        let ids: Vec<_> = menu.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["gpt-5.6-terra", "deepseek:deepseek-chat", "gpt-5.4-mini"]
+        );
+
+        let deepseek = &menu[1];
+        assert_eq!(deepseek.provider, Provider::DeepSeek);
+        assert_eq!(deepseek.model, "deepseek-chat", "the prefix is stripped");
+        assert!(
+            deepseek.efforts.is_empty(),
+            "deepseek exposes no effort scale, unlike the codex entries"
+        );
+        // An unqualified entry inherits the configured provider.
+        assert_eq!(menu[2].provider, Provider::Codex);
+        assert_eq!(menu[0].efforts, ["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn menu_drops_models_whose_provider_has_no_credential() {
+        // Offering one would mean a model that errors on every single turn.
+        let menu = cross_provider_config(false).menu();
+        let ids: Vec<_> = menu.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-5.6-terra", "gpt-5.4-mini"]);
+    }
+
+    #[test]
+    fn the_running_model_survives_even_without_its_credential() {
+        // Hiding it would misreport what the gateway is actually running; the
+        // missing key is already a startup warning.
+        let mut config = cross_provider_config(false);
+        config.provider = Provider::OpenAi;
+        config.model = "gpt-4.1".into();
+        config.models = vec!["gpt-4.1".into(), "deepseek:deepseek-chat".into()];
+        let ids: Vec<_> = config.menu().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, ["gpt-4.1"]);
+    }
+
+    #[test]
+    fn menu_providers_covers_every_backend_plus_the_default() {
+        let config = cross_provider_config(true);
+        assert_eq!(
+            config.menu_providers(),
+            vec![Provider::Codex, Provider::DeepSeek]
+        );
+        // With no credential the deepseek entry is gone, so no client is built.
+        assert_eq!(
+            cross_provider_config(false).menu_providers(),
+            vec![Provider::Codex]
+        );
+    }
+
+    #[test]
+    fn for_provider_carries_base_url_only_to_the_default_provider() {
+        let config = cross_provider_config(true);
+        // base_url overrides one specific endpoint; applying it to deepseek would
+        // silently point it at an unrelated OpenAI-compatible proxy.
+        let other = config.for_provider(Provider::DeepSeek, "deepseek-chat".into());
+        assert_eq!(other.base_url, None);
+        assert_eq!(other.api_key, "sk-ds", "each backend gets its own key");
+
+        let same = config.for_provider(Provider::Codex, "gpt-5.6-terra".into());
+        assert_eq!(same.base_url.as_deref(), Some("https://proxy.example"));
+    }
+
     #[test]
     fn debug_output_masks_api_key() {
         let cfg = ModelConfig {
             provider: Provider::DeepSeek,
             model: "deepseek-chat".into(),
             models: vec!["deepseek-chat".into()],
+            keys: Default::default(),
             api_key: "sk-abcdefghijklmnopqr".into(),
             base_url: None,
             aux_model: None,

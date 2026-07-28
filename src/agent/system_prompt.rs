@@ -417,6 +417,7 @@ mod tests {
             provider: Provider::DeepSeek,
             model: "deepseek-chat".into(),
             models: vec!["deepseek-chat".into()],
+            keys: Default::default(),
             api_key: "sk-test".into(),
             base_url: None,
             aux_model: None,

@@ -174,7 +174,7 @@ a loopback socket; `X-Komo-Trusted` auto-approve stays loopback-only regardless)
 Building requires `protoc` (`brew install protobuf`): the feishu channel's websocket
 frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.
 
-Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`,
+Runtime settings (provider/model/`models`/base_url/aux_model, maintenance `schedule`,
 the opt-in daily `briefing_schedule` + its `briefing_workdays_only` gate, the
 `dream_schedule` for usage-driven memory consolidation (on by default, nightly
 `0 3 * * *`; set to `"off"` to disable), the
@@ -183,6 +183,36 @@ the opt-in daily `briefing_schedule` + its `briefing_workdays_only` gate, the
 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, `HASS_TOKEN`) only
 in `~/.komo/.env`. Priority: built-in defaults < config.toml < `KOMO_*` env
 vars. `KOMO_HOME` relocates the whole directory.
+
+**Per-session model + reasoning effort.** `models = ["a", "b"]` (or
+`KOMO_MODELS=a,b`, comma-separated) declares the menu a client may switch a
+session to; unset it defaults to `model` plus `aux_model`, and `model` is always
+force-included first so the running model can't be unselectable. Everything on
+the menu runs on the one configured provider and key — this is a menu *inside* a
+provider, not a cross-provider router. The gateway advertises the menu plus the
+provider's effort levels over `GET /api/models`
+(`api.rs::ModelMenu::from_config`), and a chat turn carries the choice in
+`X-Komo-Model` / `X-Komo-Effort`. Unlike the workspace (creation-locked), the
+choice is **not** locked: the client sends its current selection every turn and
+the gateway validates it against the advertised menu — an unknown value resolves
+to the default rather than reaching the provider — then stores it on the session
+(`SessionRepository::set_model`, additive `model`/`effort` columns). Sending
+*neither* header leaves the stored selection alone, so a third-party
+OpenAI-compatible client can't silently reset a conversation. The turn reads the
+choice back off the `Session` (`infra/llm.rs::RigLlm::agent_for`), which clones
+the per-turn agent and swaps only its model handle (`M::make` over the retained
+provider client) plus `additional_params`. Reading it off the session is safe
+because every aux path (reviewer, delegate, recall screening, sweeps) builds a
+*synthetic* `Session` whose overrides are empty — that invariant is what keeps a
+conversation's model from leaking onto the aux model, so preserve it if you add
+an aux caller. Effort is provider-specific (`Provider::efforts` advertises,
+`infra/llm.rs::reasoning_params` spells it on the wire): openai / openrouter /
+codex take `reasoning.effort`; anthropic has no effort scale, so the levels map
+onto `thinking.budget_tokens` and `max_tokens` is raised to clear the budget;
+DeepSeek advertises **no** levels (its only knob is a thinking on/off flag, and
+squeezing three levels onto a boolean would misreport what the model did) and the
+UI says so rather than showing a dead switch. A test asserts the two halves agree
+— every advertised level must actually map.
 
 **Scheduled cron jobs** (`komo cron`): the gateway runs operator-configured jobs
 on cron schedules and delivers the output through the same `HomeNotifier` as
@@ -599,7 +629,8 @@ no "the model must have read the file first" rule
 — `apps/desktop` (Electron: a native window + gateway discovery over a preload
 bridge) and `apps/web` (a static SPA the api channel can serve via `web_dir`).
 Both talk to the gateway only over its HTTP api channel, through one
-`HttpKomoClient`; the renderer is feature-first (`features/{chat,sessions,settings,connect}`
+`HttpKomoClient`; the renderer is feature-first
+(`features/{chat,sessions,settings,connect,workspaces,models}`
 over `shared/{ui,api,lib}`), server state lives in react-query, client state in
 zustand, and one chat turn is a plain-TypeScript orchestrator
 (`features/chat/turn-orchestrator.ts`) so its approval/clarify timing is unit
@@ -624,6 +655,20 @@ fails on a raw color. Conventions and commands: `apps/app/README.md`
 (`cd apps && bun install`, then `bun run check` = typecheck + lint + fmt + test).
 There is no second GUI: the former Dioxus `crates/komo-gui` was deleted in favor
 of this one.
+
+Two per-session settings sit in the composer, and the *difference* between them is
+the design: **workspace** (`features/workspaces`) renders above the input, because
+choosing it is part of *starting* a conversation — once the first turn dispatches
+the gateway has bound it for good, so it degrades to a static label rather than a
+disabled control (an interactive-looking picker would promise something the server
+ignores). **Model and effort** (`features/models`) sit in the control row below and
+stay live, because they are switchable mid-thread. Both live in the zustand store
+keyed by session id; the model choice is additionally seeded from the session row
+whenever this client has none of its own, so reopening the app — or opening a
+conversation another client started — shows the model it actually runs on instead
+of the default. `App.tsx` keeps visited threads mounted keyed by **session id
+alone**: an unstarted session's workspace is editable, and a composite
+id+workspace key would fork a second `ChatView` on every change.
 
 ## Key extension points
 

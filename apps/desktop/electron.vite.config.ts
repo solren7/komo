@@ -3,6 +3,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 
+// `electron-vite@5` (latest stable) declares `peerDependencies.vite ^5||^6||^7`
+// while this workspace runs vite 8, so that peer is deliberately unsatisfied. The
+// build works — the vite surface electron-vite touches is unchanged in 8 — and the
+// alternatives are both worse: `electron-vite@6.0.0-beta.1` is the only release
+// accepting vite 8 and has sat untouched since 2026-04, and pinning vite back to 7
+// cascades (`@vitejs/plugin-react@6` peers `vite ^8.0.0` alone). Hence the explicit
+// `vite ^8` in this package's devDependencies: it keeps one vite resolved across
+// the workspace instead of letting a nested vite 6/7 shadow it, which is what used
+// to break `tsc` here with "two different types with this name exist".
+// Revisit when electron-vite 6 ships stable — then the pin becomes unnecessary.
 import { defineConfig } from "electron-vite";
 
 import { sharedAlias, sharedPlugins } from "../vite.shared";

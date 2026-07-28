@@ -27,6 +27,13 @@ pub struct SessionSummary {
     /// from the list). `default` for older-gateway compatibility.
     #[serde(default)]
     pub status: String,
+    /// Per-session model override (empty = the gateway default). Switchable
+    /// mid-conversation, unlike `workspace`.
+    #[serde(default)]
+    pub model: String,
+    /// Per-session reasoning effort (empty = the provider default).
+    #[serde(default)]
+    pub effort: String,
 }
 
 fn default_workspace() -> String {

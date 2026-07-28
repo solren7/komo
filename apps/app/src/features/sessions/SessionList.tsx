@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  FolderIcon,
   PencilIcon,
   PlusIcon,
   SettingsIcon,
@@ -17,33 +18,26 @@ import { useConnection } from "@/shared/api/use-connection";
 import { POLL } from "@/shared/config";
 import { fmtTs } from "@/shared/lib/format";
 import { cn } from "@/shared/lib/utils";
-import { useAppStore, useNewWorkspace, useSession } from "@/shared/store";
-import type { SessionSummary, WorkspaceInfo } from "@/shared/types";
+import { useAppStore, useSession } from "@/shared/store";
+import type { SessionSummary } from "@/shared/types";
 import { Button } from "@/shared/ui/button";
 import { IconButton } from "@/shared/ui/icon-button";
 import { Input } from "@/shared/ui/input";
 import { KomoLogo } from "@/shared/ui/komo-logo";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/ui/popover";
 import { fetchSessions, renameSession, setSessionStatus } from "./api";
+import { DEFAULT_WORKSPACE, groupByWorkspace } from "./grouping";
 import { sessionLabel } from "./labels";
 import { fetchWorkspaces } from "@/features/workspaces/api";
-import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
 
 const ROW = "group flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 transition-colors";
-const DEFAULT_WORKSPACE = "__default__";
-
-function workspaceLabel(id: string, workspaces: WorkspaceInfo[]): string {
-  return workspaces.find((workspace) => workspace.id === id)?.name ??
-    (id === DEFAULT_WORKSPACE ? "默认 workspace" : id);
-}
 
 export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { connected } = useConnection();
   const session = useSession();
   const openSession = useAppStore((s) => s.openSession);
   const startNewSession = useAppStore((s) => s.startNewSession);
-  const newWorkspace = useNewWorkspace();
-  const setNewWorkspace = useAppStore((s) => s.setNewWorkspace);
+  const setModelChoice = useAppStore((s) => s.setModelChoice);
   const pickedWorkspaces = useAppStore((s) => s.pickedWorkspaces);
   const qc = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -101,19 +95,24 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
         ? item.status === "archive"
         : item.status !== "archive",
   );
-  const groupedSessions = Array.from(
-    visibleSessions.reduce((groups, item) => {
-      const workspace = item.workspace ?? DEFAULT_WORKSPACE;
-      const entries = groups.get(workspace) ?? [];
-      entries.push(item);
-      groups.set(workspace, entries);
-      return groups;
-    }, new Map<string, SessionSummary[]>()),
-  ).map(([workspace, entries]) => ({
-    workspace,
-    label: workspaceLabel(workspace, workspaces),
-    entries,
-  }));
+  const groupedSessions = groupByWorkspace(visibleSessions, workspaces);
+
+  // Adopt the model the active conversation last ran on, whenever this client has
+  // no choice of its own for it. That covers both entry paths with one rule —
+  // clicking a session the client has never seen, and reopening the app on a
+  // persisted session id — so the composer can't show the default while the
+  // server holds something else and then reset it on the next turn.
+  //
+  // Guarded on "no local entry", so it seeds once and never fights a switch the
+  // user just made (which is local until a turn persists it).
+  const activeRow = sessions.find((item) => item.id === session);
+  useEffect(() => {
+    if (!activeRow || useAppStore.getState().sessionModels[activeRow.id]) return;
+    setModelChoice(activeRow.id, {
+      model: activeRow.model ?? "",
+      effort: activeRow.effort ?? "",
+    });
+  }, [activeRow, setModelChoice]);
 
   const renderRow = (item: SessionSummary) => {
     const isOpen = item.id === session;
@@ -226,13 +225,9 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
       </div>
 
       <div className={cn("flex flex-col gap-1 pb-2", collapsed ? "items-center px-2" : "px-3")}>
-        {!collapsed && (
-          <div className="flex min-w-0 px-2 py-1">
-            <WorkspacePicker workspace={newWorkspace} onWorkspaceChange={setNewWorkspace} />
-          </div>
-        )}
-        {/* New session only switches the active id — it does NOT add a row. The
-            selected workspace is persisted with its first message. */}
+        {/* New session only switches the active id — it does NOT add a row. Its
+            workspace is chosen in the composer (above the input, while the
+            conversation is still empty) and persisted with the first message. */}
         <Button
           className={collapsed ? "size-9 px-0" : "w-full"}
           onClick={startNewSession}
@@ -292,9 +287,14 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
             <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
           ) : (
             groupedSessions.map((group) => (
-              <section key={group.workspace} className="pt-2 first:pt-0">
-                <h2 className="truncate px-3 pb-1 text-xs font-medium text-muted-foreground" title={group.label}>
-                  {group.label}
+              <section key={group.workspace} className="pt-3 first:pt-0">
+                <h2
+                  className="flex items-center gap-1.5 px-3 pb-1 text-xs font-medium text-muted-foreground"
+                  title={group.label}
+                >
+                  <FolderIcon className="size-3 shrink-0" />
+                  <span className="truncate">{group.label}</span>
+                  <span className="shrink-0 tabular-nums opacity-60">{group.entries.length}</span>
                 </h2>
                 {group.entries.map(renderRow)}
               </section>

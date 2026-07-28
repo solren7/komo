@@ -88,6 +88,23 @@ impl Provider {
         }
     }
 
+    /// The reasoning-effort levels this provider accepts, ascending. Empty when
+    /// it exposes no effort knob, so a client can say "not supported" instead of
+    /// rendering a switch that changes nothing — see
+    /// `infra::llm::reasoning_params`, which turns a level into request params.
+    ///
+    /// DeepSeek is deliberately empty: its only knob is a thinking on/off flag,
+    /// and squeezing three levels onto a boolean would misreport what the model
+    /// actually did.
+    pub fn efforts(self) -> &'static [&'static str] {
+        match self {
+            Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::Anthropic => {
+                &["low", "medium", "high"]
+            }
+            Provider::DeepSeek => &[],
+        }
+    }
+
     /// Environment variable holding this provider's API key. Codex has none —
     /// it authenticates from `~/.codex/auth.json` (see [`Provider::uses_api_key`]).
     pub fn api_key_var(self) -> &'static str {

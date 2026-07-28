@@ -166,6 +166,13 @@ impl<T> ChannelState<T> {
 pub struct ModelConfig {
     pub provider: Provider,
     pub model: String,
+    /// The models a client may switch a session to, `model` first. Always
+    /// non-empty (it contains at least `model`). Every entry runs on the one
+    /// configured provider + key, so this is a menu inside that provider, not a
+    /// cross-provider router. The api channel advertises it over `/api/models`
+    /// and validates a client's request against it, so a typo can never reach
+    /// the provider.
+    pub models: Vec<String>,
     /// Empty for Codex (OAuth via `~/.codex/auth.json`) and when the key is
     /// missing — the latter is recorded as a fatal issue.
     pub api_key: String,
@@ -195,6 +202,7 @@ impl fmt::Debug for ModelConfig {
         f.debug_struct("ModelConfig")
             .field("provider", &self.provider)
             .field("model", &self.model)
+            .field("models", &self.models)
             .field("api_key", &mask_secret(&self.api_key))
             .field("base_url", &self.base_url)
             .field("aux_model", &self.aux_model)
@@ -208,6 +216,35 @@ impl fmt::Debug for ModelConfig {
     }
 }
 
+/// The switchable-model menu, `default_model` always first.
+///
+/// `KOMO_MODELS` (comma-separated) wins over config.toml `models`; with neither,
+/// the menu is the configured model plus `aux_model` — enough for the common
+/// "one strong model, one cheap one" setup without any config at all. Blanks and
+/// duplicates are dropped, and the default is force-included so a menu that
+/// omits it can't leave the running model unselectable.
+fn resolve_model_menu(
+    default_model: &str,
+    aux_model: Option<&str>,
+    env_models: Option<&str>,
+    file_models: Option<&[String]>,
+) -> Vec<String> {
+    let declared: Vec<String> = match env_models {
+        Some(csv) => csv.split(',').map(|s| s.trim().to_string()).collect(),
+        None => match file_models {
+            Some(list) => list.iter().map(|s| s.trim().to_string()).collect(),
+            None => aux_model.into_iter().map(str::to_string).collect(),
+        },
+    };
+    let mut menu = vec![default_model.to_string()];
+    for name in declared {
+        if !name.is_empty() && !menu.contains(&name) {
+            menu.push(name);
+        }
+    }
+    menu
+}
+
 /// Show first 3 and last 4 chars; fully mask short keys.
 fn mask_secret(s: &str) -> String {
     if s.len() <= 7 {
@@ -217,11 +254,22 @@ fn mask_secret(s: &str) -> String {
 }
 
 impl ModelConfig {
+    /// The reasoning-effort levels this provider accepts, in ascending order.
+    /// Empty when the provider exposes no effort knob — the UI then says so
+    /// instead of showing a switch that changes nothing.
+    pub fn efforts(&self) -> &'static [&'static str] {
+        self.provider.efforts()
+    }
+
     /// A variant using the cheaper `aux_model`, falling back to the main model.
     pub fn aux_variant(&self) -> ModelConfig {
+        let model = self.aux_model.clone().unwrap_or_else(|| self.model.clone());
         ModelConfig {
             provider: self.provider,
-            model: self.aux_model.clone().unwrap_or_else(|| self.model.clone()),
+            // The aux agent is not switchable: it runs the configured aux model,
+            // period. A one-entry menu keeps `allows_model` honest for it.
+            models: vec![model.clone()],
+            model,
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
@@ -369,12 +417,20 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         .map(|p| (*p, secrets.key(*p).is_some()))
         .collect();
 
+    let aux_model = env.aux_model.or(file.aux_model);
+    let models = resolve_model_menu(
+        &model,
+        aux_model.as_deref(),
+        env.models.as_deref(),
+        file.models.as_deref(),
+    );
     let model = ModelConfig {
         provider,
+        models,
         model,
         api_key,
         base_url: env.base_url.or(file.base_url),
-        aux_model: env.aux_model.or(file.aux_model),
+        aux_model,
         max_turns: env
             .max_turns
             .or(file.max_turns)
@@ -1022,10 +1078,50 @@ mod tests {
     }
 
     #[test]
+    fn model_menu_defaults_to_the_model_plus_aux() {
+        assert_eq!(
+            resolve_model_menu("deepseek-chat", Some("deepseek-chat-lite"), None, None),
+            vec!["deepseek-chat", "deepseek-chat-lite"]
+        );
+        // No aux model configured: the menu is just the one model.
+        assert_eq!(
+            resolve_model_menu("deepseek-chat", None, None, None),
+            vec!["deepseek-chat"]
+        );
+        // An aux model equal to the main one must not appear twice.
+        assert_eq!(
+            resolve_model_menu("deepseek-chat", Some("deepseek-chat"), None, None),
+            vec!["deepseek-chat"]
+        );
+    }
+
+    #[test]
+    fn model_menu_always_offers_the_running_model_first() {
+        // A declared menu that forgot the configured model would otherwise leave
+        // the model the gateway is actually running unselectable.
+        let file = vec!["b".to_string(), "c".to_string()];
+        assert_eq!(
+            resolve_model_menu("a", None, None, Some(&file)),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn env_model_menu_wins_over_the_file_and_tolerates_sloppy_csv() {
+        let file = vec!["ignored".to_string()];
+        assert_eq!(
+            resolve_model_menu("a", Some("aux"), Some(" b , a ,, c "), Some(&file)),
+            vec!["a", "b", "c"],
+            "env wins; blanks and the duplicate default are dropped, aux is not appended"
+        );
+    }
+
+    #[test]
     fn debug_output_masks_api_key() {
         let cfg = ModelConfig {
             provider: Provider::DeepSeek,
             model: "deepseek-chat".into(),
+            models: vec!["deepseek-chat".into()],
             api_key: "sk-abcdefghijklmnopqr".into(),
             base_url: None,
             aux_model: None,

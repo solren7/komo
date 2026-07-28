@@ -56,6 +56,8 @@ impl ConfigSources {
 pub struct KomoEnv {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Comma-separated model ids the UI may switch a session to (`KOMO_MODELS`).
+    pub models: Option<String>,
     pub base_url: Option<String>,
     pub aux_model: Option<String>,
     pub schedule: Option<String>,
@@ -105,6 +107,7 @@ impl KomoEnv {
         for slot in [
             &mut self.provider,
             &mut self.model,
+            &mut self.models,
             &mut self.base_url,
             &mut self.aux_model,
             &mut self.schedule,
@@ -131,6 +134,7 @@ impl KomoEnv {
         take_current!(
             provider,
             model,
+            models,
             base_url,
             aux_model,
             schedule,
@@ -222,6 +226,11 @@ impl Secrets {
 pub struct FileConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Model ids a client may switch a session to (`models = ["a", "b"]`).
+    /// Unset = just `model` plus `aux_model`. They all run on the one configured
+    /// provider and API key, so this is a menu within that provider, not a
+    /// cross-provider router.
+    pub models: Option<Vec<String>>,
     pub base_url: Option<String>,
     pub aux_model: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).

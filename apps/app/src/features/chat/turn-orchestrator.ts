@@ -85,6 +85,11 @@ export interface TurnRequest {
   message: string;
   mode: Mode;
   workspace?: string;
+  /** Per-session model / reasoning effort (empty = gateway/provider default).
+   *  Sent on every turn: the gateway validates and stores them on the session,
+   *  which is how the choice travels with the conversation. */
+  model?: string;
+  effort?: string;
 }
 
 export interface TurnResult {
@@ -159,6 +164,8 @@ export async function runTurn(
         message: req.message,
         mode: req.mode,
         workspace: req.workspace,
+        model: req.model,
+        effort: req.effort,
       },
       {
         onToolEvent: (event) => {

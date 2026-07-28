@@ -54,6 +54,21 @@ pub trait SessionRepository: Send + Sync {
         Ok(())
     }
 
+    /// Set a session's model override and reasoning effort (either empty = fall
+    /// back to the gateway/provider default). Unlike the workspace this is not
+    /// creation-locked: a conversation may switch models mid-thread, and the
+    /// stored choice is what the next turn — and any other client opening the
+    /// session — runs on. No-op if the session does not exist. Default is a
+    /// no-op so stores without the columns aren't forced to implement it.
+    async fn set_model(
+        &self,
+        _session_id: &str,
+        _model: &str,
+        _effort: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Delete a session and its messages outright (operator delete — the row
     /// disappears from the session list). Returns whether a session was
     /// removed. Default is a no-op returning `false`.

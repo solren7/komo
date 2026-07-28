@@ -14,7 +14,7 @@ import { qk } from "@/shared/api/query-keys";
 import { getClient } from "@/shared/api/runtime";
 import { useConnection } from "@/shared/api/use-connection";
 import { pushStream } from "@/shared/lib/async";
-import { useMode } from "@/shared/store";
+import { useMode, useModelChoice } from "@/shared/store";
 import type { PendingApproval } from "@/shared/types";
 import { Loading } from "@/shared/ui/loading";
 import { KomorebiSpinner } from "@/shared/ui/komorebi-spinner";
@@ -68,9 +68,16 @@ function ChatThread({
   initialMessages: ThreadMessageLike[];
 }) {
   const mode = useMode(workspace);
+  const choice = useModelChoice(session);
   const qc = useQueryClient();
   const [approval, setApproval] = useState<PendingApproval | null>(null);
   const [question, setQuestion] = useState<string | null>(null);
+  // Whether this conversation has begun — the gateway binds a session's
+  // workspace when it creates the row, so once a turn has been dispatched the
+  // choice is no longer the user's to make. A reloaded session with history is
+  // started by definition; a fresh one flips on its first turn (not on the
+  // reply, so the picker locks the moment the choice stops mattering).
+  const [started, setStarted] = useState(initialMessages.length > 0);
 
   // One turn = one `runTurn`. The orchestrator owns the request, the live tool
   // feed, and the interaction polling; this adapter only reshapes what it
@@ -94,9 +101,10 @@ function ChatThread({
           .map((part) => (part.type === "text" ? part.text : ""))
           .join("");
 
+        setStarted(true);
         const feed = pushStream<ToolActivity[]>();
         const turn = runTurn(
-          { session, message: text, mode, workspace },
+          { session, message: text, mode, workspace, ...choice },
           { onTools: feed.push, onApproval: setApproval, onQuestion: setQuestion },
           { client: getClient(), signal: abortSignal },
         ).finally(feed.close);
@@ -130,7 +138,7 @@ function ChatThread({
         };
       },
     }),
-    [session, workspace, mode, qc],
+    [session, workspace, mode, choice, qc],
   );
 
   const runtime = useLocalRuntime(adapter, {
@@ -176,7 +184,7 @@ function ChatThread({
 
           {question && <ClarifyBar question={question} onAnswer={answer} />}
 
-          <Composer workspace={workspace} />
+          <Composer session={session} workspace={workspace} started={started} />
         </ThreadPrimitive.Root>
 
         {approval && <ApprovalModal req={approval} onDecide={decide} />}

@@ -15,16 +15,22 @@ export function App() {
   const theme = useTheme();
   const toggleTheme = useAppStore((s) => s.toggleTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [openThreads, setOpenThreads] = useState<
-    Record<string, { session: string; workspace: string }>
-  >(() => ({ [`${workspace}\u0000${session}`]: { session, workspace } }));
-  const activeThread = `${workspace}\u0000${session}`;
+  // Visited sessions and the workspace each runs in, keyed by session id.
+  //
+  // Keyed by id alone — *not* id+workspace — because an unstarted session's
+  // workspace is editable from the composer: a composite key would fork a second
+  // ChatView on every change and leave the first one mounted. Refreshing the
+  // stored workspace in place is safe precisely because it can only change before
+  // the first turn, when nothing is running.
+  const [openThreads, setOpenThreads] = useState<Record<string, string>>(() => ({
+    [session]: workspace,
+  }));
 
   useEffect(() => {
     setOpenThreads((current) =>
-      current[activeThread] ? current : { ...current, [activeThread]: { session, workspace } },
+      current[session] === workspace ? current : { ...current, [session]: workspace },
     );
-  }, [activeThread, session, workspace]);
+  }, [session, workspace]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
@@ -51,12 +57,9 @@ export function App() {
 
         {/* Keep visited runtimes mounted. assistant-ui aborts a request when its
             runtime unmounts, so navigation must only hide a running thread. */}
-        {Object.entries(openThreads).map(([key, thread]) => (
-          <div
-            key={key}
-            className={key === activeThread ? "flex min-h-0 min-w-0 flex-1" : "hidden"}
-          >
-            <ChatView session={thread.session} workspace={thread.workspace} />
+        {Object.entries(openThreads).map(([id, threadWorkspace]) => (
+          <div key={id} className={id === session ? "flex min-h-0 min-w-0 flex-1" : "hidden"}>
+            <ChatView session={id} workspace={threadWorkspace} />
           </div>
         ))}
       </section>

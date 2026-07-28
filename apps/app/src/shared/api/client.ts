@@ -126,12 +126,18 @@ export class HttpKomoClient implements KomoClient {
   // started, which `fetchWithTimeout` could not do.
   async chat(req: KomoChatRequest, options?: ChatOptions): Promise<KomoChatResponse> {
     if (!this.gateway) return { ok: false, error: "未连接" };
-    const { header, message, mode, workspace = "__default__" } = req;
+    const { header, message, mode, workspace = "__default__", model = "", effort = "" } = req;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.gateway.key}`,
       "Content-Type": "application/json",
       "X-Komo-Session-Id": header,
       "X-Komo-Workspace": workspace,
+      // Always sent (empty = "use the default"), because sending *neither* is
+      // how a client says "leave the stored selection alone" — which is the
+      // right default for third-party OpenAI clients but wrong for us: our own
+      // pickers must be able to switch a session back to the default too.
+      "X-Komo-Model": model,
+      "X-Komo-Effort": effort,
       ...(mode === "trusted" ? { "X-Komo-Trusted": "1" } : { "X-Komo-Interactive": "1" }),
     };
 

@@ -48,6 +48,13 @@ struct SessionRecord {
     /// `deleted`.
     status: String,
 
+    /// Per-session model override (empty = the gateway's configured model) and
+    /// reasoning effort (empty = the provider default). Additive columns; set
+    /// through `SessionRepository::set_model`. Unlike `workspace` these are not
+    /// creation-locked — a conversation may switch models mid-thread.
+    model: String,
+    effort: String,
+
     #[has_many]
     messages: toasty::Deferred<Vec<MessageRecord>>,
 }
@@ -224,6 +231,8 @@ impl Db {
                     "workspace",
                     "\"workspace\" text NOT NULL DEFAULT '__default__'",
                 ),
+                ("model", "\"model\" text NOT NULL DEFAULT ''"),
+                ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             const RUN_COLUMNS: &[(&str, &str)] = &[(
@@ -337,6 +346,8 @@ impl SessionRepository for Db {
             created_at: record.created_at,
             title: record.title,
             status: record.status,
+            model: record.model,
+            effort: record.effort,
         }))
     }
 
@@ -374,6 +385,8 @@ impl SessionRepository for Db {
                 reviewed_through: 0,
                 title: session.title.clone(),
                 status: session.status.clone(),
+                model: session.model.clone(),
+                effort: session.effort.clone(),
             })
             .exec(&mut conn)
             .await;
@@ -451,6 +464,8 @@ impl SessionRepository for Db {
                 reviewed_through: prior_reviewed,
                 title: live.title.clone(),
                 status: live.status.clone(),
+                model: live.model.clone(),
+                effort: live.effort.clone(),
             })
             .exec(&mut tx)
             .await?;
@@ -484,6 +499,29 @@ impl SessionRepository for Db {
             record
                 .update()
                 .title(title.to_string())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_model(&self, session_id: &str, model: &str, effort: &str) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+                return Ok(()); // no such session
+            };
+            // Skip the write when nothing moved: the chat endpoint sends the
+            // client's current selection on *every* turn, so an unchanged
+            // selection would otherwise be a pointless write per turn.
+            if record.model == model && record.effort == effort {
+                return Ok(());
+            }
+            record
+                .update()
+                .model(model.to_string())
+                .effort(effort.to_string())
                 .exec(&mut conn)
                 .await?;
             Ok(())
@@ -1193,6 +1231,8 @@ async fn session_from_record(
     let created_at = record.created_at;
     let title = record.title.clone();
     let status = record.status.clone();
+    let model = record.model.clone();
+    let effort = record.effort.clone();
     let rows = record.messages().exec(conn).await?;
     let mut messages: Vec<Message> = rows
         .into_iter()
@@ -1210,6 +1250,8 @@ async fn session_from_record(
         created_at,
         title,
         status,
+        model,
+        effort,
     })
 }
 

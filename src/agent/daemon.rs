@@ -819,6 +819,10 @@ impl BriefingSweep {
             created_at: now,
             title: String::new(),
             status: String::new(),
+            // A sweep runs on the aux model as configured — never a
+            // conversation's per-session model choice.
+            model: String::new(),
+            effort: String::new(),
         };
         self.llm.complete(&session).await
     }

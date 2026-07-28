@@ -37,6 +37,12 @@ export interface KomoChatRequest {
   mode: Mode;
   /** Opaque id resolved by the gateway's server-owned workspace catalog. */
   workspace?: string;
+  /** Model to run this turn on (empty/absent = the gateway default). Sent every
+   *  turn: the gateway validates it against its advertised menu and stores it on
+   *  the session, which is what makes the choice travel with the conversation. */
+  model?: string;
+  /** Reasoning effort for this turn (empty/absent = the provider default). */
+  effort?: string;
 }
 
 export interface KomoChatResponse {

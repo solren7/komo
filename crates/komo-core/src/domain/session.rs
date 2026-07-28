@@ -20,6 +20,18 @@ pub struct Session {
     /// `deleted`. See [`SESSION_STATUS_ACTIVE`] etc.
     #[serde(default = "default_status")]
     pub status: String,
+    /// Per-session model override (empty = the gateway's configured model).
+    /// Unlike [`workspace`](Self::workspace) this is *not* creation-locked — a
+    /// conversation may switch models mid-thread, and the last choice is what
+    /// the next turn (and any other client opening the session) uses. Only
+    /// honored for the main agent; aux/reviewer/briefing keep their own model.
+    #[serde(default)]
+    pub model: String,
+    /// Per-session reasoning effort (`low` / `medium` / `high`; empty = the
+    /// provider default). Which values a provider actually supports is decided
+    /// by the LLM adapter — see `infra::llm::reasoning_params`.
+    #[serde(default)]
+    pub effort: String,
 }
 
 /// Default session status when none is stored (older rows, fresh sessions).
@@ -49,7 +61,20 @@ impl Session {
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
             status: default_status(),
+            model: String::new(),
+            effort: String::new(),
         }
+    }
+
+    /// The session's model override, or `None` when it runs on the gateway
+    /// default.
+    pub fn model_override(&self) -> Option<&str> {
+        Some(self.model.trim()).filter(|m| !m.is_empty())
+    }
+
+    /// The session's reasoning effort, or `None` for the provider default.
+    pub fn effort_override(&self) -> Option<&str> {
+        Some(self.effort.trim()).filter(|e| !e.is_empty())
     }
 
     pub fn user_turns(&self) -> usize {

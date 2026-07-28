@@ -18,9 +18,16 @@ import {
 } from "lucide-react";
 
 import { fetchStatus } from "@/features/settings/api";
+import {
+  EffortSelect,
+  ModelSelect,
+  selectedContextWindow,
+  useModelMenu,
+} from "@/features/models/ModelPicker";
+import { WorkspacePicker } from "@/features/workspaces/WorkspacePicker";
 import { qk } from "@/shared/api/query-keys";
 import { cn } from "@/shared/lib/utils";
-import { useAppStore, useMode } from "@/shared/store";
+import { useAppStore, useMode, useModelChoice } from "@/shared/store";
 import { buttonVariants } from "@/shared/ui/button";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/ui/popover";
 
@@ -135,14 +142,32 @@ function ContextProgress({ capacity, used }: { capacity?: number | null; used?: 
  *
  *  ArrowUp on an empty draft recalls previously sent messages (terminal-style
  *  history); the hook reads the composer runtime, so this must render inside the
- *  runtime provider. */
-export function Composer({ workspace }: { workspace: string }) {
+ *  runtime provider.
+ *
+ *  The workspace sits directly above the input because that is where the choice
+ *  belongs: it is part of *starting* a conversation, and once the first message
+ *  is sent (`started`) the gateway has bound it for good, so it degrades to a
+ *  static label. Model and effort are the opposite — per session but switchable
+ *  at any time — so they stay live in the control row below. */
+export function Composer({
+  session,
+  workspace,
+  started,
+}: {
+  session: string;
+  workspace: string;
+  /** The conversation already has messages, so its workspace is fixed. */
+  started: boolean;
+}) {
   const history = unstable_useComposerInputHistory();
   const aui = useAui();
   const mode = useMode(workspace);
   const setMode = useAppStore((s) => s.setMode);
+  const setWorkspace = useAppStore((s) => s.setWorkspace);
+  const choice = useModelChoice(session);
+  const setModelChoice = useAppStore((s) => s.setModelChoice);
+  const menu = useModelMenu();
   const status = useQuery({ queryKey: qk.status, queryFn: fetchStatus, staleTime: 30_000 });
-  const model = status.data?.model ?? "当前模型";
 
   const insertMention = () => {
     const composer = aui.composer();
@@ -155,6 +180,13 @@ export function Composer({ workspace }: { workspace: string }) {
 
   return (
     <ComposerPrimitive.Root className="px-4 py-3">
+      <div className="mb-1.5 flex min-w-0 items-center gap-2">
+        <WorkspacePicker workspace={workspace} onWorkspaceChange={setWorkspace} locked={started} />
+        {!started && (
+          <span className="truncate text-xs text-muted-foreground">发出第一条消息后不可更改</span>
+        )}
+      </div>
+
       <div className="relative">
         <ComposerPrimitive.Input
           {...history}
@@ -222,31 +254,23 @@ export function Composer({ workspace }: { workspace: string }) {
         </button>
 
         <span className="flex-1" />
-        <Popover>
-          <PopoverTrigger className={cn(TOOL, "max-w-44 truncate")} title={model}>
-            {model}
-          </PopoverTrigger>
-          <PopoverContent align="end" className="w-64 gap-2">
-            <PopoverTitle>当前模型</PopoverTitle>
-            <p className="break-all text-xs">
-              {status.data?.provider ? `${status.data.provider} / ` : ""}
-              {model}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              模型由 gateway 配置管理，修改后重启生效。
-            </p>
-          </PopoverContent>
-        </Popover>
-        <Popover>
-          <PopoverTrigger className={TOOL}>effort · 自动</PopoverTrigger>
-          <PopoverContent align="end" className="w-64 gap-2">
-            <PopoverTitle>推理强度</PopoverTitle>
-            <p className="text-xs text-muted-foreground">
-              当前 provider 未向界面暴露 effort 切换，使用模型默认值。
-            </p>
-          </PopoverContent>
-        </Popover>
-        <ContextProgress capacity={status.data?.context_window} used={status.data?.token_usage} />
+        <ModelSelect
+          menu={menu.data}
+          model={choice.model}
+          onModelChange={(model) => setModelChoice(session, { ...choice, model })}
+        />
+        <EffortSelect
+          menu={menu.data}
+          effort={choice.effort}
+          onEffortChange={(effort) => setModelChoice(session, { ...choice, effort })}
+        />
+        {/* Capacity follows the session's own model, not the gateway default —
+            otherwise switching to a smaller model would keep showing the big
+            model's window. Usage still comes from /api/status. */}
+        <ContextProgress
+          capacity={selectedContextWindow(menu.data, choice.model) ?? status.data?.context_window}
+          used={status.data?.token_usage}
+        />
       </div>
     </ComposerPrimitive.Root>
   );

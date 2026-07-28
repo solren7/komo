@@ -27,9 +27,15 @@ export function encodeFolder(path: string): string {
 export function WorkspacePicker({
   workspace,
   onWorkspaceChange,
+  locked = false,
 }: {
   workspace: string;
   onWorkspaceChange: (workspace: string) => void;
+  /** The conversation has started, so its workspace is fixed. Renders the choice
+   *  as a static label rather than a disabled control: the gateway binds a
+   *  session's workspace at creation and ignores every later request, so an
+   *  interactive-looking picker here would promise something it can't do. */
+  locked?: boolean;
 }) {
   const { connected } = useConnection();
   const addWorkspace = useAppStore((s) => s.addWorkspace);
@@ -45,20 +51,13 @@ export function WorkspacePicker({
   const items = [...(query.data ?? []), ...Object.values(picked)].filter(
     (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index,
   );
+  const current = items.find((item) => item.id === workspace);
+  const currentLabel =
+    current?.name ?? (workspace === "__default__" ? "默认 workspace" : workspace);
   // Base UI deliberately renders a SelectValue's raw value unless the root is
   // given an item catalogue. Folder ids are base64url-encoded paths, so showing
   // the raw value makes a selected folder look like garbled text.
-  const currentFallback =
-    items.some((item) => item.id === workspace)
-      ? []
-      : [
-          {
-            value: workspace,
-            label:
-              picked[workspace]?.name ??
-              (workspace === "__default__" ? "默认 workspace" : workspace),
-          },
-        ];
+  const currentFallback = current ? [] : [{ value: workspace, label: currentLabel }];
   const selectItems = [
     ...currentFallback,
     ...items.map((item) => ({ value: item.id, label: item.name })),
@@ -73,6 +72,18 @@ export function WorkspacePicker({
     onWorkspaceChange(selected.id);
   };
 
+  if (locked) {
+    return (
+      <span
+        className="inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
+        title={current?.path ? `${currentLabel} · ${current.path}` : currentLabel}
+      >
+        <FolderIcon className="size-3.5 shrink-0" />
+        <span className="truncate">{currentLabel}</span>
+      </span>
+    );
+  }
+
   return (
     <Select
       items={selectItems}
@@ -82,11 +93,7 @@ export function WorkspacePicker({
         else if (value) onWorkspaceChange(value);
       }}
     >
-      <SelectTrigger
-        size="sm"
-        className="min-w-0 max-w-[min(12rem,100%)]"
-        title="选择 workspace"
-      >
+      <SelectTrigger size="sm" className="min-w-0 max-w-[min(12rem,100%)]" title="选择 workspace">
         <FolderIcon className="size-4" />
         <SelectValue
           className="min-w-0"

@@ -81,6 +81,27 @@ export interface SessionSummary {
   title?: string;
   /** "active" | "archive" (deleted sessions are omitted from the list). */
   status?: string;
+  /** Model this session last ran on; empty/absent = the gateway default. Unlike
+   *  `workspace` this is switchable mid-conversation. */
+  model?: string;
+  /** Reasoning effort; empty/absent = the provider default. */
+  effort?: string;
+}
+
+/** One selectable model. `context_window` is null for ids the gateway has no
+ *  known capacity for — it must read as "unknown", never as zero. */
+export interface ModelOption {
+  id: string;
+  context_window: number | null;
+}
+
+/** What a session may be switched to (`GET /api/models`). An empty `efforts`
+ *  means this provider exposes no effort knob at all. */
+export interface ModelMenu {
+  provider: string;
+  default_model: string;
+  models: ModelOption[];
+  efforts: string[];
 }
 
 export interface PendingApproval {

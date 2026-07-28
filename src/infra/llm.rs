@@ -16,6 +16,7 @@ use rig::{
     providers::{anthropic, deepseek, openai, openrouter},
     tool::ToolDyn,
 };
+use serde_json::{Value, json};
 
 use crate::{
     config::{ModelConfig, Provider},
@@ -58,6 +59,16 @@ impl LlmClient for UnconfiguredLlm {
 /// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
 pub struct RigLlm<M: CompletionModel> {
     agent: Agent<M>,
+    /// The provider client the `agent` was built from, kept so a turn whose
+    /// session names a different model can mint a model handle for it
+    /// (`M::make`). Only the handle is swapped — tools, preamble and every other
+    /// agent field stay the ones assembled at startup.
+    client: Arc<M::Client>,
+    /// The configured model: what a session with no override runs on.
+    default_model: String,
+    /// Which provider this is, for mapping a session's reasoning-effort level
+    /// onto request params (see [`reasoning_params`]).
+    provider: Provider,
     /// Maximum tool-calling round-trips per user turn before the agent must
     /// answer (config `max_turns`, env `KOMO_MAX_TURNS`).
     max_turns: usize,
@@ -107,9 +118,63 @@ where
     }
 }
 
+/// Extra answer budget granted on top of an Anthropic thinking budget, so the
+/// model has room to write a reply after it finishes reasoning.
+const THINKING_ANSWER_HEADROOM: u64 = 8_192;
+
+/// Map a reasoning-effort level onto the provider's request params, or `None`
+/// when this provider/level pair has no effect.
+///
+/// Which levels a provider offers is [`Provider::efforts`]; this is the other
+/// half — how a level is actually spelled on the wire. Both paths merge the
+/// result into the agent's `additional_params`, which every provider flattens
+/// into the request body.
+fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
+    let level = match effort.trim() {
+        level @ ("low" | "medium" | "high") => level,
+        _ => return None,
+    };
+    match provider {
+        // The OpenAI Responses API (which Codex speaks too) and OpenRouter both
+        // take `reasoning.effort` verbatim.
+        Provider::OpenAi | Provider::OpenRouter | Provider::Codex => {
+            Some(json!({ "reasoning": { "effort": level } }))
+        }
+        // Anthropic has no effort scale — it budgets thinking in tokens, so the
+        // levels map onto budgets. The caller must also raise `max_tokens` above
+        // the budget (thinking is charged against it): see `agent_for`.
+        Provider::Anthropic => {
+            let budget = match level {
+                "low" => 4_096,
+                "medium" => 10_240,
+                _ => 24_576,
+            };
+            Some(json!({ "thinking": { "type": "enabled", "budget_tokens": budget } }))
+        }
+        // Only a thinking on/off flag; see `Provider::efforts`.
+        Provider::DeepSeek => None,
+    }
+}
+
+/// Shallow-merge `extra`'s top-level keys into `base` (extra wins). Anything
+/// non-object on either side is replaced outright, which is all the agent's
+/// `additional_params` ever holds.
+fn merge_params(base: Option<Value>, extra: Value) -> Value {
+    match (base, extra) {
+        (Some(Value::Object(mut base)), Value::Object(extra)) => {
+            base.extend(extra);
+            Value::Object(base)
+        }
+        (_, extra) => extra,
+    }
+}
+
 impl<M> RigLlm<M>
 where
     M: CompletionModel + 'static,
+    // The retained provider client crosses the gateway's per-turn tasks, so it
+    // has to be shareable — every rig provider client is.
+    M::Client: Send + Sync + 'static,
 {
     /// Assemble this turn's `(preamble, prompt, history)`: split the session
     /// into the latest user prompt + prior history, rebuild the system prompt,
@@ -170,10 +235,44 @@ where
         Ok((preamble, prompt, history))
     }
 
-    /// Clone the agent with this turn's assembled preamble installed.
-    fn agent_with_preamble(&self, preamble: String) -> Agent<M> {
+    /// Clone the agent for this turn: install the assembled preamble, then the
+    /// session's own model / reasoning-effort choices.
+    ///
+    /// `Agent` is cheap to clone (`Arc<model>` + an `Arc`-backed tool handle) and
+    /// its fields are public, so per-session settings are applied to a private
+    /// copy — concurrent sessions in the gateway never see each other's.
+    ///
+    /// Only the *main* agent is ever handed a stored session: every aux path
+    /// (reviewer, delegate, recall screening, sweeps) builds a synthetic
+    /// `Session`, whose overrides are empty. That is what keeps a conversation's
+    /// model choice from leaking onto the aux model.
+    fn agent_for(&self, preamble: String, session: &Session) -> Agent<M> {
         let mut agent = self.agent.clone();
         agent.preamble = Some(preamble);
+
+        if let Some(name) = session
+            .model_override()
+            .filter(|name| *name != self.default_model)
+        {
+            agent.model = Arc::new(M::make(&self.client, name));
+        }
+
+        if let Some(params) = session
+            .effort_override()
+            .and_then(|effort| reasoning_params(self.provider, effort))
+        {
+            // Anthropic charges thinking against `max_tokens`, so a budget above
+            // the cap is rejected outright — raise the cap to clear it.
+            if let Some(budget) = params
+                .get("thinking")
+                .and_then(|thinking| thinking.get("budget_tokens"))
+                .and_then(Value::as_u64)
+            {
+                let needed = budget + THINKING_ANSWER_HEADROOM;
+                agent.max_tokens = Some(agent.max_tokens.unwrap_or(0).max(needed));
+            }
+            agent.additional_params = Some(merge_params(agent.additional_params.take(), params));
+        }
         agent
     }
 }
@@ -182,12 +281,13 @@ where
 impl<M> LlmClient for RigLlm<M>
 where
     M: CompletionModel + 'static,
+    M::Client: Send + Sync + 'static,
 {
     async fn complete(&self, session: &Session) -> anyhow::Result<String> {
         // Tool-less callers (aux/delegate/reviewer/briefing): rig's own loop does
         // a single completion and returns, since no tools are exposed.
         let (preamble, prompt, history) = self.assemble(session).await?;
-        let agent = self.agent_with_preamble(preamble);
+        let agent = self.agent_for(preamble, session);
         if self.stream {
             // Codex: one streamed completion, aggregated to its text. (No tools
             // are exposed here, so a single round is the whole answer.)
@@ -213,7 +313,7 @@ where
     async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
         let (preamble, prompt, history) = self.assemble(session).await?;
         Ok(Box::new(RigTurnDriver {
-            agent: self.agent_with_preamble(preamble),
+            agent: self.agent_for(preamble, session),
             history,
             pending: Some(RigMessage::user(prompt)),
             stream: self.stream,
@@ -434,13 +534,19 @@ pub fn build_llm(
     // fine. `client` is the only thing that varies.
     macro_rules! rig_llm {
         ($client:expr) => {{
-            let agent = $client
+            // Kept past `build()` so a per-session model override can mint a
+            // model handle for the turn (`RigLlm::agent_for`).
+            let client = Arc::new($client);
+            let agent = client
                 .agent(model.clone())
                 .preamble(&initial)
                 .tools(adapters)
                 .build();
             Arc::new(RigLlm {
                 agent,
+                client,
+                default_model: model,
+                provider: config.provider,
                 max_turns,
                 preamble,
                 max_history_messages,
@@ -524,6 +630,74 @@ where
     match base_url {
         Some(url) => builder.base_url(url),
         None => builder,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_style_providers_send_reasoning_effort() {
+        for provider in [Provider::OpenAi, Provider::OpenRouter, Provider::Codex] {
+            assert_eq!(
+                reasoning_params(provider, "high"),
+                Some(json!({ "reasoning": { "effort": "high" } })),
+                "{provider:?} should carry reasoning.effort"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_maps_effort_onto_a_thinking_budget() {
+        let low = reasoning_params(Provider::Anthropic, "low").unwrap();
+        let high = reasoning_params(Provider::Anthropic, "high").unwrap();
+        let budget = |v: &Value| v["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert_eq!(low["thinking"]["type"], "enabled");
+        assert!(
+            budget(&low) < budget(&high),
+            "a higher effort must buy more thinking"
+        );
+    }
+
+    #[test]
+    fn deepseek_and_unknown_levels_change_nothing() {
+        // DeepSeek exposes no effort scale (`Provider::efforts` is empty), so a
+        // level arriving anyway must not invent request params.
+        assert_eq!(reasoning_params(Provider::DeepSeek, "high"), None);
+        for level in ["", "  ", "auto", "xhigh", "HIGH"] {
+            assert_eq!(reasoning_params(Provider::OpenAi, level), None, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn every_advertised_effort_level_actually_maps() {
+        // The menu a client is shown (`Provider::efforts`) and what reaches the
+        // wire must agree — otherwise the UI offers a switch that does nothing.
+        for provider in Provider::ALL {
+            for level in provider.efforts() {
+                assert!(
+                    reasoning_params(provider, level).is_some(),
+                    "{provider:?} advertises `{level}` but sends nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merging_params_keeps_unrelated_keys_and_overrides_collisions() {
+        let merged = merge_params(
+            Some(json!({ "store": false, "reasoning": { "effort": "low" } })),
+            json!({ "reasoning": { "effort": "high" } }),
+        );
+        assert_eq!(merged["store"], false);
+        assert_eq!(merged["reasoning"]["effort"], "high");
+        // No prior params, or a non-object one, is simply replaced.
+        assert_eq!(merge_params(None, json!({ "a": 1 })), json!({ "a": 1 }));
+        assert_eq!(
+            merge_params(Some(Value::Null), json!({ "a": 1 })),
+            json!({ "a": 1 })
+        );
     }
 }
 

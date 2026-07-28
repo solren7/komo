@@ -104,6 +104,12 @@ struct AppState {
     /// Resolved main model identity (safe, non-secret status metadata).
     provider: Arc<String>,
     model: Arc<String>,
+    /// The models a client may switch a session to, and the reasoning-effort
+    /// levels this provider accepts (empty = no effort knob). Advertised over
+    /// `GET /api/models`; the chat path validates a request against them so an
+    /// unknown id falls back to `model` instead of reaching the provider.
+    models: Arc<Vec<String>>,
+    efforts: Arc<Vec<String>>,
     /// Shared with the gateway dispatcher and the `ChatApprover`: lets a
     /// loopback interactive HTTP turn (the GUI) surface a pending approval over
     /// `GET /api/interactions/{session}` and resolve it over `POST`.
@@ -125,6 +131,33 @@ struct AppState {
     default_workspace: Arc<PathBuf>,
 }
 
+/// The model identity plus the switchable menu the api advertises.
+///
+/// Derived once from the resolved [`ModelConfig`] so `/api/status`,
+/// `/api/models`, and the chat path's validation can never disagree about what
+/// is on offer. Everything here is non-secret status metadata.
+pub struct ModelMenu {
+    provider: String,
+    default_model: String,
+    /// Selectable models, the configured default first (always non-empty).
+    models: Vec<String>,
+    /// Reasoning-effort levels this provider accepts; empty = no effort knob,
+    /// which is what lets a client say "unsupported" rather than render a
+    /// switch that changes nothing.
+    efforts: Vec<String>,
+}
+
+impl ModelMenu {
+    pub fn from_config(config: &crate::config::ModelConfig) -> Self {
+        Self {
+            provider: config.provider.name().to_string(),
+            default_model: config.model.clone(),
+            models: config.models.clone(),
+            efforts: config.efforts().iter().map(|e| e.to_string()).collect(),
+        }
+    }
+}
+
 /// The HTTP API channel. Holds the listen config and the shared handler state.
 pub struct ApiChannel {
     bind: String,
@@ -142,8 +175,7 @@ impl ApiChannel {
         actions: Arc<OperatorActions>,
         channels: Vec<String>,
         home: Option<String>,
-        provider: String,
-        model: String,
+        models: ModelMenu,
         approvals: Arc<ApprovalState>,
         clarify: Arc<ClarifyState>,
         workspace_home: PathBuf,
@@ -159,8 +191,10 @@ impl ApiChannel {
                 actions,
                 channels: Arc::new(channels),
                 home,
-                provider: Arc::new(provider),
-                model: Arc::new(model),
+                provider: Arc::new(models.provider),
+                model: Arc::new(models.default_model),
+                models: Arc::new(models.models),
+                efforts: Arc::new(models.efforts),
                 approvals,
                 clarify,
                 cancels: Arc::new(CancelState::new()),
@@ -271,6 +305,8 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("x-komo-trusted"),
             HeaderName::from_static("x-komo-interactive"),
             HeaderName::from_static("x-komo-workspace"),
+            HeaderName::from_static("x-komo-model"),
+            HeaderName::from_static("x-komo-effort"),
         ])
         .max_age(std::time::Duration::from_secs(600))
 }
@@ -322,6 +358,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/status", get(status))
+        .route("/api/models", get(list_model_menu))
         .route("/api/workspaces", get(list_workspaces))
         .route("/api/home", get(get_home))
         .route("/api/sessions", get(list_sessions))
@@ -508,6 +545,20 @@ async fn chat_completions(
     // silently run tools in a different directory.
     let workspace = bind_session_workspace(&state, &session_id, &requested_workspace).await?;
 
+    // The model / effort choice, unlike the workspace, is *not* creation-locked:
+    // a conversation may switch models mid-thread. The client sends its current
+    // selection on every turn and we persist it, so the choice travels with the
+    // session — the turn itself reads it back off the session row (see
+    // `infra::llm::RigLlm::agent_for`), which is also what makes it visible to
+    // another client opening the same conversation.
+    if let Some(selection) = requested_model(&state.models, &state.efforts, &headers) {
+        state
+            .actions
+            .sessions
+            .set_model(&session_id, &selection.model, &selection.effort)
+            .await?;
+    }
+
     // Loopback callers may opt into one of two richer contexts (both ignored on
     // an external bind, where there is no host operator behind the socket):
     //   - `X-Komo-Trusted`: auto-approve side-effecting tools (the CLI user is
@@ -649,6 +700,49 @@ fn resolve_workspace_id(state: &AppState, id: &str) -> Option<PathBuf> {
     resolve_folder_workspace(id)
 }
 
+/// A validated per-session model selection. Either field may be empty, meaning
+/// "back to the gateway/provider default".
+struct ModelSelection {
+    model: String,
+    effort: String,
+}
+
+/// Read `X-Komo-Model` / `X-Komo-Effort` off a chat request, validated against
+/// what this gateway actually advertises (`models` / `efforts`).
+///
+/// `None` = neither header present, so the session keeps whatever it already
+/// stored (an OpenAI-compatible client that knows nothing about these headers
+/// must not silently reset a conversation's model). Present-but-unknown values
+/// resolve to empty — i.e. the default — rather than being forwarded verbatim,
+/// so a stale UI or a typo can't push a bogus model id at the provider.
+fn requested_model(
+    models: &[String],
+    efforts: &[String],
+    headers: &axum::http::HeaderMap,
+) -> Option<ModelSelection> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let model = header("x-komo-model");
+    let effort = header("x-komo-effort");
+    if model.is_none() && effort.is_none() {
+        return None;
+    }
+    let advertised = |menu: &[String], value: Option<&str>| {
+        value
+            .filter(|want| menu.iter().any(|known| known == want))
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(ModelSelection {
+        model: advertised(models, model),
+        effort: advertised(efforts, effort),
+    })
+}
+
 fn requested_workspace(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -703,6 +797,24 @@ fn resolve_folder_workspace(id: &str) -> Option<PathBuf> {
     let path = PathBuf::from(String::from_utf8(bytes).ok()?);
     let canonical = path.canonicalize().ok()?;
     canonical.is_dir().then_some(canonical)
+}
+
+/// What a session may be switched to: the model menu (default first, each with
+/// its best-known context window) and the provider's reasoning-effort levels.
+/// An empty `efforts` means this provider has no effort knob — the client should
+/// say so rather than offer a switch.
+async fn list_model_menu(State(state): State<AppState>) -> Json<Value> {
+    let models = state
+        .models
+        .iter()
+        .map(|id| json!({ "id": id, "context_window": model_context_window(id) }))
+        .collect::<Vec<_>>();
+    Json(json!({
+        "provider": state.provider.as_ref(),
+        "default_model": state.model.as_ref(),
+        "models": models,
+        "efforts": state.efforts.as_ref(),
+    }))
 }
 
 async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
@@ -1577,6 +1689,78 @@ mod tests {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(file.to_string_lossy().as_bytes());
         assert_eq!(resolve_folder_workspace(&format!("folder:{encoded}")), None);
+    }
+
+    fn menu() -> (Vec<String>, Vec<String>) {
+        (
+            vec!["gpt-5.5".into(), "gpt-5.4-mini".into()],
+            vec!["low".into(), "medium".into(), "high".into()],
+        )
+    }
+
+    fn model_headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn no_model_headers_leaves_the_stored_selection_alone() {
+        // An OpenAI-compatible client that knows nothing about these headers must
+        // not silently reset a conversation's model.
+        let (models, efforts) = menu();
+        assert!(requested_model(&models, &efforts, &model_headers(&[])).is_none());
+    }
+
+    #[test]
+    fn advertised_model_and_effort_are_accepted() {
+        let (models, efforts) = menu();
+        let selection = requested_model(
+            &models,
+            &efforts,
+            &model_headers(&[("x-komo-model", "gpt-5.4-mini"), ("x-komo-effort", "high")]),
+        )
+        .expect("headers present");
+        assert_eq!(selection.model, "gpt-5.4-mini");
+        assert_eq!(selection.effort, "high");
+    }
+
+    #[test]
+    fn unadvertised_values_resolve_to_the_default_not_the_provider() {
+        let (models, efforts) = menu();
+        let selection = requested_model(
+            &models,
+            &efforts,
+            &model_headers(&[
+                ("x-komo-model", "definitely-not-a-model"),
+                ("x-komo-effort", "extreme"),
+            ]),
+        )
+        .expect("headers present");
+        assert_eq!(
+            selection.model, "",
+            "an unknown id must not reach the provider"
+        );
+        assert_eq!(selection.effort, "");
+    }
+
+    #[test]
+    fn one_header_alone_clears_the_other() {
+        // Sending only a model is a full selection: effort resets to the default.
+        let (models, efforts) = menu();
+        let selection = requested_model(
+            &models,
+            &efforts,
+            &model_headers(&[("x-komo-model", "gpt-5.5")]),
+        )
+        .expect("headers present");
+        assert_eq!(selection.model, "gpt-5.5");
+        assert_eq!(selection.effort, "");
     }
 
     #[test]

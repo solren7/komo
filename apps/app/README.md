@@ -12,6 +12,21 @@ cd apps/desktop && bun run dev     # or: cd apps/web && bun run dev
 
 From `apps/`: `bun run check` = `typecheck` + `lint` + `fmt:check` + `test`.
 
+Install **only** from `apps/` — this is one bun workspace, and every package's
+`node_modules` must be symlinks into the shared store. A per-package install
+(`npm`/`bun` run inside `desktop/` or `web/`) leaves real directories there, which
+gives you a _second physical copy_ of `@types/react` and possibly an off-lockfile
+`vite`. TypeScript then reports the same version as two unrelated types:
+
+```
+Type 'X' is not assignable to type 'X'. Two different types with this name exist,
+but they are unrelated.
+```
+
+The fix is `rm -rf <package>/node_modules && bun install` from `apps/` — not a
+tsconfig `paths` workaround. `ls -la desktop/node_modules/@types` tells you which
+you have: symlinks are correct, real directories are the stale install.
+
 ## Layout
 
 Feature-first: everything one screen needs — its components, its queries, its
@@ -87,9 +102,13 @@ Three layers, deliberately separate:
 - **Server state → react-query.** Every read is a query, including gateway
   liveness (`shared/api/use-connection.ts`) — no hand-rolled `setInterval`.
   Intervals live in `shared/config.ts`.
-- **Client state → zustand** (`shared/store.ts`): the active session, the trust
-  mode, the theme. `mode` and `theme` persist; **`session` does not** — every
-  launch starts a fresh session, matching `komo chat` and the TUI.
+- **Client state → zustand** (`shared/store.ts`): the active session and the
+  workspace it runs in, per-session model/effort, per-workspace trust mode, the
+  theme. All of it persists — unlike `komo chat` and the TUI, reopening a window
+  returns you to the conversation you were in. Two keying rules matter:
+  `workspaceModes` is keyed by **workspace** (trust is a property of the
+  directory), `sessionModels` by **session** (the model follows the
+  conversation).
 - **A turn → `features/chat/turn-orchestrator.ts`**, plain TypeScript with the
   client injected. It owns the request, the live tool feed, and the interaction
   polling that raises the approval modal / clarify bar. React only renders what

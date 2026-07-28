@@ -51,6 +51,10 @@ impl Reviewer for ReflectiveReviewer {
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
             status: String::new(),
+            // The reviewer always runs on the aux model: deliberately *not*
+            // inherited from the reviewed session's own model choice.
+            model: String::new(),
+            effort: String::new(),
         };
 
         let reply = self.llm.complete(&review_session).await?;
@@ -440,6 +444,8 @@ mod tests {
             created_at: 0,
             title: String::new(),
             status: String::new(),
+            model: String::new(),
+            effort: String::new(),
         }
     }
 

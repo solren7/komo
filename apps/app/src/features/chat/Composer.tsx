@@ -145,10 +145,10 @@ function ContextProgress({ capacity, used }: { capacity?: number | null; used?: 
  *  history); the hook reads the composer runtime, so this must render inside the
  *  runtime provider.
  *
- *  The workspace sits directly above the input because that is where the choice
- *  belongs: it is part of *starting* a conversation, and once the first message
- *  is sent (`started`) the gateway has bound it for good, so it degrades to a
- *  static label. Model and effort are the opposite — per session but switchable
+ *  The workspace and attachment controls sit directly above the input: both
+ *  establish the context for a new conversation. Once the first message is sent
+ *  (`started`), the gateway has bound the workspace for good, so it degrades to
+ *  a static label. Model and effort are the opposite — per session but switchable
  *  at any time — so they stay live in the control row below. */
 export function Composer({
   session,
@@ -183,9 +183,9 @@ export function Composer({
     <ComposerPrimitive.Root className="px-4 py-3">
       <div className="mb-1.5 flex min-w-0 items-center gap-2">
         <WorkspacePicker workspace={workspace} onWorkspaceChange={setWorkspace} locked={started} />
-        {!started && (
-          <span className="truncate text-xs text-muted-foreground">发出第一条消息后不可更改</span>
-        )}
+        <ComposerPrimitive.AddAttachment className={TOOL} title="添加文本附件">
+          <PlusIcon className="size-4" />
+        </ComposerPrimitive.AddAttachment>
       </div>
 
       <div className="relative">
@@ -247,9 +247,6 @@ export function Composer({
           </PopoverContent>
         </Popover>
 
-        <ComposerPrimitive.AddAttachment className={TOOL} title="添加文本附件">
-          <PlusIcon className="size-4" />
-        </ComposerPrimitive.AddAttachment>
         <button type="button" className={TOOL} title="插入 @" onClick={insertMention}>
           <AtSignIcon className="size-4" />
         </button>

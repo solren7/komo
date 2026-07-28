@@ -93,7 +93,12 @@ export function WorkspacePicker({
         else if (value) onWorkspaceChange(value);
       }}
     >
-      <SelectTrigger size="sm" className="min-w-0 max-w-[min(12rem,100%)]" title="选择 workspace">
+      <SelectTrigger
+        size="sm"
+        showIndicator={false}
+        className="min-w-0 max-w-[min(12rem,100%)] pr-2.5"
+        title="选择 workspace"
+      >
         <FolderIcon className="size-4" />
         <SelectValue
           className="min-w-0"

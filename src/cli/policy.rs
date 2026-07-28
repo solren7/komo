@@ -11,7 +11,14 @@ use std::path::PathBuf;
 
 use crate::config::{ConfigSnapshot, PolicyReport};
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
-use crate::domain::policy::{Access, Category, Effect, Matcher, Rule, Verdict};
+use crate::domain::policy::{Category, Policy, Rule, Verdict};
+use crate::infra::permissions_store::PermissionsStore;
+
+/// Rendering lives on the rule itself, so `policy list`, `saved list`, and the
+/// approval prompt can't describe the same rule three different ways.
+fn describe_rule(r: &Rule) -> String {
+    r.describe()
+}
 
 /// Render the resolved policy: defaults, rules in evaluation order, and any
 /// config entries that failed to parse.
@@ -22,7 +29,8 @@ pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
         configured,
     } = &config.runtime.policy;
 
-    if !configured {
+    let saved = PermissionsStore::load(&config.runtime.home);
+    if !configured && saved.is_empty() {
         println!(
             "No [policy] table in {} — every Normal/Dangerous action asks interactively.",
             config.runtime.home.join("config.toml").display()
@@ -38,9 +46,14 @@ pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
     } else {
         println!("\nrules (deny rules always win over allow):");
         for (i, r) in policy.rules().iter().enumerate() {
-            println!("  #{i} {}", rule_str(r));
+            println!("  #{i} {}", describe_rule(r));
         }
     }
+
+    // Saved grants are listed apart from config rules, and after them, because
+    // that is the order they are evaluated in — a config deny still wins.
+    println!();
+    print_saved(&saved);
 
     if !invalid.is_empty() {
         println!(
@@ -115,8 +128,24 @@ pub fn check(
     request.risk = risk;
     let request = request.with_action(action);
 
-    let policy = &config.runtime.policy.policy;
+    // Evaluate exactly what a turn would: config rules plus the operator's saved
+    // grants. (Saved grants are skipped for a dangerous action and for a
+    // channel-less/unattended check — the engine, not this command, decides that.)
+    let store = PermissionsStore::load(&config.runtime.home);
+    let policy: Policy = config
+        .runtime
+        .policy
+        .policy
+        .clone()
+        .with_saved(store.rules());
     let decision = policy.decide(&request, channel);
+    let matched = |i: usize| {
+        if decision.saved {
+            format!("saved #{i} {}", describe_rule(&policy.saved_rules()[i]))
+        } else {
+            format!("#{i} {}", describe_rule(&policy.rules()[i]))
+        }
+    };
 
     let risk_str = match risk {
         Risk::Safe => "safe (read-only)",
@@ -133,11 +162,16 @@ pub fn check(
     match (decision.verdict, decision.rule) {
         (Verdict::Deny, Some(i)) => {
             println!("verdict: DENY — hard-blocked, no prompt");
-            println!("matched: #{i} {}", rule_str(&policy.rules()[i]));
+            println!("matched: {}", matched(i));
         }
         (Verdict::Allow, Some(i)) => {
             println!("verdict: ALLOW — auto-allowed inside a session turn (no prompt)");
-            println!("matched: #{i} {}", rule_str(&policy.rules()[i]));
+            println!("matched: {}", matched(i));
+            if decision.saved {
+                println!(
+                    "note:    a saved grant (`komo policy saved list`); forget it to be asked again"
+                );
+            }
             println!(
                 "note:    with no session in scope (sweep/aux), this still falls to ask → deny"
             );
@@ -178,51 +212,59 @@ fn verdict_str(v: Verdict) -> &'static str {
     }
 }
 
-/// One-line rendering of a rule, mirroring its config shape.
-fn rule_str(r: &Rule) -> String {
-    let mut parts = vec![
-        match r.effect {
-            Effect::Allow => "allow".to_string(),
-            Effect::Deny => "deny ".to_string(),
+/// `komo policy saved list` — the grants accumulated by answering `a` at an
+/// approval prompt, numbered as `forget` takes them.
+pub fn saved_list(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    let store = PermissionsStore::load(&config.runtime.home);
+    println!("{}", store.path().display());
+    print_saved(&store);
+    Ok(())
+}
+
+/// `komo policy saved forget <n>` / `--all` — stop honoring a grant, so the next
+/// matching action asks again.
+pub fn saved_forget(
+    config: &ConfigSnapshot,
+    index: Option<usize>,
+    all: bool,
+) -> anyhow::Result<()> {
+    let store = PermissionsStore::load(&config.runtime.home);
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    match (index, all) {
+        (_, true) => {
+            let removed = store.forget_all(&now);
+            println!("Forgot {removed} saved grant(s); those actions will ask again.");
+        }
+        (Some(i), false) => match store.forget(i, &now) {
+            Some(rule) => println!("Forgot #{i} {} — it will ask again.", rule.describe()),
+            None => anyhow::bail!(
+                "no saved grant #{i} (there {} {})",
+                if store.len() == 1 { "is" } else { "are" },
+                match store.len() {
+                    0 => "none".to_string(),
+                    n => format!("{n}"),
+                }
+            ),
         },
-        format!("{:<14}", category_str(r.category)),
-        format!("{} \"{}\"", matcher_str(r.matcher), r.value),
-    ];
-    if let Some(a) = r.access {
-        parts.push(format!(
-            "access={}",
-            match a {
-                Access::Read => "read",
-                Access::Write => "write",
-            }
-        ));
+        (None, false) => anyhow::bail!("pass an index (see `komo policy saved list`) or --all"),
     }
-    if let Some(c) = &r.channels {
-        parts.push(format!("channels={}", c.join(",")));
-    }
-    if r.include_dangerous {
-        parts.push("include_dangerous".to_string());
-    }
-    if r.unattended {
-        parts.push("unattended".to_string());
-    }
-    parts.join("  ")
+    Ok(())
 }
 
-fn category_str(c: Category) -> &'static str {
-    match c {
-        Category::Shell => "shell",
-        Category::File => "file",
-        Category::Network => "network",
-        Category::HomeAssistant => "homeassistant",
+fn print_saved(store: &PermissionsStore) {
+    let rules = store.list();
+    if rules.is_empty() {
+        println!("saved grants: none (answer `a` at an approval prompt to add one)");
+        return;
     }
-}
-
-fn matcher_str(m: Matcher) -> &'static str {
-    match m {
-        Matcher::Prefix => "prefix",
-        Matcher::Suffix => "suffix",
-        Matcher::Exact => "exact",
-        Matcher::Contains => "contains",
+    println!(
+        "saved grants ({}, from approval prompts — evaluated after config rules, \
+         never for dangerous or unattended actions):",
+        rules.len()
+    );
+    for (i, r) in rules.iter().enumerate() {
+        println!("  #{i} {}", describe_rule(r));
     }
 }

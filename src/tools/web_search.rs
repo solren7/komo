@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::domain::{
+    cancel::Cancelled,
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
@@ -60,20 +61,28 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: SearchArgs = parse_args(&input)?;
 
-        let body = self
-            .client
-            .get("https://html.duckduckgo.com/html/")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .query(&[("q", args.query.as_str())])
-            .send()
-            .await
-            .map_err(|e| crate::tools::http::transport_error(e, "search request failed"))?
-            .text()
-            .await
-            .map_err(|e| crate::tools::http::transport_error(e, "failed to read search results"))?;
+        let fetch = async {
+            let resp = self
+                .client
+                .get("https://html.duckduckgo.com/html/")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .query(&[("q", args.query.as_str())])
+                .send()
+                .await
+                .map_err(|e| crate::tools::http::transport_error(e, "search request failed"))?;
+            resp.text().await.map_err(|e| {
+                crate::tools::http::transport_error(e, "failed to read search results")
+            })
+        };
+        // A search is a read with nothing to leave half-done, so a cancelled turn
+        // drops the request instead of holding the connection open to its timeout.
+        let body = tokio::select! {
+            r = fetch => r?,
+            _ = ctx.cancelled() => return Err(ToolError::Failed(Cancelled.into())),
+        };
 
         let results = parse_results(&body);
         if results.is_empty() {

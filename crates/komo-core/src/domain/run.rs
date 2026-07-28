@@ -141,6 +141,21 @@ pub struct RunStep {
     /// means "unknown" for pre-column rows, so the two cases coincide.
     #[serde(default)]
     pub elapsed_ms: i64,
+    /// The tool's machine-readable third view (`ToolOutput::structured`) — the
+    /// `shell` exit code, an `edit`'s diff stats. The model never paid tokens for
+    /// it; it exists for the operator (`run inspect`) and the UI.
+    ///
+    /// `Null` means "this tool has no structured view" **or** "recorded before
+    /// the column existed" — an absence either way, never an empty object. Over
+    /// [`STEP_FIELD_CAP`] it is replaced by a marker rather than cut, because
+    /// half a JSON document is worse than none.
+    #[serde(default)]
+    pub structured: serde_json::Value,
+    /// Files holding this call's full output, when the result was too large to
+    /// hand the model whole (`services::tool_output_store`). Empty is the common
+    /// case; this is the operator's way back to what the preview elided.
+    #[serde(default)]
+    pub output_paths: Vec<String>,
 }
 
 /// Per-field cap on a step's args/result inside the resume digest, and the
@@ -292,6 +307,9 @@ mod tests {
             ok,
             started_at: 100 + seq,
             ended_at: 101 + seq,
+            elapsed_ms: 10 + seq,
+            structured: serde_json::Value::Null,
+            output_paths: Vec::new(),
         }
     }
 

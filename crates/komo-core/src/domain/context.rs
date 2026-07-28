@@ -222,4 +222,22 @@ impl ToolContext {
     pub async fn decide(&self, request: &ApprovalRequest) -> Decision {
         self.approver.decide(request).await
     }
+
+    /// Resolves once this turn has been cancelled — and **never** otherwise, so
+    /// it is safe as a `select!` arm against real work. With no cancel signal
+    /// (sweeps, cron, aux sub-agents) it pends forever, which makes that arm
+    /// inert rather than instantly winning.
+    ///
+    /// Only a tool that can abandon its work **without leaving a mess** should
+    /// race this: `shell` (kills its process group), `web_fetch` / `web_search`
+    /// (drop the request, no side effect). A tool that mutates the filesystem
+    /// deliberately does *not* — `apply_patch` writes several files in sequence,
+    /// and stopping between two of them turns a patch that would have completed
+    /// into a half-applied tree. Slower is better than inconsistent.
+    pub async fn cancelled(&self) {
+        match self.session.cancel.as_ref() {
+            Some(signal) => signal.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }

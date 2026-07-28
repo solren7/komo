@@ -1,7 +1,39 @@
 # 10 — `ToolOutputStore`：超限输出落盘 + 双端预览 + 可回搜
 
-Status: ready-for-agent
+Status: done (2026-07-28) — `cargo test` 604 passed
 Phase: 2 管线 · 依赖: 03（read 要能读 managed 路径）· 建议与 11 同批
+
+## 落地记录
+
+新 `src/services/tool_output_store.rs`，与 issue 设计的三处偏差：
+
+1. **`output_paths` 不进 `ToolOutput`**。issue 写「output_paths 进 ToolOutput 新
+   字段」，但产出方是 executor（`bound()` 在工具返回**之后**跑），工具永远不会
+   自己填它。所以 `bound()` 直接返回 `Bounded { text, output_paths }`，
+   `ToolOutput` 没动。
+2. **落盘的门槛是「有 ledger seq」**，不是「有 session」。aux 子代理 / sweeps 既没有
+   run 可供 operator 回查，也没有后续 turn 会去 `read`，落一个没人打开的文件是垃圾。
+   `bound()` 的 call id 因此是 `<run_id>-<seq:04>`。
+3. **只读 managed 根挂在 `Workspace` 上**，不在 `fs_common` 里判定：
+   `Workspace::with_readonly()` + `resolve_readable()`，`fs_common::resolve_readable`
+   给 `read`/`grep` 用，`resolve`（写路径）不变 —— 于是 write/edit/apply_patch
+   指向 managed 路径**自动**被拒，不需要额外分支。session 自选 workspace 时
+   派生的临时 Workspace 会继承 readonly 根（`fs_common::effective`）。
+   `glob` 仍走 `resolve`：模型拿到的是精确文件路径，不需要列目录。
+
+管线顺序：执行 → 从**原始**结果算 ledger 字段 → `bound()`（可能写盘）→ 记 step
+（带 output_paths）→ turn budget admit。ledger 记原始、模型看预览，这一点不变。
+
+预览：marker 之外的预算对半分给首尾，先按行采样（`MAX_PREVIEW_LINES` 2000 对半），
+无换行的单行 blob 退回 char boundary 字节切分。写盘失败 → 退回原来的单向截断
+（磁盘满不该把一次成功的工具调用变成失败）。
+
+清理：7 天，gateway 启动扫一次 + store 内 1 小时去抖，无新 cron。
+
+验证：8 个 store 单测 + 2 个 executor 集成测试（500 行输出 → 首尾都在、中段在文件里、
+step 带路径；无 ledger → 不落盘）+ read/write 各一个（managed 路径可读 / 不可写，
+且 managed 根的兄弟目录仍被拒）；另外真实启动 gateway，27 天前的文件与空目录被清掉、
+当天的保留（日志 `expired stored tool outputs removed=1`）。
 
 ## 目标
 

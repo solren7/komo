@@ -1,7 +1,20 @@
 # 08 — `skill view` 补 base directory + 文件清单
 
-Status: ready-for-agent
+Status: done (2026-07-28) — `cargo test` 588 passed
 Phase: 1 工具集（小项，改动最小/收益最直接）· 依赖: 无
+
+## 落地记录
+
+`SkillRegistry::get` 改回 `LocatedSkill { skill, dir }`（内部
+`snapshot_located` 保留 `entry.path()`），`view` 渲染成 `<skill_content>` 块：
+instructions + base directory + `<skill_files>`（`skill_files()` 递归、排序、
+绝对路径、排除 `SKILL.md` 与 `.git`、取前 10、`WALK_BUDGET` 1000 兜底）。
+
+与 issue 的两处收紧：无资产的 skill **不输出** `<skill_files>` 块也不输出
+"sampled" 那行（空块会被模型读成"有文件"），但仍输出 base directory；
+`structured` 带 `{name, directory, files}`（v2 `Output` 的形状，供 11 落库）。
+
+`Skill` 结构体没动（18 处字面量构造），位置信息挂在 registry 的返回类型上。
 
 ## 目标
 

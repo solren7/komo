@@ -203,6 +203,12 @@ impl App {
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Answer::Once),
                 KeyCode::Char('s') | KeyCode::Char('S') => Some(Answer::Session),
+                // Offered only when the modal showed the rule it would save.
+                KeyCode::Char('a') | KeyCode::Char('A')
+                    if self.modal.as_ref().is_some_and(|m| m.always_rule.is_some()) =>
+                {
+                    Some(Answer::Always)
+                }
                 // `n` asks for a reason first (one extra keystroke); Esc is the
                 // immediate, explanation-free denial.
                 KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -482,6 +488,7 @@ mod tests {
             summary: "run shell".into(),
             detail: None,
             dangerous: false,
+            always_rule: None,
             reply: Some(tx),
         });
         // Ordinary typing is captured by the modal.
@@ -506,6 +513,7 @@ mod tests {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
+            always_rule: None,
             reply: Some(tx),
         });
 
@@ -541,6 +549,7 @@ mod tests {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
+            always_rule: None,
             reply: Some(tx),
         });
         assert_eq!(
@@ -559,6 +568,7 @@ mod tests {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
+            always_rule: None,
             reply: Some(tx),
         });
         app.on_key(key(KeyCode::Char('n')));
@@ -579,6 +589,7 @@ mod tests {
             summary: "write".into(),
             detail: None,
             dangerous: false,
+            always_rule: None,
             reply: Some(tx),
         });
         app.on_key(key(KeyCode::Char('n')));

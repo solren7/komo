@@ -13,7 +13,7 @@ use crate::{
         tool::{Tool, ToolError, ToolOutput, parse_args},
     },
     infra::skills::FsSkillStore,
-    services::skill_registry::SkillRegistry,
+    services::skill_registry::{LocatedSkill, SkillRegistry, skill_files},
 };
 
 #[derive(Deserialize)]
@@ -123,15 +123,11 @@ impl Tool for SkillTool {
                 match self.registry.get(&name) {
                     // A clear terminal answer, not an error: the model should
                     // move on, not retry other spellings.
-                    Some(skill) if skill.disabled => Ok(ToolOutput::text(format!(
+                    Some(located) if located.skill.disabled => Ok(ToolOutput::text(format!(
                         "skill `{}` is disabled by the operator and cannot be used.",
-                        skill.name
+                        located.skill.name
                     ))),
-                    Some(skill) => Ok(ToolOutput::text(format!(
-                        "# Skill: {}\n{}\n\n{}",
-                        skill.name, skill.description, skill.instructions
-                    ))
-                    .with_title(format!("skill {}", skill.name))),
+                    Some(located) => Ok(render_view(&located)),
                     None => Err(ToolError::InvalidInput(format!(
                         "skill `{name}` not found; use action=list to see available skills"
                     ))),
@@ -214,6 +210,53 @@ impl Tool for SkillTool {
     }
 }
 
+/// How many of a skill's own files are listed in a `view`. A sample, not the
+/// inventory — the output says so, so the model asks (`glob`/`read`) rather than
+/// assuming a script it needs isn't there.
+const FILE_LIMIT: usize = 10;
+
+/// Render `view`: the instruction body, plus **where it lives** and a sample of
+/// the files next to it. Without the base directory a SKILL.md that says "run
+/// `scripts/foo.py`" is unactionable — the model has no way to know what
+/// `scripts/` is relative to.
+fn render_view(located: &LocatedSkill) -> ToolOutput {
+    let skill = &located.skill;
+    let mut text = format!(
+        "<skill_content name=\"{}\">\n# Skill: {}\n{}\n\n{}\n",
+        skill.name, skill.name, skill.description, skill.instructions
+    );
+    let files = located
+        .dir
+        .as_deref()
+        .map(|dir| skill_files(dir, FILE_LIMIT))
+        .unwrap_or_default();
+    if let Some(dir) = located.dir.as_deref() {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        text.push_str(&format!(
+            "\nBase directory for this skill: {}\n\
+             Relative paths in this skill (e.g., scripts/, references/) are relative to \
+             this base directory.\n",
+            dir.display()
+        ));
+        if !files.is_empty() {
+            text.push_str("Note: file list is sampled.\n\n<skill_files>\n");
+            for file in &files {
+                text.push_str(&format!("<file>{}</file>\n", file.display()));
+            }
+            text.push_str("</skill_files>\n");
+        }
+    }
+    text.push_str("</skill_content>");
+
+    ToolOutput::text(text)
+        .with_title(format!("skill {}", skill.name))
+        .with_structured(json!({
+            "name": skill.name,
+            "directory": located.dir.as_ref().map(|d| d.display().to_string()),
+            "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +328,76 @@ mod tests {
             .unwrap();
         assert!(view.text.contains("disabled by the operator"));
         assert!(!view.text.contains("secret steps"));
+    }
+
+    /// The point of 08: a multi-file skill's `scripts/` is useless to the model
+    /// unless `view` says where it is and what's in it.
+    #[tokio::test]
+    async fn view_reports_base_directory_and_sampled_files() {
+        let root = std::env::temp_dir().join("komo_skillview_files_root");
+        let _ = std::fs::remove_dir_all(&root);
+        let skill_dir = root.join("packer");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: packer\ndescription: Pack things\n---\nRun scripts/pack.py.",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("scripts/pack.py"), "print(1)").unwrap();
+
+        let tool = SkillTool::new(
+            Arc::new(SkillRegistry::load_from_dirs(std::slice::from_ref(&root))),
+            store("view_files"),
+        );
+        let out = tool
+            .call(json!({ "action": "view", "name": "packer" }), &ctx())
+            .await
+            .unwrap();
+
+        assert!(out.text.contains("Run scripts/pack.py."));
+        assert!(out.text.contains(&format!(
+            "Base directory for this skill: {}",
+            skill_dir.display()
+        )));
+        assert!(out.text.contains("file list is sampled"));
+        assert!(out.text.contains(&format!(
+            "<file>{}</file>",
+            skill_dir.join("scripts/pack.py").display()
+        )));
+        assert_eq!(out.structured["files"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No assets ⇒ no `<skill_files>` block (an empty one reads as "this skill
+    /// has files" to a model skimming the output), but the base directory still
+    /// helps: the skill may create files there.
+    #[tokio::test]
+    async fn view_omits_the_file_block_for_a_lone_skill_md() {
+        let root = std::env::temp_dir().join("komo_skillview_lone_root");
+        let _ = std::fs::remove_dir_all(&root);
+        let skill_dir = root.join("solo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: solo\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+
+        let tool = SkillTool::new(
+            Arc::new(SkillRegistry::load_from_dirs(std::slice::from_ref(&root))),
+            store("view_lone"),
+        );
+        let out = tool
+            .call(json!({ "action": "view", "name": "solo" }), &ctx())
+            .await
+            .unwrap();
+
+        assert!(out.text.contains("Base directory for this skill:"));
+        assert!(!out.text.contains("<skill_files>"));
+        assert!(!out.text.contains("sampled"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

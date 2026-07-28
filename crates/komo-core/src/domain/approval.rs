@@ -102,7 +102,14 @@ impl ApprovalRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    Deny { feedback: Option<String> },
+    /// Allow, **and remember** this kind of action for future sessions — the
+    /// interactive `a` answer. Only the interactive approvers produce it, and
+    /// only `PolicyApprover` acts on it (it synthesizes the narrowest matching
+    /// rule and persists it), so every other layer can treat it as `Allow`.
+    AllowAlways,
+    Deny {
+        feedback: Option<String>,
+    },
 }
 
 impl Decision {
@@ -119,7 +126,7 @@ impl Decision {
     }
 
     pub fn is_allowed(&self) -> bool {
-        matches!(self, Decision::Allow)
+        matches!(self, Decision::Allow | Decision::AllowAlways)
     }
 
     /// The denial's explanation, if the user (or a policy rule) gave one.

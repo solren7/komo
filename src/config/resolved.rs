@@ -835,16 +835,69 @@ fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyR
     }
 }
 
+#[cfg(test)]
+mod policy_rule_tests {
+    use super::*;
+    use crate::domain::policy::{Access, Category, Matcher};
+
+    fn rule(category: &str, matcher: &str, value: &str) -> PolicyRuleFileConfig {
+        PolicyRuleFileConfig {
+            category: category.to_string(),
+            matcher: matcher.to_string(),
+            value: value.to_string(),
+            effect: "deny".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// `category = "shell", effect = "deny"` with no `match`/`value` is the
+    /// whole-category form — it must survive parsing, since it's what takes a
+    /// tool out of the model's catalog.
+    #[test]
+    fn a_rule_without_match_or_value_is_a_wildcard() {
+        let parsed = build_rule(rule("shell", "", "")).expect("wildcard rule is valid");
+        assert_eq!(parsed.matcher, Matcher::Any);
+        assert_eq!(parsed.category, Category::Shell);
+
+        // Still scopable by access — deny every write, leave reads alone.
+        let mut r = rule("file", "", "");
+        r.access = Some("write".to_string());
+        let parsed = build_rule(r).unwrap();
+        assert_eq!(parsed.matcher, Matcher::Any);
+        assert_eq!(parsed.access, Some(Access::Write));
+    }
+
+    /// A matcher with nothing to compare is a config mistake, not a wildcard:
+    /// reading `prefix ""` as "everything" would be the worst possible way for
+    /// the operator to discover the typo.
+    #[test]
+    fn a_matcher_without_a_value_stays_invalid() {
+        assert!(build_rule(rule("shell", "prefix", "")).is_none());
+        assert!(build_rule(rule("shell", "nonsense", "x")).is_none());
+        assert!(build_rule(rule("nonsense", "prefix", "x")).is_none());
+    }
+}
+
 fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {
     use crate::domain::policy::{Access, Category, Effect, Matcher, Rule};
 
-    if r.value.is_empty() {
+    // No `match` and no `value` is the wildcard form — "this whole category" —
+    // which is what lets a `category = "shell", effect = "deny"` rule take the
+    // tool out of the model's catalog entirely. A `match` *without* a value stays
+    // invalid: a `prefix` with nothing to compare is a config mistake, and
+    // silently reading it as "everything" would be the worst way to find out.
+    let wildcard = r.matcher.trim().is_empty() && r.value.is_empty();
+    if r.value.is_empty() && !wildcard {
         return None;
     }
     Some(Rule {
         channels: r.channels.filter(|c| !c.is_empty()),
         category: Category::parse(&r.category)?,
-        matcher: Matcher::parse(&r.matcher)?,
+        matcher: if wildcard {
+            Matcher::Any
+        } else {
+            Matcher::parse(&r.matcher)?
+        },
         value: r.value,
         access: match r.access {
             Some(a) => Some(Access::parse(&a)?),

@@ -13,6 +13,9 @@ enum Answer {
     Once,
     /// Allow this action and remember its scope key for the rest of the session.
     Session,
+    /// Allow, and save a narrow rule so this kind of action stops asking in
+    /// future sessions too (`~/.komo/permissions.json`).
+    Always,
     /// Refuse. A denial answered as `n: <reason>` carries the reason to the
     /// model, so it can correct the call instead of retrying it verbatim.
     Deny(Option<String>),
@@ -28,6 +31,7 @@ fn parse_answer(input: &str) -> Answer {
     match verb.to_lowercase().as_str() {
         "y" | "yes" => Answer::Once,
         "s" | "session" => Answer::Session,
+        "a" | "always" => Answer::Always,
         _ => Answer::Deny((!rest.is_empty()).then(|| rest.to_string())),
     }
 }
@@ -111,13 +115,37 @@ impl Approver for CliApprover {
                 }
                 Decision::Allow
             }
+            Answer::Always => {
+                // Also cache for the session: the saved rule is narrow, so a
+                // near-miss later in this conversation shouldn't re-prompt after
+                // the user already said "always".
+                if let Some(key) = &request.scope_key {
+                    self.session_allowed.lock().unwrap().insert(key.clone());
+                }
+                Decision::AllowAlways
+            }
             Answer::Deny(feedback) => Decision::Deny { feedback },
         }
     }
 }
 
 /// The interactive prompt text for a non-`Safe` request.
+///
+/// `[a]lways` is offered only when there is something to remember — a
+/// `Risk::Normal` request carrying an action to generalize from. A dangerous
+/// action never offers it (the policy engine refuses to read a saved grant for
+/// one, so the key would be a lie), and the rule text is spelled out so the
+/// operator sees how wide the grant is *before* answering.
 fn prompt_text(request: &ApprovalRequest) -> String {
+    let saveable = (request.risk == Risk::Normal)
+        .then(|| always_rule(request))
+        .flatten();
+    let choices = match &saveable {
+        Some(rule) => format!(
+            "[y]es once / [s]ession / [a]lways (saves: {rule}) / [N]o (`n: reason` tells the agent why) "
+        ),
+        None => "[y]es once / [s]ession / [N]o (`n: reason` tells the agent why) ".to_string(),
+    };
     match request.risk {
         Risk::Safe => unreachable!("handled before prompting"),
         Risk::Dangerous => {
@@ -125,16 +153,20 @@ fn prompt_text(request: &ApprovalRequest) -> String {
             if let Some(detail) = &request.detail {
                 s.push_str(&format!("\n   ({detail})"));
             }
-            s.push_str(
-                "\n   Approve? [y]es once / [s]ession / [N]o (`n: reason` tells the agent why) ",
-            );
+            s.push_str(&format!("\n   Approve? {choices}"));
             s
         }
-        Risk::Normal => format!(
-            "\n⚠  Approve request to {}? [y]es once / [s]ession / [N]o (`n: reason` tells the agent why) ",
-            request.summary
-        ),
+        Risk::Normal => format!("\n⚠  Approve request to {}? {choices}", request.summary),
     }
+}
+
+/// The rule an `always` answer would save, described for the prompt. `None` when
+/// there is nothing to generalize (no action, or no session to scope it to).
+fn always_rule(request: &ApprovalRequest) -> Option<String> {
+    let session = crate::services::tool_execution::current_session()?;
+    let channel = crate::domain::policy::channel_of(&session.session_id);
+    let action = request.action.as_ref()?;
+    Some(crate::domain::policy::Rule::narrowest_for(action, &channel)?.describe())
 }
 
 // The gateway uses `agent::interaction::ChatApprover`, which routes the prompt
@@ -152,6 +184,8 @@ mod tests {
         assert_eq!(parse_answer("YES"), Answer::Once);
         assert_eq!(parse_answer("s\n"), Answer::Session);
         assert_eq!(parse_answer("Session"), Answer::Session);
+        assert_eq!(parse_answer("a\n"), Answer::Always);
+        assert_eq!(parse_answer("ALWAYS"), Answer::Always);
         assert_eq!(parse_answer(""), Answer::Deny(None));
         assert_eq!(parse_answer("n"), Answer::Deny(None));
         assert_eq!(parse_answer("whatever"), Answer::Deny(None));

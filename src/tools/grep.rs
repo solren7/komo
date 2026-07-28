@@ -97,7 +97,8 @@ impl Tool for GrepTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: GrepArgs = parse_args(&input)?;
-        let target = fs_common::resolve(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
+        let target =
+            fs_common::resolve_readable(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
 
         if let Some(refusal) = fs_common::allow_read(ctx, &target).await {
             return Ok(ToolOutput::text(refusal));
@@ -242,6 +243,34 @@ mod tests {
             GrepTool::new(Arc::new(Workspace::new(vec![dir.clone()]))),
             dir,
         )
+    }
+
+    /// A stored over-limit result is only useful if the model can search the
+    /// part the preview elided — so `grep` has to reach the managed root too.
+    #[tokio::test]
+    async fn searches_a_managed_path_outside_the_workspace() {
+        let base = std::env::temp_dir().join("komo_greptool_managed");
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace_dir = base.join("project");
+        let managed = base.join("tool-output").join("cli-t");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        let stored = managed.join("run-0000.txt");
+        std::fs::write(&stored, "head\nelided middle marker\ntail\n").unwrap();
+
+        let tool = GrepTool::new(Arc::new(
+            Workspace::new(vec![workspace_dir]).with_readonly(vec![base.join("tool-output")]),
+        ));
+        let out = tool
+            .call(
+                json!({ "pattern": "elided middle", "path": stored.display().to_string() }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("elided middle marker"), "{}", out.text);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

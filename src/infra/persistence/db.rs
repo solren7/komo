@@ -185,6 +185,15 @@ struct RunStepRecord {
     /// `STEP_COLUMNS`); `started_at`/`ended_at` are whole seconds and can't
     /// express a sub-second call.
     elapsed_ms: i64,
+
+    /// `ToolOutput::structured` as JSON text; empty string = none (which is also
+    /// what a row written before the column reads as). Additive column.
+    structured: String,
+
+    /// Newline-separated paths of stored full outputs; empty = none. Additive
+    /// column. A list, not JSON: the entries are paths, and `split('\n')` on the
+    /// read side beats a nested parse.
+    output_paths: String,
 }
 
 /// Setting key for the runtime home channel (`/sethome`).
@@ -240,8 +249,11 @@ impl Db {
                 "\"recoverable\" boolean NOT NULL DEFAULT false",
             )];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
-            const STEP_COLUMNS: &[(&str, &str)] =
-                &[("elapsed_ms", "\"elapsed_ms\" integer NOT NULL DEFAULT 0")];
+            const STEP_COLUMNS: &[(&str, &str)] = &[
+                ("elapsed_ms", "\"elapsed_ms\" integer NOT NULL DEFAULT 0"),
+                ("structured", "\"structured\" text NOT NULL DEFAULT ''"),
+                ("output_paths", "\"output_paths\" text NOT NULL DEFAULT ''"),
+            ];
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
         }
 
@@ -1044,6 +1056,14 @@ impl RunRepository for Db {
                 started_at: step.started_at,
                 ended_at: step.ended_at,
                 elapsed_ms: step.elapsed_ms,
+                // `Null` is "no structured view" — store it as the empty string
+                // rather than the four bytes of `null`, so the column reads the
+                // same for a tool without one and a row written before it existed.
+                structured: match &step.structured {
+                    serde_json::Value::Null => String::new(),
+                    value => value.to_string(),
+                },
+                output_paths: step.output_paths.join("\n"),
             })
             .exec(&mut conn)
             .await?;
@@ -1210,6 +1230,16 @@ fn step_from_record(record: RunStepRecord) -> RunStep {
         started_at: record.started_at,
         ended_at: record.ended_at,
         elapsed_ms: record.elapsed_ms,
+        // Empty (a tool with no structured view, or a pre-column row) reads back
+        // as `Null` — absence, not an empty object. Unparseable text does too:
+        // the ledger is an audit record, and a malformed cell must not fail a read.
+        structured: serde_json::from_str(&record.structured).unwrap_or(serde_json::Value::Null),
+        output_paths: record
+            .output_paths
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -1325,6 +1355,16 @@ mod tests {
             started_at: 100 + seq,
             ended_at: 101 + seq,
             elapsed_ms: 250 + seq,
+            structured: if ok {
+                serde_json::json!({ "exit": 0 })
+            } else {
+                serde_json::Value::Null
+            },
+            output_paths: if ok {
+                vec!["/tmp/komo/out.txt".to_string()]
+            } else {
+                Vec::new()
+            },
         };
         RunRepository::append_step(&db, &step(1, "time", true))
             .await
@@ -1353,6 +1393,12 @@ mod tests {
         assert_eq!(steps[0].error, "boom");
         assert_eq!(steps[1].seq, 1);
         assert!(steps[1].ok);
+        // The additive columns round-trip, and an absent structured view reads
+        // back as `Null` — absence, never an empty object.
+        assert_eq!(steps[1].structured, serde_json::json!({ "exit": 0 }));
+        assert_eq!(steps[1].output_paths, vec!["/tmp/komo/out.txt".to_string()]);
+        assert!(steps[0].structured.is_null());
+        assert!(steps[0].output_paths.is_empty());
 
         let recent = RunRepository::list(&db, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
@@ -1395,6 +1441,8 @@ mod tests {
                     started_at: t,
                     ended_at: t + 1,
                     elapsed_ms: 12,
+                    structured: serde_json::Value::Null,
+                    output_paths: Vec::new(),
                 },
             )
             .await

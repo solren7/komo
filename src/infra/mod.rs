@@ -2,6 +2,7 @@
 pub mod codex;
 pub mod gateway_client;
 pub mod llm;
+pub mod permissions_store;
 pub mod rendezvous;
 pub mod rig_tool;
 pub mod skill_install;

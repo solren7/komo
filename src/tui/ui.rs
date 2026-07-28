@@ -218,10 +218,29 @@ fn render_modal(
                 Style::new().add_modifier(Modifier::BOLD),
             )));
         }
-        None => lines.push(Line::from(Span::styled(
-            "[y] 允许一次   [s] 本会话内同类操作   [n] 拒绝并说明   [Esc] 拒绝",
-            Style::new().add_modifier(Modifier::BOLD),
-        ))),
+        None => {
+            // The saved rule is spelled out before the key that saves it: the
+            // operator has to see how wide the grant is to judge it.
+            if let Some(rule) = &prompt.always_rule {
+                for l in wrap_text(&format!("[a] 以后都允许，保存规则：{rule}"), inner_width)
+                {
+                    lines.push(Line::from(Span::styled(
+                        l,
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            let keys = match prompt.always_rule {
+                Some(_) => {
+                    "[y] 允许一次   [s] 本会话内同类操作   [a] 以后都允许   [n] 拒绝并说明   [Esc] 拒绝"
+                }
+                None => "[y] 允许一次   [s] 本会话内同类操作   [n] 拒绝并说明   [Esc] 拒绝",
+            };
+            lines.push(Line::from(Span::styled(
+                keys,
+                Style::new().add_modifier(Modifier::BOLD),
+            )));
+        }
     }
 
     let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
@@ -409,6 +428,7 @@ mod tests {
             summary: "run shell command: rm -rf /tmp/x".into(),
             detail: Some("matched dangerous pattern".into()),
             dangerous: true,
+            always_rule: None,
             reply: None,
         });
         app.in_flight = true; // spinner path renders too

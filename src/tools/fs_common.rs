@@ -20,29 +20,71 @@ use crate::domain::{
 /// the workspace root; anything that lands outside it is refused as
 /// [`ToolError::Denied`] — the workspace whitelist is a floor, not a prompt (no
 /// approval unlocks it, matching `shell`'s hardline patterns).
+///
+/// This is the **mutating** resolver. A read goes through
+/// [`resolve_readable`], which also admits komo's read-only managed roots.
 pub fn resolve(
     workspace: &Arc<Workspace>,
     ctx: &ToolContext,
     path: &str,
 ) -> Result<PathBuf, ToolError> {
-    let selected = ctx
-        .session
-        .workspace_root
-        .as_ref()
-        .map(|root| Workspace::new(vec![root.clone()]));
-    let effective = selected.as_ref().unwrap_or(workspace.as_ref());
+    let effective = effective(workspace, ctx);
     effective.resolve_contained(Path::new(path)).ok_or_else(|| {
         ToolError::Denied(format!(
             "path `{path}` is outside the workspace and was blocked. \
                  Only paths under {} are available.",
-            effective
-                .roots()
-                .iter()
-                .map(|r| r.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            roots_note(effective.roots())
         ))
     })
+}
+
+/// [`resolve`] for a read: the workspace **plus** the read-only managed roots
+/// (`~/.komo/tool-output`, where an over-limit tool result is stored in full).
+/// A preview hands the model that path, so `read`/`grep` have to be able to open
+/// it; nothing else can, because every mutating tool resolves through [`resolve`].
+pub fn resolve_readable(
+    workspace: &Arc<Workspace>,
+    ctx: &ToolContext,
+    path: &str,
+) -> Result<PathBuf, ToolError> {
+    let effective = effective(workspace, ctx);
+    effective.resolve_readable(Path::new(path)).ok_or_else(|| {
+        ToolError::Denied(format!(
+            "path `{path}` is outside the workspace and was blocked. \
+                 Only paths under {} are available.",
+            roots_note(
+                &effective
+                    .roots()
+                    .iter()
+                    .chain(effective.readonly_roots())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            )
+        ))
+    })
+}
+
+/// The workspace this turn actually resolves against: the session's own root when
+/// it picked one, else the wired default. A session-selected root still carries
+/// the managed read-only roots — they are komo's, not the workspace's.
+fn effective<'a>(
+    workspace: &'a Arc<Workspace>,
+    ctx: &ToolContext,
+) -> std::borrow::Cow<'a, Workspace> {
+    match ctx.session.workspace_root.as_ref() {
+        Some(root) => std::borrow::Cow::Owned(
+            Workspace::new(vec![root.clone()]).with_readonly(workspace.readonly_roots().to_vec()),
+        ),
+        None => std::borrow::Cow::Borrowed(workspace.as_ref()),
+    }
+}
+
+fn roots_note(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Consult the approver for a **read**. Reads are `Risk::Safe`, so an
@@ -56,7 +98,9 @@ pub async fn allow_read(ctx: &ToolContext, path: &Path) -> Option<String> {
             write: false,
         });
     match ctx.decide(&request).await {
-        Decision::Allow => None,
+        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
+        // differently (it persists the grant).
+        Decision::Allow | Decision::AllowAlways => None,
         Decision::Deny { feedback } => Some(match feedback {
             Some(reason) => format!(
                 "Read of {} blocked: {reason}. Nothing was read.",
@@ -81,7 +125,9 @@ pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Opt
             write: true,
         });
     match ctx.decide(&request).await {
-        Decision::Allow => None,
+        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
+        // differently (it persists the grant).
+        Decision::Allow | Decision::AllowAlways => None,
         Decision::Deny { feedback } => Some(match feedback {
             Some(reason) => format!(
                 "Rejected by the user; {} was not changed. They said: {reason}",

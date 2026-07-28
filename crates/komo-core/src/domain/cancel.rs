@@ -5,15 +5,24 @@
 //! transcript with nobody watching. This is the signal that lets the caller stop
 //! it for real.
 //!
-//! **Cooperative**, in two senses worth being precise about:
+//! **Cooperative**, in three senses worth being precise about:
 //!
 //!   - The agent loop stops between rounds and mid-await (the model round-trip
 //!     and the tool round are raced against the signal), so cancelling lands
 //!     within one await, not after the whole turn.
-//!   - A tool call *already executing* still runs to completion — the executor
-//!     spawns each call, and [`Tool`](crate::domain::tool::Tool) has no abort
-//!     hook. So cancelling means "no further rounds, no further tool calls", not
-//!     "kill whatever is running".
+//!   - A tool call already executing stops only if it **claims** the signal via
+//!     [`ToolContext::cancelled`](crate::domain::context::ToolContext::cancelled).
+//!     `shell` does (it kills its process group, so interrupting a ten-minute
+//!     build actually ends the build) and so do `web_fetch` / `web_search` (they
+//!     drop the request). Everything else runs to completion and observes the
+//!     cancellation only after returning.
+//!   - The executor deliberately does **not** race every call against the signal
+//!     on the tools' behalf. That would also interrupt the filesystem tools, and
+//!     `apply_patch` writes several files in sequence: stopping between two of
+//!     them turns a patch that would have finished into a half-applied tree.
+//!     A single `write`/`edit` is safe either way (one `tokio::fs::write` is one
+//!     `spawn_blocking`, so the syscall completes regardless), but there is
+//!     nothing to gain by interrupting a millisecond-long local write.
 //!
 //! Like [`ToolEventSink`](crate::domain::events::ToolEventSink), this is a trait
 //! so the domain stays runtime-agnostic; the `watch`-channel implementation

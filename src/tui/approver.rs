@@ -24,6 +24,8 @@ pub enum Answer {
     Once,
     /// Allow and remember the scope key for the rest of the session.
     Session,
+    /// Allow, and save a narrow rule so this stops asking in future sessions.
+    Always,
     /// Refuse, optionally with a reason the agent is told (typed after `n`).
     Deny(Option<String>),
 }
@@ -34,6 +36,11 @@ pub struct ApprovalPrompt {
     pub summary: String,
     pub detail: Option<String>,
     pub dangerous: bool,
+    /// The rule an "always" answer would save, already described. `None` when
+    /// there is nothing to generalize (no action on the request) or when the
+    /// action is dangerous — the policy engine refuses to read a saved grant for
+    /// one, so the modal must not offer the key.
+    pub always_rule: Option<String>,
     pub reply: Option<oneshot::Sender<Answer>>,
 }
 
@@ -68,6 +75,9 @@ impl Approver for TuiApprover {
             summary: request.summary.clone(),
             detail: request.detail.clone(),
             dangerous: request.risk == Risk::Dangerous,
+            always_rule: (request.risk == Risk::Normal)
+                .then(|| always_rule(request))
+                .flatten(),
             reply: Some(tx),
         };
         // The TUI gone (channel closed) means no one can answer: deny.
@@ -82,11 +92,25 @@ impl Approver for TuiApprover {
                 }
                 Decision::Allow
             }
+            Ok(Answer::Always) => {
+                if let Some(key) = &request.scope_key {
+                    self.session_allowed.lock().unwrap().insert(key.clone());
+                }
+                Decision::AllowAlways
+            }
             Ok(Answer::Deny(feedback)) => Decision::Deny { feedback },
             // The modal was dropped unanswered (quit).
             Err(_) => Decision::deny(),
         }
     }
+}
+
+/// The rule an `always` answer would save, described for the modal.
+fn always_rule(request: &ApprovalRequest) -> Option<String> {
+    let session = crate::services::tool_execution::current_session()?;
+    let channel = crate::domain::policy::channel_of(&session.session_id);
+    let action = request.action.as_ref()?;
+    Some(crate::domain::policy::Rule::narrowest_for(action, &channel)?.describe())
 }
 
 #[cfg(test)]

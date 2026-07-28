@@ -105,7 +105,7 @@ impl Tool for ReadTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: ReadArgs = parse_args(&input)?;
-        let path = fs_common::resolve(&self.workspace, ctx, &args.path)?;
+        let path = fs_common::resolve_readable(&self.workspace, ctx, &args.path)?;
 
         if let Some(refusal) = fs_common::allow_read(ctx, &path).await {
             return Ok(ToolOutput::text(refusal));
@@ -354,6 +354,48 @@ mod tests {
             ReadTool::new(Arc::new(Workspace::new(vec![dir.clone()]))),
             dir,
         )
+    }
+
+    /// The other half of the tool-output store: a preview hands the model a path
+    /// **outside** the workspace, so `read` has to be able to open it — otherwise
+    /// the pointer is decoration.
+    #[tokio::test]
+    async fn reads_a_managed_path_outside_the_workspace() {
+        let base = std::env::temp_dir().join("komo_read_managed");
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace_dir = base.join("project");
+        let managed = base.join("tool-output");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        let stored = managed.join("cli-t").join("run-0000.txt");
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, "stored line\n").unwrap();
+
+        let tool = ReadTool::new(Arc::new(
+            Workspace::new(vec![workspace_dir]).with_readonly(vec![managed.clone()]),
+        ));
+        let out = tool
+            .call(
+                json!({ "path": stored.display().to_string() }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("stored line"), "{}", out.text);
+
+        // A sibling of the managed root is still refused — the widening is scoped.
+        let outside = base.join("elsewhere.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let err = tool
+            .call(
+                json!({ "path": outside.display().to_string() }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

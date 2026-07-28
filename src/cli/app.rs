@@ -180,6 +180,25 @@ enum PolicyAction {
         #[arg(long)]
         write: bool,
     },
+    /// Grants saved by answering `a` at an approval prompt (permissions.json)
+    Saved {
+        #[command(subcommand)]
+        action: SavedAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SavedAction {
+    /// List the saved grants, numbered as `forget` takes them
+    List,
+    /// Stop honoring a saved grant, so the action asks again
+    Forget {
+        /// Index from `saved list`
+        index: Option<usize>,
+        /// Forget every saved grant
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -576,6 +595,10 @@ pub async fn run() -> anyhow::Result<()> {
                 dangerous,
                 write,
             ),
+            PolicyAction::Saved { action } => match action {
+                SavedAction::List => policy::saved_list(&config),
+                SavedAction::Forget { index, all } => policy::saved_forget(&config, index, all),
+            },
         },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(&config).await,

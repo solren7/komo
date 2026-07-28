@@ -16,29 +16,69 @@ use tracing::info;
 
 use crate::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
-    policy::{Policy, Verdict},
+    policy::{Policy, Rule, Verdict, channel_of},
 };
+use crate::infra::permissions_store::PermissionsStore;
 use crate::services::tool_execution::current_session;
 
 /// Wraps an [`Approver`], applying a [`Policy`] before falling back to it.
 pub struct PolicyApprover {
     policy: Policy,
     inner: Arc<dyn Approver>,
+    /// Where an "always allow" answer is persisted. `None` for the unattended
+    /// approvers (cron / briefing), which can never receive that answer anyway —
+    /// there is nobody at the prompt.
+    saved: Option<Arc<PermissionsStore>>,
 }
 
 impl PolicyApprover {
     /// Wrap `inner` with `policy`. Returns the trait object the tools depend on.
     pub fn wrap(policy: Policy, inner: Arc<dyn Approver>) -> Arc<dyn Approver> {
-        Arc::new(Self { policy, inner })
+        Arc::new(Self {
+            policy,
+            inner,
+            saved: None,
+        })
     }
-}
 
-/// The channel a session id belongs to: the part before `:` (`feishu:oc_x` →
-/// `feishu`), or `cli` for the REPL's bare uuid session ids.
-fn channel_of(session_id: &str) -> String {
-    match session_id.split_once(':') {
-        Some((platform, _)) => platform.to_string(),
-        None => "cli".to_string(),
+    /// [`wrap`](Self::wrap), plus the store that makes an `a` answer durable.
+    /// This is the **only** place a grant is written: the interactive approvers
+    /// just report which answer came back, so the three of them (CLI, chat, TUI)
+    /// can't drift on what "always" means.
+    pub fn wrap_with_store(
+        policy: Policy,
+        inner: Arc<dyn Approver>,
+        saved: Arc<PermissionsStore>,
+    ) -> Arc<dyn Approver> {
+        Arc::new(Self {
+            policy,
+            inner,
+            saved: Some(saved),
+        })
+    }
+
+    /// Persist the narrowest rule covering `request`, scoped to the channel the
+    /// answer came from. Best-effort and never fails the call: the user said yes,
+    /// and the only thing at stake is whether they get asked again.
+    fn remember(&self, request: &ApprovalRequest, channel: Option<&str>) {
+        let (Some(store), Some(action), Some(channel)) =
+            (self.saved.as_ref(), request.action.as_ref(), channel)
+        else {
+            // No store, no structured action to generalize, or no session to
+            // scope to — nothing safe to write, so the grant stays session-local.
+            info!(summary = %request.summary, "always-allow could not be saved; granted once");
+            return;
+        };
+        let Some(rule) = Rule::narrowest_for(action, channel) else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let described = rule.describe();
+        if store.remember(rule, &now) {
+            info!(rule = %described, "saved an always-allow grant");
+        }
     }
 }
 
@@ -76,7 +116,15 @@ impl Approver for PolicyApprover {
                       "policy: auto-allowed");
                 Decision::Allow
             }
-            Verdict::Ask => self.inner.decide(request).await,
+            Verdict::Ask => match self.inner.decide(request).await {
+                // "Allow, and remember it": persist here, then hand the caller a
+                // plain Allow — no tool needs to know the difference.
+                Decision::AllowAlways => {
+                    self.remember(request, channel.as_deref());
+                    Decision::Allow
+                }
+                other => other,
+            },
         }
     }
 }
@@ -219,6 +267,87 @@ mod tests {
         // Even with no session in scope (sweep/aux), safe stays allowed.
         assert!(approver.approve(&req).await);
         assert!(!*inner.asked.lock().unwrap());
+    }
+
+    /// The `a` answer's whole point: the grant outlives the process. The
+    /// approver is the only writer, so this is where that is pinned.
+    #[tokio::test]
+    async fn always_persists_a_narrow_grant_and_stops_asking() {
+        struct Always;
+        #[async_trait]
+        impl Approver for Always {
+            async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+                Decision::AllowAlways
+            }
+        }
+
+        let home = std::env::temp_dir().join("komo_policy_always");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Arc::new(PermissionsStore::load(&home));
+        let approver = PolicyApprover::wrap_with_store(
+            Policy::default().with_saved(store.rules()),
+            Arc::new(Always),
+            store.clone(),
+        );
+
+        let ctx = SessionContext::detached("cli-session");
+        assert!(with_session(ctx.clone(), approver.approve(&shell_req())).await);
+
+        // Saved, narrowed to the command's first token, scoped to the channel.
+        let saved = store.list();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].value, "cargo ");
+        assert_eq!(saved[0].channels, Some(vec!["cli".to_string()]));
+
+        // …and a fresh process would honor it without asking: build a *deny-all*
+        // inner over the reloaded store and confirm the policy short-circuits.
+        let reloaded = Arc::new(PermissionsStore::load(&home));
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let next = PolicyApprover::wrap_with_store(
+            Policy::default().with_saved(reloaded.rules()),
+            inner.clone(),
+            reloaded,
+        );
+        assert!(with_session(ctx, next.approve(&shell_req())).await);
+        assert!(
+            !*inner.asked.lock().unwrap(),
+            "a saved grant must not reach the interactive approver"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// No session in scope ⇒ nothing to scope a rule to, so the grant stays
+    /// session-local rather than being written channel-less (which would apply
+    /// everywhere — the opposite of narrow).
+    #[tokio::test]
+    async fn always_without_a_session_grants_once_and_saves_nothing() {
+        struct Always;
+        #[async_trait]
+        impl Approver for Always {
+            async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+                Decision::AllowAlways
+            }
+        }
+
+        let home = std::env::temp_dir().join("komo_policy_always_nosession");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Arc::new(PermissionsStore::load(&home));
+        let approver = PolicyApprover::wrap_with_store(
+            Policy::default().with_saved(store.rules()),
+            Arc::new(Always),
+            store.clone(),
+        );
+
+        assert!(approver.approve(&shell_req()).await);
+        assert!(store.is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

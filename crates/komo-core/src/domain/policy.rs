@@ -45,6 +45,12 @@ pub enum Matcher {
     Suffix,
     Exact,
     Contains,
+    /// Every target in the rule's category, whatever its value — what a rule
+    /// with no `match`/`value` means. This is the only matcher a tool can be
+    /// dropped from the catalog for (see [`Policy::wholly_denied`]): any of the
+    /// others leaves *some* action in the category permitted, so the tool has to
+    /// stay advertised.
+    Any,
 }
 
 impl Matcher {
@@ -54,6 +60,7 @@ impl Matcher {
             "suffix" => Some(Self::Suffix),
             "exact" => Some(Self::Exact),
             "contains" => Some(Self::Contains),
+            "any" | "*" | "all" => Some(Self::Any),
             _ => None,
         }
     }
@@ -64,6 +71,7 @@ impl Matcher {
             Matcher::Suffix => target.ends_with(value),
             Matcher::Exact => target == value,
             Matcher::Contains => target.contains(value),
+            Matcher::Any => true,
         }
     }
 }
@@ -146,6 +154,116 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// The **narrowest** allow rule that would cover `action` again — what an
+    /// "always allow" answer saves. `None` when the request carries no
+    /// [`ActionRef`] to generalize from, in which case there is nothing to
+    /// remember and the prompt must not offer to.
+    ///
+    /// Narrow by construction, because the operator is answering one prompt and
+    /// should not be granting a category:
+    ///
+    /// - `shell` → the command's **first token** (`cargo build` → prefix
+    ///   `cargo `), not the whole command line (which would never match twice)
+    ///   and not the category;
+    /// - `file` → the target's **parent directory** as a prefix, plus the
+    ///   read/write access kind, so approving a write under `src/` doesn't also
+    ///   grant reads elsewhere;
+    /// - `network` → the **host** as a dot-boundary suffix;
+    /// - `homeassistant` → the exact `domain.service`.
+    ///
+    /// Always scoped to `channel`: an approval given at the CLI must not silently
+    /// grant the same action to a chat channel where someone else is typing.
+    pub fn narrowest_for(action: &ActionRef, channel: &str) -> Option<Rule> {
+        let (category, matcher, value, access) = match action {
+            ActionRef::Shell { command } => {
+                let first = command.split_whitespace().next()?.to_string();
+                // Keep the trailing space when the command had arguments: it is
+                // strictly narrower (`cargo ` can't match `cargonaut`).
+                let value = if command.trim() == first {
+                    first
+                } else {
+                    format!("{first} ")
+                };
+                (Category::Shell, Matcher::Prefix, value, None)
+            }
+            ActionRef::File { path, write } => {
+                let dir = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+                let access = Some(if *write { Access::Write } else { Access::Read });
+                (
+                    Category::File,
+                    Matcher::Prefix,
+                    // Trailing separator so `/src` can't also cover `/src-old`.
+                    format!("{}/", dir.display().to_string().trim_end_matches('/')),
+                    access,
+                )
+            }
+            ActionRef::Network { url } => {
+                let host = host_of(url);
+                if host.is_empty() {
+                    return None;
+                }
+                (Category::Network, Matcher::Suffix, host, None)
+            }
+            ActionRef::Service { domain, service } => (
+                Category::HomeAssistant,
+                Matcher::Exact,
+                format!("{domain}.{service}"),
+                None,
+            ),
+        };
+        Some(Rule {
+            channels: Some(vec![channel.to_string()]),
+            category,
+            matcher,
+            value,
+            access,
+            effect: Effect::Allow,
+            // Both deliberately off for a saved entry: the engine refuses to read
+            // it for a dangerous or unattended action anyway, and storing `true`
+            // here would misrepresent what it can do.
+            include_dangerous: false,
+            unattended: false,
+        })
+    }
+
+    /// One line describing this rule the way config would write it — shown at the
+    /// approval prompt (so the operator sees exactly how wide the grant is before
+    /// answering) and by `komo policy list` / `saved list`.
+    pub fn describe(&self) -> String {
+        let mut parts = vec![
+            match self.effect {
+                Effect::Allow => "allow".to_string(),
+                Effect::Deny => "deny ".to_string(),
+            },
+            format!("{:<14}", category_str(self.category)),
+            match self.matcher {
+                // A wildcard rule has no value to show — printing `any ""` would
+                // read like an empty pattern rather than "the whole category".
+                Matcher::Any => "any (whole category)".to_string(),
+                other => format!("{} \"{}\"", matcher_str(other), self.value),
+            },
+        ];
+        if let Some(a) = self.access {
+            parts.push(format!(
+                "access={}",
+                match a {
+                    Access::Read => "read",
+                    Access::Write => "write",
+                }
+            ));
+        }
+        if let Some(c) = &self.channels {
+            parts.push(format!("channels={}", c.join(",")));
+        }
+        if self.include_dangerous {
+            parts.push("include_dangerous".to_string());
+        }
+        if self.unattended {
+            parts.push("unattended".to_string());
+        }
+        parts.join("  ")
+    }
+
     /// Whether this rule is in scope for `action` on `channel` (ignores `value`).
     fn applies(&self, action: &ActionRef, channel: Option<&str>) -> bool {
         if self.category != category_of(action) {
@@ -194,11 +312,16 @@ impl Rule {
 
 /// A verdict plus which rule produced it (`None` = fell through to a default).
 /// The rule index is into the policy's rule list as configured — `komo policy
-/// list` shows the same numbering, so a `check` result points at a real line.
+/// list` shows the same numbering, so a `check` result points at a real line —
+/// unless [`saved`](Self::saved) is set, in which case it indexes the
+/// runtime-accumulated allow list instead (`komo policy saved list`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
     pub verdict: Verdict,
     pub rule: Option<usize>,
+    /// Whether `rule` points at a saved entry rather than a config rule. Only an
+    /// `Allow` can come from the saved list — it holds allows only.
+    pub saved: bool,
 }
 
 impl Decision {
@@ -206,16 +329,37 @@ impl Decision {
         Self {
             verdict,
             rule: None,
+            saved: false,
+        }
+    }
+
+    fn from_config(verdict: Verdict, rule: usize) -> Self {
+        Self {
+            verdict,
+            rule: Some(rule),
+            saved: false,
         }
     }
 }
 
+/// Allow rules accumulated at runtime — the operator answering "always" at an
+/// approval prompt (`~/.komo/permissions.json`, persisted by
+/// `infra::permissions_store`).
+///
+/// Shared rather than copied on purpose: the store and every [`Policy`] clone
+/// hold the same list, so an entry saved at a prompt applies to the *next*
+/// decision without a restart. Held here as plain data — the domain never does
+/// the file I/O.
+pub type SavedRules = std::sync::Arc<std::sync::RwLock<Vec<Rule>>>;
+
 /// A resolved permission policy: an ordered rule list plus the fallback verdict
-/// for a `Risk::Normal` action that no rule matches.
+/// for a `Risk::Normal` action that no rule matches, and optionally the saved
+/// allow list accumulated at runtime.
 #[derive(Debug, Clone)]
 pub struct Policy {
     rules: Vec<Rule>,
     default_normal: Verdict,
+    saved: Option<SavedRules>,
 }
 
 impl Policy {
@@ -223,12 +367,30 @@ impl Policy {
         Self {
             rules,
             default_normal,
+            saved: None,
         }
+    }
+
+    /// Attach the runtime-accumulated allow list. Without this a policy behaves
+    /// exactly as before — saved approvals are opt-in wiring, and every
+    /// unattended construction deliberately leaves them out.
+    pub fn with_saved(mut self, saved: SavedRules) -> Self {
+        self.saved = Some(saved);
+        self
     }
 
     /// The configured rules, in evaluation-list order (for `komo policy list`).
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// A snapshot of the saved allow entries, in the order they are evaluated
+    /// (for `komo policy saved list` and `check`'s explanation).
+    pub fn saved_rules(&self) -> Vec<Rule> {
+        self.saved
+            .as_ref()
+            .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default()
     }
 
     /// The fallback verdict for an unmatched `Risk::Normal` action.
@@ -263,15 +425,35 @@ impl Policy {
         for (i, rule) in self.rules.iter().enumerate() {
             if rule.effect == Effect::Deny && rule.applies(action, channel) && rule.matches(action)
             {
-                return Decision {
-                    verdict: Verdict::Deny,
-                    rule: Some(i),
-                };
+                return Decision::from_config(Verdict::Deny, i);
             }
         }
         if request.risk == Risk::Safe {
             // Deny-only for read-only actions: no allow rules, no escalation.
             return Decision::fallback(Verdict::Allow);
+        }
+        // Saved allows sit *below* every config deny (checked above) and *above*
+        // config allows, so a remembered approval can shortcut a prompt but can
+        // never widen past what the operator wrote in config.toml. Two further
+        // floors, both enforced here rather than at the call site:
+        //
+        //   - a saved entry never grants a `Risk::Dangerous` action — "remember
+        //     this" must not turn a dangerous action into a silent one, and
+        //     `include_dangerous` is a config-only opt-in;
+        //   - a saved entry is not read in an **unattended** context (no
+        //     channel). It was accumulated interactively; letting it leak into
+        //     cron / sweeps would grant there what only `unattended = true`
+        //     config rules are allowed to grant.
+        if request.risk != Risk::Dangerous && channel.is_some() {
+            for (i, rule) in self.saved_rules().iter().enumerate() {
+                if rule.applies(action, channel) && rule.matches(action) {
+                    return Decision {
+                        verdict: Verdict::Allow,
+                        rule: Some(i),
+                        saved: true,
+                    };
+                }
+            }
         }
         for (i, rule) in self.rules.iter().enumerate() {
             if rule.effect == Effect::Allow && rule.applies(action, channel) && rule.matches(action)
@@ -283,13 +465,46 @@ impl Policy {
                 if channel.is_none() && !rule.unattended {
                     continue;
                 }
-                return Decision {
-                    verdict: Verdict::Allow,
-                    rule: Some(i),
-                };
+                return Decision::from_config(Verdict::Allow, i);
             }
         }
         Decision::fallback(self.default_for(request.risk, channel))
+    }
+
+    /// Whether *every* action in `category` is denied — for every channel and
+    /// every target. `access` narrows the question to one kind of file action
+    /// (`read` for `read`/`grep`/`glob`, `write` for `write`/`edit`); pass `None`
+    /// for the categories that have no access dimension.
+    ///
+    /// This is the catalog-filtering question (opencode v2's `whollyDisabled`):
+    /// a tool that can never do anything is worth dropping from the model's
+    /// schema and prompt entirely, rather than burning a round-trip on a call
+    /// that is certain to be refused.
+    ///
+    /// Deliberately conservative — only an unscoped [`Matcher::Any`] deny counts:
+    ///
+    /// - a **channel-scoped** rule leaves the tool usable elsewhere,
+    /// - a **value-scoped** rule (`prefix`, `contains`, …) leaves some target
+    ///   permitted.
+    ///
+    /// Both keep the tool advertised and refuse the individual call instead.
+    /// Dropping a tool by mistake hides a capability the model can never learn
+    /// it had; keeping one costs a refusal the model is actually told about.
+    pub fn wholly_denied(&self, category: Category, access: Option<Access>) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.effect == Effect::Deny
+                && rule.category == category
+                && rule.channels.is_none()
+                && rule.matcher == Matcher::Any
+                && match (rule.access, access) {
+                    // Unscoped by access ⇒ covers reads and writes alike.
+                    (None, _) => true,
+                    // The rule only bans one kind; a tool whose kind we can't
+                    // state stays.
+                    (Some(_), None) => false,
+                    (Some(banned), Some(want)) => banned == want,
+                }
+        })
     }
 
     fn default_for(&self, risk: Risk, channel: Option<&str>) -> Verdict {
@@ -311,6 +526,36 @@ impl Default for Policy {
     /// having no policy at all — i.e. the current interactive-only flow.
     fn default() -> Self {
         Self::new(Vec::new(), Verdict::Ask)
+    }
+}
+
+/// The channel a session id belongs to: the part before `:` (`feishu:oc_x` →
+/// `feishu`), or `cli` for the REPL's bare uuid session ids. Both the approver
+/// (scoping a rule it saves) and the engine (matching `channels`) key off this,
+/// so it lives here rather than in either caller.
+pub fn channel_of(session_id: &str) -> String {
+    match session_id.split_once(':') {
+        Some((platform, _)) => platform.to_string(),
+        None => "cli".to_string(),
+    }
+}
+
+pub fn category_str(c: Category) -> &'static str {
+    match c {
+        Category::Shell => "shell",
+        Category::File => "file",
+        Category::Network => "network",
+        Category::HomeAssistant => "homeassistant",
+    }
+}
+
+pub fn matcher_str(m: Matcher) -> &'static str {
+    match m {
+        Matcher::Prefix => "prefix",
+        Matcher::Suffix => "suffix",
+        Matcher::Exact => "exact",
+        Matcher::Contains => "contains",
+        Matcher::Any => "any",
     }
 }
 
@@ -603,6 +848,282 @@ mod tests {
                 .verdict,
             Verdict::Ask
         );
+    }
+
+    /// The catalog filter: only an unscoped wildcard deny takes a tool away.
+    #[test]
+    fn wholly_denied_only_for_an_unscoped_wildcard_deny() {
+        let wildcard = |category, effect| rule(category, Matcher::Any, "", effect);
+
+        let p = Policy::new(vec![wildcard(Category::Shell, Effect::Deny)], Verdict::Ask);
+        assert!(p.wholly_denied(Category::Shell, None));
+        assert!(!p.wholly_denied(Category::Network, None));
+
+        // A value-scoped deny still permits other commands ⇒ keep the tool.
+        let p = Policy::new(
+            vec![rule(Category::Shell, Matcher::Contains, "rm", Effect::Deny)],
+            Verdict::Ask,
+        );
+        assert!(!p.wholly_denied(Category::Shell, None));
+
+        // A channel-scoped deny leaves the tool usable elsewhere ⇒ keep it.
+        let mut scoped = wildcard(Category::Shell, Effect::Deny);
+        scoped.channels = Some(vec!["feishu".to_string()]);
+        assert!(!Policy::new(vec![scoped], Verdict::Ask).wholly_denied(Category::Shell, None));
+
+        // An allow rule never removes anything, and neither does default_normal.
+        let p = Policy::new(
+            vec![wildcard(Category::Shell, Effect::Allow)],
+            Verdict::Deny,
+        );
+        assert!(!p.wholly_denied(Category::Shell, None));
+    }
+
+    /// `file` splits by access: banning writes must not take the readers away.
+    #[test]
+    fn wholly_denied_respects_file_access_scope() {
+        let mut write_ban = rule(Category::File, Matcher::Any, "", Effect::Deny);
+        write_ban.access = Some(Access::Write);
+        let p = Policy::new(vec![write_ban], Verdict::Ask);
+        assert!(p.wholly_denied(Category::File, Some(Access::Write)));
+        assert!(!p.wholly_denied(Category::File, Some(Access::Read)));
+        assert!(!p.wholly_denied(Category::File, None));
+
+        // Unscoped by access ⇒ both halves go.
+        let p = Policy::new(
+            vec![rule(Category::File, Matcher::Any, "", Effect::Deny)],
+            Verdict::Ask,
+        );
+        assert!(p.wholly_denied(Category::File, Some(Access::Read)));
+        assert!(p.wholly_denied(Category::File, Some(Access::Write)));
+    }
+
+    #[test]
+    fn any_matcher_matches_every_target() {
+        let p = Policy::new(
+            vec![rule(Category::Shell, Matcher::Any, "", Effect::Deny)],
+            Verdict::Ask,
+        );
+        assert_eq!(
+            p.decide(&shell("anything at all", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Deny
+        );
+    }
+
+    fn saved(rules: Vec<Rule>) -> SavedRules {
+        std::sync::Arc::new(std::sync::RwLock::new(rules))
+    }
+
+    /// A saved grant shortcuts the prompt — but only inside a session, and only
+    /// for an action the operator could have been asked about.
+    #[test]
+    fn a_saved_grant_allows_where_config_would_ask() {
+        let grant = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "cargo build".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![grant]));
+
+        let d = p.decide(&shell("cargo test", Risk::Normal), Some("cli"));
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert!(d.saved, "the decision must name the saved list");
+        assert_eq!(d.rule, Some(0));
+        // Scoped to the channel it was granted on.
+        assert_eq!(
+            p.decide(&shell("cargo test", Risk::Normal), Some("feishu"))
+                .verdict,
+            Verdict::Ask
+        );
+        // And narrow: a different command still asks.
+        assert_eq!(
+            p.decide(&shell("npm install", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// Constraint 1: a config deny outranks any saved grant. Otherwise "remember
+    /// this" would let a prompt answer override what the operator wrote down.
+    #[test]
+    fn a_config_deny_beats_a_saved_grant() {
+        let grant = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "git push".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        let p = Policy::new(
+            vec![rule(
+                Category::Shell,
+                Matcher::Contains,
+                "push",
+                Effect::Deny,
+            )],
+            Verdict::Ask,
+        )
+        .with_saved(saved(vec![grant]));
+        assert_eq!(
+            p.decide(&shell("git push origin", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Deny
+        );
+    }
+
+    /// Constraint 2: "remember this" must never turn a dangerous action into a
+    /// silent one — that stays a config-only `include_dangerous` opt-in.
+    #[test]
+    fn a_saved_grant_never_covers_a_dangerous_action() {
+        let grant = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "rm file".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![grant]));
+        assert_eq!(
+            p.decide(&shell("rm file", Risk::Dangerous), Some("cli"))
+                .verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// Constraint 3: saved grants were accumulated interactively, so an
+    /// unattended turn (cron / sweep — no channel) must not read them.
+    #[test]
+    fn a_saved_grant_is_not_read_in_an_unattended_context() {
+        let grant = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "cargo build".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![grant]));
+        assert_eq!(
+            p.decide(&shell("cargo build", Risk::Normal), None).verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// A grant saved mid-session applies to the very next decision: the store and
+    /// the policy share one list, so nothing has to be rebuilt.
+    #[test]
+    fn a_grant_added_after_construction_is_seen_immediately() {
+        let list = saved(Vec::new());
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(list.clone());
+        assert_eq!(
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Ask
+        );
+
+        list.write().unwrap().push(
+            Rule::narrowest_for(
+                &ActionRef::Shell {
+                    command: "cargo build".into(),
+                },
+                "cli",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            p.decide(&shell("cargo build", Risk::Normal), Some("cli"))
+                .verdict,
+            Verdict::Allow
+        );
+    }
+
+    /// What "narrowest" means, per action kind — the operator is answering one
+    /// prompt, not granting a category.
+    #[test]
+    fn narrowest_for_generalizes_just_far_enough() {
+        let shell_rule = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "cargo build --release".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        assert_eq!(shell_rule.matcher, Matcher::Prefix);
+        assert_eq!(shell_rule.value, "cargo ");
+        assert_eq!(shell_rule.channels, Some(vec!["cli".to_string()]));
+        // A bare command has no arguments to separate from.
+        assert_eq!(
+            Rule::narrowest_for(
+                &ActionRef::Shell {
+                    command: "make".into()
+                },
+                "cli"
+            )
+            .unwrap()
+            .value,
+            "make"
+        );
+
+        let file_rule = Rule::narrowest_for(
+            &ActionRef::File {
+                path: PathBuf::from("/home/me/proj/src/main.rs"),
+                write: true,
+            },
+            "cli",
+        )
+        .unwrap();
+        assert_eq!(file_rule.value, "/home/me/proj/src/");
+        assert_eq!(file_rule.access, Some(Access::Write));
+        // The write grant must not also cover reads (or vice versa).
+        let read_req = ApprovalRequest::normal("read").with_action(ActionRef::File {
+            path: PathBuf::from("/home/me/proj/src/main.rs"),
+            write: false,
+        });
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![file_rule]));
+        assert!(!p.decide(&read_req, Some("cli")).saved);
+
+        let net_rule = Rule::narrowest_for(
+            &ActionRef::Network {
+                url: "https://api.github.com/repos/x".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        assert_eq!(net_rule.matcher, Matcher::Suffix);
+        assert_eq!(net_rule.value, "api.github.com");
+
+        let ha_rule = Rule::narrowest_for(
+            &ActionRef::Service {
+                domain: "light".into(),
+                service: "turn_on".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        assert_eq!(ha_rule.matcher, Matcher::Exact);
+        assert_eq!(ha_rule.value, "light.turn_on");
+
+        // A relative filename has no directory to generalize to.
+        assert!(
+            Rule::narrowest_for(
+                &ActionRef::File {
+                    path: PathBuf::from("notes.txt"),
+                    write: true
+                },
+                "cli"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn channel_of_reads_the_session_prefix() {
+        assert_eq!(channel_of("feishu:oc_abc"), "feishu");
+        assert_eq!(channel_of("telegram:123"), "telegram");
+        // A bare uuid session id is the CLI's.
+        assert_eq!(channel_of("0192f0aa-1111-7000-8000-000000000000"), "cli");
     }
 
     #[test]

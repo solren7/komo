@@ -1,10 +1,15 @@
 # PRD: opencode v2 工具体系对齐（工具集 + 执行管线 + 权限模型）
 
-Status: in-progress — 7/16 已落地（01 02 03 04 05 06 13），见 `issues/`
+Status: in-progress — 13.5/16 已落地（01 02 03 04 05 06 07 08 10 12 13 14 15，11 的 Rust 侧），见 `issues/`
 
-已落地后 komo 的工具集对 v2 的 12 个内建**已无缺失工具**，只余功能缺口：
-`webfetch` 的 format/mime 白名单（07）、`skill view` 的文件清单（08）、
-`question` 的多问多选（09）。管线（10-12、14）与权限（15）两期未动。
+**0-3 期全部完成**（地基 / 工具集 / 管线 / 权限）。剩下三项，都是用户明确
+暂不处理的：`question` 的多问多选（09，便利性）、11 的 web 渲染（`TurnEvent` 带
+structured + `ToolCalls.tsx`，两者必须同时落，否则运行中与刷新后会显示不一致）、
+附件 16（仍待 triage，卡在 rig 侧可行性）。
+
+12 落地时顺带修掉一个前置缺陷：`[[policy.rule]]` 原来必须带 `value`，所以本 PRD
+里写的 `category="shell" effect="deny"` 通配规则会被静默丢弃。现在「省略 match
+和 value」= 整类通配。
 
 ## 背景
 

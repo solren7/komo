@@ -85,7 +85,9 @@ impl CronTool {
 async fn approve_manage(ctx: &ToolContext, summary: String, kept: &str) -> Option<String> {
     let request = ApprovalRequest::normal(summary).with_scope_key("cron:manage".to_string());
     match ctx.decide(&request).await {
-        Decision::Allow => None,
+        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
+        // differently (it persists the grant).
+        Decision::Allow | Decision::AllowAlways => None,
         Decision::Deny { feedback } => Some(match feedback {
             Some(reason) => format!("Rejected by the user ({reason}); {kept}"),
             None => format!("Rejected by user; {kept}"),

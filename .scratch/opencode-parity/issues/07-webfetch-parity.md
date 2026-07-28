@@ -1,7 +1,29 @@
 # 07 — `web_fetch` 对齐：format 参数 + content-type 白名单 + 真 Markdown
 
-Status: ready-for-agent
+Status: done (2026-07-28) — `cargo test` 588 passed
 Phase: 1 工具集（小项）· 依赖: 无
+
+## 落地记录
+
+`src/tools/web_fetch.rs` 重写 fetch 路径：
+
+- `format`（`markdown` 默认 / `text` / `html`）驱动 `Accept` 头与 HTML 渲染。
+- **content-type 白名单**：raster image（SVG 除外）与非文本 mime 直接报
+  `Unsupported fetched {image,file} content type: …`，不再 lossy 解码进上下文。
+- **大小**：`Content-Length` 预检超限 → 未下载即失败；chunked 无声明长度时
+  流式累积到 256KB 并带 marker 保留首段（与 v2 的直接失败不同，故意的：
+  已经付过的下载比空手更有用）。
+- **不再自截断**：模型可见范围交给 executor 唯一的 `max_tool_result_bytes`
+  choke point（原来 8KB 自截断，`result.rs` 的注释同步修正）。
+- HTML→Markdown 用手写 `render_html`（标题 / `- ` 列表 / ``` fence / 反引号
+  行内 code / `[text](href)` / 实体解码 / pre 外空白折叠），**没有**引入
+  html5ever 系依赖 —— 单二进制分发下 8 个传递依赖换不来模型理解上的差别，
+  替换点收敛在一个函数里。顺带修掉 `strip_html` 用 `to_lowercase()` 建索引的
+  隐性字节漂移（改 `to_ascii_lowercase()`，长度恒等）。
+- 新增 `http(s)` scheme 校验（`file://` 之类当场报错）。
+
+验证：15 个单测，其中 3 个跑真实 loopback socket（PDF 拒绝 / HTML→markdown 与
+raw / `Content-Length` 超限提前失败）。
 
 ## 目标
 

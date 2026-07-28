@@ -53,6 +53,9 @@ pub enum Answer {
     Once,
     /// Allow this action and remember its scope key for the rest of the session.
     Session,
+    /// Allow, and save a narrow rule so this kind of action stops asking in
+    /// future sessions too (`~/.komo/permissions.json`).
+    Always,
     /// Refuse. `/deny <理由>` carries the reason through to the model (see
     /// [`Decision`]) so the next round can correct the call rather than repeat it.
     Deny(Option<String>),
@@ -342,7 +345,8 @@ impl Approver for ChatApprover {
             return Decision::Allow;
         }
 
-        if let Err(error) = ctx.sink.send(&prompt(request)).await {
+        let channel = crate::domain::policy::channel_of(&ctx.session_id);
+        if let Err(error) = ctx.sink.send(&prompt(request, &channel)).await {
             warn!(%error, "failed to send approval prompt; denying");
             return Decision::deny();
         }
@@ -358,6 +362,16 @@ impl Approver for ChatApprover {
                 }
                 Decision::Allow
             }
+            Ok(Ok(Answer::Always)) => {
+                // Cache for the session too: the saved rule is narrow, so a
+                // near-miss later in this conversation shouldn't re-prompt after
+                // the user already said "always". `PolicyApprover` is what turns
+                // this into a persisted grant.
+                if let Some(key) = &request.scope_key {
+                    self.state.remember(&ctx.session_id, key);
+                }
+                Decision::AllowAlways
+            }
             Ok(Ok(Answer::Deny(feedback))) => Decision::Deny { feedback },
             // The sender was dropped (superseded / cleared).
             Ok(Err(_)) => Decision::deny(),
@@ -370,7 +384,7 @@ impl Approver for ChatApprover {
     }
 }
 
-fn prompt(request: &ApprovalRequest) -> String {
+fn prompt(request: &ApprovalRequest, channel: &str) -> String {
     let mut s = match request.risk {
         Risk::Dangerous => format!("🛑 需要审批（危险操作）：{}", request.summary),
         _ => format!("⚠️ 需要审批：{}", request.summary),
@@ -382,6 +396,21 @@ fn prompt(request: &ApprovalRequest) -> String {
         "\n回复 /approve 批准本次 · /approve session 批准本会话内同类操作 · \
          /deny 拒绝（可写理由：/deny 用 trash 代替 rm）",
     );
+    // `always` is offered only when there is something to remember, and the rule
+    // text is spelled out — the operator has to see how wide the grant is before
+    // granting it. A dangerous action never offers it: the policy engine refuses
+    // to read a saved grant for one, so the option would be a lie.
+    if request.risk == Risk::Normal
+        && let Some(rule) = request
+            .action
+            .as_ref()
+            .and_then(|a| crate::domain::policy::Rule::narrowest_for(a, channel))
+    {
+        s.push_str(&format!(
+            "\n· /approve always 以后都允许，将保存规则：{}",
+            rule.describe()
+        ));
+    }
     s
 }
 
@@ -451,6 +480,7 @@ pub fn classify(text: &str) -> Command {
         "/new" | "/clear" | "/reset" => Command::New,
         "/approve" | "/yes" | "/y" | "/ok" => Command::Approve(Answer::Once),
         "/approve session" | "/approve all" => Command::Approve(Answer::Session),
+        "/approve always" => Command::Approve(Answer::Always),
         "/sethome" | "/home" => Command::SetHome,
         "/wechat" | "/wechat login" | "/weixin" => Command::WechatLogin,
         _ => Command::Plain(text.to_string()),
@@ -537,11 +567,14 @@ impl GatewayDispatcher {
     ) {
         match classify(&text) {
             Command::Approve(answer) => {
-                let session_wide = answer == Answer::Session;
+                let scope = answer.clone();
                 let acked = self.approvals.resolve(session_id, answer);
-                let reply = match (acked, session_wide) {
-                    (true, true) => "✅ 已批准（本会话内同类操作将自动放行）",
-                    (true, false) => "✅ 已批准",
+                let reply = match (acked, scope) {
+                    (true, Answer::Session) => "✅ 已批准（本会话内同类操作将自动放行）",
+                    (true, Answer::Always) => {
+                        "✅ 已批准，并已记住（同类操作以后不再询问，可用 `komo policy saved list` 查看）"
+                    }
+                    (true, _) => "✅ 已批准",
                     (false, _) => "当前没有待审批的操作。",
                 };
                 let _ = sink.send(reply).await;

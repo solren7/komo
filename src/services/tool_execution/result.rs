@@ -7,9 +7,10 @@
 /// tool returning tens of KB (a big file read, a full `/api/states` dump, a
 /// long web page) would otherwise flood the context window *every subsequent
 /// turn*, since the result stays in history. The cap is instance-owned
-/// executor config, sized **above** the per-tool self-caps (`web_fetch` /
-/// `homeassistant` cap themselves at 8 KB) so it only catches tools that
-/// don't self-trim.
+/// executor config, sized **above** the per-tool self-caps (`homeassistant`
+/// caps itself at 8 KB) so it only catches tools that don't self-trim.
+/// `web_fetch` deliberately does *not* self-trim — it bounds only how much it
+/// downloads (256 KB) and leaves sizing the model's view to this one place.
 pub(super) fn cap_tool_result(mut out: String, cap: usize) -> String {
     if out.len() <= cap {
         return out;

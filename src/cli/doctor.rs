@@ -184,6 +184,15 @@ fn policy_health(config: &ConfigSnapshot) {
     use crate::domain::policy::Verdict;
     let report = &config.runtime.policy;
     println!("\npolicy:");
+    // Saved grants are reported whether or not a [policy] table exists — they are
+    // accumulated at runtime, so an operator with no config can still have them.
+    let saved = crate::infra::permissions_store::PermissionsStore::load(&config.runtime.home);
+    if !saved.is_empty() {
+        println!(
+            "  {OK} {} saved grant(s) from approval prompts  (see `komo policy saved list`)",
+            saved.len()
+        );
+    }
     if !report.configured {
         println!("  {OFF} no [policy] table — Normal/Dangerous actions ask interactively");
         return;

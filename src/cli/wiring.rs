@@ -20,6 +20,7 @@ use crate::{
     infra::{
         llm::{PreambleFn, build_llm},
         memory::memory_db::MemoryDb,
+        permissions_store::PermissionsStore,
         persistence::{db::Db, kanban::KanbanDb},
         skills::FsSkillStore,
     },
@@ -28,6 +29,7 @@ use crate::{
         memory_enrichment::MemoryEnricher,
         skill_registry::SkillRegistry,
         tool_execution::{ToolExecutionConfig, ToolExecutor},
+        tool_output_store::ToolOutputStore,
     },
     tools::{
         apply_patch::ApplyPatchTool, ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
@@ -63,6 +65,11 @@ pub struct Wiring {
     /// (unlike briefing) but the same unattended policy gating. Main model, no
     /// memory enricher.
     pub cron_runtime: Arc<AgentRuntime>,
+    /// Where over-limit tool results are stored in full. Exposed so the gateway
+    /// can run the retention sweep once at startup — the store re-sweeps at most
+    /// hourly on its own, and this is deliberately not a cron schedule: expiring
+    /// a scratch file does not need to happen on the minute.
+    pub output_store: Arc<ToolOutputStore>,
 }
 
 /// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
@@ -87,17 +94,38 @@ pub async fn build(
     config.validate_agent()?;
     let model_config = &config.runtime.model;
 
+    // Approvals the operator chose to make durable (`a` at the prompt →
+    // ~/.komo/permissions.json). The store's list is *shared* with the policy, so
+    // a grant applies to the next decision without a restart.
+    let permissions = Arc::new(PermissionsStore::load(&config.runtime.home));
+    let interactive_policy = config
+        .runtime
+        .policy
+        .policy
+        .clone()
+        .with_saved(permissions.rules());
+
     // Wrap the interactive approver in the configurable permission policy
     // (roadmap §3): the policy auto-allows / hard-denies per `[policy]` rules and
     // only escalates to `approver` when it says "ask". With no `[policy]` table
     // this is the empty policy — identical to the bare interactive approver.
-    let approver = crate::agent::policy_approver::PolicyApprover::wrap(
-        config.runtime.policy.policy.clone(),
+    let approver = crate::agent::policy_approver::PolicyApprover::wrap_with_store(
+        interactive_policy,
         approver,
+        permissions.clone(),
     );
 
-    // File operations are confined to the current working directory.
-    let workspace = Arc::new(Workspace::current_dir()?);
+    // Over-limit tool output is kept in full under ~/.komo/tool-output; the model
+    // gets a head+tail preview naming the file (roadmap item 10).
+    let output_store = Arc::new(ToolOutputStore::new(
+        config.runtime.home.join("tool-output"),
+    ));
+
+    // File operations are confined to the current working directory — plus a
+    // read-only view of the store above, so a preview's path is one the `read`
+    // and `grep` tools can actually open. No write tool can reach it.
+    let workspace =
+        Arc::new(Workspace::current_dir()?.with_readonly(vec![output_store.root().to_path_buf()]));
 
     // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Mid-turn clarification (roadmap §7): the sentinel tool suspends the turn
@@ -183,7 +211,8 @@ pub async fn build(
                     .with_turn_budget(model_config.max_turn_result_bytes)
                     .with_call_timeout_secs(model_config.tool_timeout_secs),
             )
-            .with_approver(approver.clone());
+            .with_approver(approver.clone())
+            .with_output_store(output_store.clone());
             tools.register(Arc::new(TimeTool));
             tools.register(Arc::new(ReadTool::new(workspace.clone())));
             tools.register(Arc::new(WriteTool::new(workspace.clone())));
@@ -218,6 +247,14 @@ pub async fn build(
                 skills.clone(),
                 skill_store.clone(),
             )));
+            // A tool the policy denies outright never gets advertised: it would
+            // otherwise cost a schema, a prompt entry, and a whole round-trip per
+            // attempt, all to be refused. Runs before the catalog is read, so the
+            // prompt's tool list and the model's schemas agree by construction.
+            let dropped = tools.drop_policy_denied(&config.runtime.policy.policy);
+            if !dropped.is_empty() {
+                tracing::info!(tools = %dropped.join(", "), "tools withheld by a policy deny rule");
+            }
             tools
         };
 
@@ -342,6 +379,10 @@ pub async fn build(
     // policy rule. Main model (jobs can be arbitrarily complex), no memory
     // enricher (sweeps aren't fed the user's memory library), and the run ledger
     // is shared so every job execution is auditable via `komo run list`.
+    // Deliberately `wrap`, not `wrap_with_store`: saved grants were accumulated
+    // interactively and must not leak into an unattended context, where only an
+    // explicit `unattended = true` config rule may grant. (The engine enforces
+    // this again for a channel-less decision — two floors, on purpose.)
     let cron_approver = crate::agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
@@ -386,6 +427,7 @@ pub async fn build(
     // policy rule. Safe reads (web_fetch, skill view) work out of the box.
     // Sharing the run ledger (`runs: db`) makes every briefing execution
     // auditable via `komo run list`.
+    // No saved grants here either — see the cron approver above.
     let briefing_approver = crate::agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
@@ -395,7 +437,8 @@ pub async fn build(
             .with_turn_budget(model_config.max_turn_result_bytes)
             .with_call_timeout_secs(model_config.tool_timeout_secs),
     )
-    .with_approver(briefing_approver.clone());
+    .with_approver(briefing_approver.clone())
+    .with_output_store(output_store.clone());
     briefing_tools.register(Arc::new(TimeTool));
     briefing_tools.register(Arc::new(WebFetchTool::new()));
     briefing_tools.register(Arc::new(WebSearchTool::new()));
@@ -409,6 +452,7 @@ pub async fn build(
             ha.token.clone(),
         )));
     }
+    briefing_tools.drop_policy_denied(&config.runtime.policy.policy);
     let briefing_tool_names = briefing_tools
         .definitions()
         .iter()
@@ -443,6 +487,7 @@ pub async fn build(
         clarify,
         briefing_runtime,
         cron_runtime,
+        output_store,
     })
 }
 

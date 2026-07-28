@@ -323,6 +323,22 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
         } else {
             println!("      error  {}", oneline(&s.error, 120));
         }
+        // The tool's machine-readable view, when it has one. Indented JSON: this
+        // is the operator surface, and `shell`'s exit code or an `edit`'s line
+        // counts are the point of reading a step at all.
+        if !s.structured.is_null() {
+            let rendered = serde_json::to_string_pretty(&s.structured)
+                .unwrap_or_else(|_| s.structured.to_string());
+            for (i, line) in rendered.lines().enumerate() {
+                let label = if i == 0 { "struct" } else { "      " };
+                println!("      {label} {line}");
+            }
+        }
+        // Where the elided middle went, for a result too large to hand the model
+        // whole — this is the way back to what the preview cut.
+        for path in &s.output_paths {
+            println!("      output {path}");
+        }
     }
     Ok(())
 }

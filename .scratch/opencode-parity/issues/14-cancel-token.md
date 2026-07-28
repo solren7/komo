@@ -1,7 +1,48 @@
 # 14 — `ctx.cancel`：协作式取消能打断正在执行的工具
 
-Status: ready-for-agent
+Status: done (2026-07-28) — `cargo test` 607 passed
 Phase: 2 管线 · 依赖: 13（shell 是最需要被打断的工具）
+
+## 落地记录
+
+与 issue 设计的三处偏差，都是为了不产生半成品文件：
+
+1. **executor 不做全局 race**。issue 写「executor spawn 时把 `tool.call()` 与
+   `token.cancelled()` race」—— 但那会作用于**所有**工具，包括 `apply_patch`
+   （多文件顺序写，文件之间有 await 点）。主动在两个文件之间中断，等于把一个本会
+   完成的 patch 变成半应用的仓库：超时导致的部分应用是不得已，取消导致的是自找。
+   改成 executor 只把信号暴露给工具（`ToolContext::cancelled()`），认领的工具
+   自己在安全点 `select!`。
+2. **`apply_patch` 不认领**（issue 原本列为第 3 优先）。理由同上；patch 是毫秒级
+   本地写入，没人需要中断它。`write`/`edit` 也不认领 —— 顺带核实过它们其实**安全**：
+   `file_mutation::write_if_unchanged` 走 `tokio::fs::write`，内部是一次
+   `spawn_blocking(std::fs::write)`，取消只取消*等待*，syscall 在 blocking 线程里
+   跑完，不会写半个文件。但没有收益，所以不改。
+3. **不加 `tokio-util` 依赖**。`CancelSignal::cancelled()` 本身就是 `async fn`，
+   直接 `select!` 即可；`CancellationToken` 是多余的一层。`ToolContext::cancelled()`
+   在无信号时 `std::future::pending()`，所以 sweeps/cron/aux 的那条 select 分支
+   是惰性的，不会立刻胜出。
+
+认领范围：`shell`（`killpg` 整个进程组，复用 13 的 kill 逻辑）+ `web_fetch` /
+`web_search`（drop 请求即断连，纯读无副作用）。
+
+`shell` 的 race 现在是三路：命令自己的 `timeout`（报给模型，可加大重试）、取消
+（返回 `ToolError::Failed(Cancelled)`）、正常结束。取消的措辞与 run 级一致
+（`CANCELLED_ERROR`），且重试分类器把它判为 terminal —— 这点很关键，因为
+`web_fetch` 是 `idempotent`，不然一次取消会变成三次尝试。
+
+**被杀的命令自己可能在写文件**（`cargo build` 写 target/）—— 这和用户按 Ctrl-C
+完全一样，是杀进程固有的，也是用户主动要求的。
+
+顺带发现一个**既存**行为（未改）：executor 的超时路径本来就 `abort()`，所以一个
+超时的 `apply_patch` 现在就可能在文件之间被打断。
+
+验证：`shell` 两个测试（取消 → 5s 内返回、错误措辞是 `cancelled by user`、
+backgrounded 子进程的 marker 文件不出现；无信号的 turn 行为不变）+ executor 一个
+（认领取消的工具只被调用一次、step 记 `ok=false` / `error=cancelled by user`）。
+另外确认 `infra/messaging/api.rs:598` 给**每个** api turn 都挂了信号，所以这条路
+在 GUI / `komo chat` over gateway 上真的可达。AGENTS.md 与 `domain/cancel.rs`
+的「不停止已在执行的工具调用」段落已改写。
 
 ## 目标
 

@@ -8,10 +8,22 @@ use tokio::io::AsyncReadExt;
 
 use crate::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
+    cancel::Cancelled,
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
+
+/// Why the command stopped being waited on. Both outcomes kill the process
+/// group; they differ in what the caller is told.
+enum Interrupt {
+    /// The command's own `timeout` elapsed — reported to the model, which can
+    /// retry with a bigger one.
+    Timeout,
+    /// The user stopped the turn. Nothing will read a reply, so this ends the
+    /// call as an error the ledger records.
+    Cancelled,
+}
 
 /// Command substrings treated as high-risk. Matching commands are flagged as
 /// dangerous in the approval prompt.
@@ -385,7 +397,14 @@ impl Tool for ShellTool {
             let status = child.wait().await;
             (out, err, status)
         };
-        let outcome = tokio::time::timeout(timeout, run).await;
+        // Two ways to lose the race, and both kill the group: the command's own
+        // budget elapsed, or the user asked to stop the turn. `shell` is the tool
+        // that most needs the second one — interrupting a ten-minute build should
+        // actually end the build, not just stop waiting for it.
+        let outcome = tokio::select! {
+            r = tokio::time::timeout(timeout, run) => r.map_err(|_| Interrupt::Timeout),
+            _ = ctx.cancelled() => Err(Interrupt::Cancelled),
+        };
 
         let (out_bytes, err_bytes, status, timed_out) = match outcome {
             Ok((out, err, status)) => {
@@ -394,11 +413,18 @@ impl Tool for ShellTool {
                 })?;
                 (out, err, Some(status), false)
             }
-            Err(_) => {
-                // Kill the whole group: `sh` alone would leave its children
-                // running (and holding the pipes) forever.
+            // Kill the whole group: `sh` alone would leave its children
+            // running (and holding the pipes) forever.
+            Err(Interrupt::Timeout) => {
                 kill_group(pgid);
                 (Vec::new(), Vec::new(), None, true)
+            }
+            Err(Interrupt::Cancelled) => {
+                kill_group(pgid);
+                // The turn is already ending, so nothing will read a reply — the
+                // point of returning an error is the ledger, which records this
+                // step with the same wording as the run's own cancellation.
+                return Err(ToolError::Failed(Cancelled.into()));
             }
         };
 
@@ -586,6 +612,78 @@ mod tests {
             !marker.exists(),
             "a process started by the command survived the timeout"
         );
+    }
+
+    /// A [`CancelSignal`] that fires after a delay — a stand-in for the user
+    /// hitting stop mid-command.
+    struct CancelAfter(std::time::Duration);
+    #[async_trait::async_trait]
+    impl crate::domain::cancel::CancelSignal for CancelAfter {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        async fn cancelled(&self) {
+            tokio::time::sleep(self.0).await;
+        }
+    }
+
+    /// What 14 is actually for: cancelling a turn ends the *command*, not just
+    /// komo's wait for it. Same orphan-marker shape as the timeout test — the
+    /// backgrounded child must never get to write.
+    #[tokio::test]
+    async fn cancelling_the_turn_kills_the_command_and_its_children() {
+        let dir = scratch("cancel");
+        let marker = dir.join("alive.txt");
+        let tool = ShellTool::new(workspace());
+        // Tighter than the timeout test's timings on purpose: this test holds a
+        // runtime while it sleeps, and the whole suite runs concurrently.
+        let command = format!(
+            "(sleep 0.5; echo alive > {}) & sleep 30",
+            marker.to_string_lossy()
+        );
+        let session = SessionContext::detached("cli:test")
+            .with_cancel(Arc::new(CancelAfter(std::time::Duration::from_millis(100))));
+        let ctx = ToolContext::new(session, None, Arc::new(AlwaysApprove));
+
+        let started = std::time::Instant::now();
+        // A generous `timeout` so the command's own budget can't be what ends it.
+        let err = tool
+            .call(json!({ "command": command, "timeout": 60_000 }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel should land promptly, took {:?}",
+            started.elapsed()
+        );
+        // The ledger wording matches the run's own cancellation, so a step and
+        // its run don't describe the same stop two different ways.
+        assert_eq!(
+            err.to_string(),
+            crate::domain::cancel::CANCELLED_ERROR,
+            "{err}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        assert!(
+            !marker.exists(),
+            "a process started by the command survived cancellation"
+        );
+    }
+
+    /// Without a cancel signal (sweeps, cron, aux) the new `select!` arm must be
+    /// inert — a turn nobody can interrupt behaves exactly as before.
+    #[tokio::test]
+    async fn a_turn_with_no_cancel_signal_runs_normally() {
+        let tool = ShellTool::new(workspace());
+        let out = tool
+            .call(
+                json!({ "command": "echo hi" }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("hi"), "{}", out.text);
     }
 
     #[tokio::test]

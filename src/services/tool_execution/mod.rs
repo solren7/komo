@@ -32,8 +32,10 @@ pub use context::{
 use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::events::TurnEvent;
 use crate::domain::llm::{ToolCallReq, ToolOutcome};
+use crate::domain::policy::{Access, Category, Policy};
 use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
 use crate::domain::tool::{Tool, ToolError};
+use crate::services::tool_output_store::{Bounded, ToolOutputStore};
 
 /// Live `TurnEvent` args/result use the **ledger's** cap, not a smaller one of
 /// their own. A watcher renders a running call from the stream and the same call
@@ -61,6 +63,40 @@ const DEFAULT_MAX_TOOL_CALLS_PER_TURN: i64 = 500;
 /// short note instead — logged, never silently dropped. Set well above any
 /// legitimate parallel tool use in one round.
 const MAX_CALLS_PER_ROUND: usize = 32;
+
+/// A structured view over [`STEP_FIELD_CAP`] is replaced, not cut: half a JSON
+/// document fails to parse, so every reader would have to treat a truncated cell
+/// as corrupt. The marker keeps the cell valid and says what happened.
+fn cap_structured(structured: serde_json::Value) -> serde_json::Value {
+    if structured.is_null() {
+        return structured;
+    }
+    let rendered = structured.to_string();
+    if rendered.len() <= STEP_FIELD_CAP {
+        return structured;
+    }
+    serde_json::json!({ "_elided": "structured view over the field cap", "bytes": rendered.len() })
+}
+
+/// Which `[policy]` category (and, for files, which access kind) a tool's
+/// actions fall under — the mapping behind [`ToolExecutor::drop_policy_denied`].
+///
+/// `None` means "not subject to the permission policy": `time`, `todo`, `task`,
+/// `memory`, `skill`, … carry no [`ActionRef`], so no rule can ever deny them and
+/// they are never filtered. A tool added without an entry here defaults to that
+/// safe side — it stays advertised.
+///
+/// [`ActionRef`]: crate::domain::approval::ActionRef
+fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
+    match name {
+        "shell" => Some((Category::Shell, None)),
+        "read" | "grep" | "glob" => Some((Category::File, Some(Access::Read))),
+        "write" | "edit" | "apply_patch" => Some((Category::File, Some(Access::Write))),
+        "web_fetch" | "web_search" => Some((Category::Network, None)),
+        "homeassistant" => Some((Category::HomeAssistant, None)),
+        _ => None,
+    }
+}
 
 /// Instance-owned execution policy.
 #[derive(Debug, Clone, Copy)]
@@ -132,6 +168,9 @@ pub struct ToolExecutionCore {
     /// deny-all; wiring installs the real (policy-wrapped) approver via
     /// [`ToolExecutor::with_approver`].
     approver: Arc<dyn Approver>,
+    /// Where an over-limit result is kept in full. `None` ⇒ over-limit results
+    /// are truncated, with the tail lost — the behavior before roadmap item 10.
+    output_store: Option<Arc<ToolOutputStore>>,
 }
 
 impl ToolExecutor {
@@ -141,6 +180,7 @@ impl ToolExecutor {
                 tools: HashMap::new(),
                 config,
                 approver: Arc::new(DenyAllApprover),
+                output_store: None,
             }),
         }
     }
@@ -151,6 +191,17 @@ impl ToolExecutor {
         let core = Arc::get_mut(&mut self.core)
             .expect("set the approver during wiring, before the executor is shared");
         core.approver = approver;
+        self
+    }
+
+    /// Install the store that keeps an over-limit result in full, so the model
+    /// gets a head+tail preview and a path instead of a one-sided truncation.
+    /// Absent (tests, and any executor wiring hasn't given one) ⇒ plain
+    /// truncation, the previous behavior.
+    pub fn with_output_store(mut self, store: Arc<ToolOutputStore>) -> Self {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("set the output store during wiring, before the executor is shared");
+        core.output_store = Some(store);
         self
     }
 
@@ -166,6 +217,38 @@ impl ToolExecutor {
     /// calling). A read-only view — execution always goes through the executor.
     pub fn definitions(&self) -> Vec<Arc<dyn Tool>> {
         self.core.tools.values().cloned().collect()
+    }
+
+    /// Drop the tools `policy` denies outright, returning their names (sorted) so
+    /// wiring can log what it removed. Called during wiring, right after
+    /// registration and before the catalog is read — the prompt's tool-name list
+    /// and the model's function schemas both come from [`definitions`], so
+    /// filtering here keeps them from ever disagreeing about what exists.
+    ///
+    /// Only a wholly-denied tool goes (see [`Policy::wholly_denied`]): a tool
+    /// that *can* act, just not everywhere, stays advertised and refuses the
+    /// individual call — the model gets an explanation it can work with, which a
+    /// missing tool never is.
+    ///
+    /// [`definitions`]: Self::definitions
+    /// [`Policy::wholly_denied`]: crate::domain::policy::Policy::wholly_denied
+    pub fn drop_policy_denied(&mut self, policy: &Policy) -> Vec<String> {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("filter the catalog during wiring, before the executor is shared");
+        let mut removed: Vec<String> = core
+            .tools
+            .keys()
+            .filter(|name| {
+                policy_scope(name)
+                    .is_some_and(|(category, access)| policy.wholly_denied(category, access))
+            })
+            .cloned()
+            .collect();
+        removed.sort();
+        for name in &removed {
+            core.tools.remove(name);
+        }
+        removed
     }
 
     /// The cumulative per-turn tool-output budget this executor enforces (`0` =
@@ -289,6 +372,10 @@ impl ToolExecutionCore {
         let value = serde_json::from_str::<serde_json::Value>(&input)
             .unwrap_or_else(|_| serde_json::Value::String(input.clone()));
 
+        // Filled in by a successful call below; stays `Null` for a failure or a
+        // tool that has no structured view.
+        let mut structured = serde_json::Value::Null;
+
         // Soft tool-call budget (backstop): once this turn has reached the cap,
         // refuse further calls with an error the model sees instead of
         // executing them. Inactive without a run ledger (seq_field = -1).
@@ -406,7 +493,12 @@ impl ToolExecutionCore {
             // a genuine failure stays an `Err` so the ledger marks the step
             // failed and `execute_round` surfaces it.
             match outcome {
-                Ok(out) => Ok(out.text),
+                Ok(out) => {
+                    // The tool's machine-readable view rides to the ledger, not
+                    // to the model — it never pays tokens for it.
+                    structured = out.structured;
+                    Ok(out.text)
+                }
                 Err(ToolError::InvalidInput(m)) => Ok(format!(
                     "invalid input for tool `{name}`: {m}. \
                      Rewrite the arguments to match the tool's schema."
@@ -436,19 +528,27 @@ impl ToolExecutionCore {
             });
         }
 
+        // The ledger's view of the outcome, taken from the *original* result —
+        // the audit record keeps what the model was not shown.
+        let (ok, result_s, error_s) = match &result {
+            Ok(out) => (true, truncate(out, STEP_FIELD_CAP), String::new()),
+            Err(e) => (
+                false,
+                String::new(),
+                truncate(&format!("{e:#}"), STEP_FIELD_CAP),
+            ),
+        };
+
+        // Size the model's view. Over the cap, the full output is written out and
+        // the model gets a head+tail preview naming that file — so this has to
+        // run before the step is recorded, which is what carries the path.
+        let bounded = result.map(|out| self.bound(out, context, seq_field));
+
         // Record the step — best-effort, never affecting the tool's own result.
         // Retries collapse into this one step: the retry is a robustness
         // detail, not extra audit rows.
         if let (Some((run, seq)), Some(args)) = (ledger, redacted_args) {
             let ended_at = now();
-            let (ok, result_s, error_s) = match &result {
-                Ok(out) => (true, truncate(out, STEP_FIELD_CAP), String::new()),
-                Err(e) => (
-                    false,
-                    String::new(),
-                    truncate(&format!("{e:#}"), STEP_FIELD_CAP),
-                ),
-            };
             if ok {
                 info!(tool = name, seq, elapsed_ms, "tool ok");
             } else {
@@ -465,25 +565,59 @@ impl ToolExecutionCore {
                 started_at,
                 ended_at,
                 elapsed_ms,
+                structured: cap_structured(structured),
+                output_paths: bounded
+                    .as_ref()
+                    .map(|b| {
+                        b.output_paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             if let Err(error) = run.repo.append_step(&step).await {
                 warn!(%error, tool = name, "failed to record run step (non-fatal)");
             }
         }
 
-        // Cap the LLM-facing result *after* the ledger records the original, so
-        // the audit trail stays faithful while the model's context stays bounded.
-        // Then charge it against the turn's cumulative budget: once the turn is
-        // over budget, the result is swapped for a short note so a long tool
-        // chain can't quietly overflow the context window (the ledger still has
-        // the real result above).
-        result.map(|out| {
-            let capped = cap_tool_result(out, self.config.max_result_bytes);
-            match context.budget.admit(capped) {
-                Ok(out) => out,
-                Err(note) => note,
-            }
+        // Charge the bounded result against the turn's cumulative budget: once
+        // the turn is over budget, it is swapped for a short note so a long tool
+        // chain can't quietly overflow the context window (the ledger — and, for
+        // an over-limit result, the stored file — still have the real thing).
+        bounded.map(|b| match context.budget.admit(b.text) {
+            Ok(out) => out,
+            Err(note) => note,
         })
+    }
+
+    /// Size one result for the model: the store's head+tail preview when a store
+    /// is wired and this is a ledgered turn, else the old one-sided truncation.
+    ///
+    /// The store is skipped without a ledger seq (aux sub-agents, sweeps): those
+    /// have no run to point an operator back at and no `read`-capable follow-up
+    /// turn, so a file on disk nobody will open is just litter.
+    fn bound(&self, out: String, context: &ToolTurnContext, seq: i64) -> Bounded {
+        let cap = self.config.max_result_bytes;
+        match (&self.output_store, seq >= 0) {
+            (Some(store), true) => store.bound(
+                &context.session.session_id,
+                &format!(
+                    "{}-{seq:04}",
+                    context
+                        .run
+                        .as_ref()
+                        .map(|r| r.run_id.as_str())
+                        .unwrap_or("run")
+                ),
+                out,
+                cap,
+            ),
+            _ => Bounded {
+                text: cap_tool_result(out, cap),
+                output_paths: Vec::new(),
+            },
+        }
     }
 
     /// The trait-required fallback for a rig-driven completion (not on komo's
@@ -621,6 +755,102 @@ mod tests {
         async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text(format!("echoed: {}", arg_text(&input))))
         }
+    }
+
+    /// A stand-in registered under a real tool's name, so the catalog filter is
+    /// tested against the names it actually maps (`policy_scope`).
+    struct NamedTool(&'static str);
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "stand-in"
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    fn catalog_with(names: &[&'static str]) -> ToolExecutor {
+        let mut tools = ToolExecutor::new(ToolExecutionConfig::default());
+        for name in names {
+            tools.register(Arc::new(NamedTool(name)));
+        }
+        tools
+    }
+
+    fn wildcard_deny(category: Category, access: Option<Access>) -> Policy {
+        use crate::domain::policy::{Effect, Matcher, Rule, Verdict};
+        Policy::new(
+            vec![Rule {
+                channels: None,
+                category,
+                matcher: Matcher::Any,
+                value: String::new(),
+                access,
+                effect: Effect::Deny,
+                include_dangerous: false,
+                unattended: false,
+            }],
+            Verdict::Ask,
+        )
+    }
+
+    const FILE_AND_SHELL: &[&str] = &[
+        "read",
+        "grep",
+        "glob",
+        "write",
+        "edit",
+        "apply_patch",
+        "shell",
+        "time",
+        "memory",
+    ];
+
+    #[test]
+    fn a_wholly_denied_tool_leaves_the_catalog() {
+        let mut tools = catalog_with(FILE_AND_SHELL);
+        assert_eq!(
+            tools.drop_policy_denied(&wildcard_deny(Category::Shell, None)),
+            vec!["shell".to_string()]
+        );
+        let left: std::collections::BTreeSet<String> = tools
+            .definitions()
+            .iter()
+            .map(|t| t.name().into())
+            .collect();
+        assert!(!left.contains("shell"));
+        assert!(left.contains("read"), "only the denied tool goes");
+        assert!(left.contains("time"));
+    }
+
+    /// Banning writes must not take the readers away — the file category is the
+    /// one that splits, and losing `read`/`grep` here would blind the model.
+    #[test]
+    fn denying_file_writes_keeps_the_readers() {
+        let mut tools = catalog_with(FILE_AND_SHELL);
+        let dropped = tools.drop_policy_denied(&wildcard_deny(
+            Category::File,
+            Some(crate::domain::policy::Access::Write),
+        ));
+        assert_eq!(dropped, vec!["apply_patch", "edit", "write"]);
+        let left: std::collections::BTreeSet<String> = tools
+            .definitions()
+            .iter()
+            .map(|t| t.name().into())
+            .collect();
+        assert!(left.contains("read") && left.contains("grep") && left.contains("glob"));
+        assert!(left.contains("shell"), "shell is its own category");
+    }
+
+    #[test]
+    fn an_empty_policy_drops_nothing() {
+        let mut tools = catalog_with(FILE_AND_SHELL);
+        assert!(tools.drop_policy_denied(&Policy::default()).is_empty());
+        assert_eq!(tools.definitions().len(), FILE_AND_SHELL.len());
     }
 
     struct SecretTool;
@@ -928,6 +1158,202 @@ mod tests {
         async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("x".repeat(10_000)))
         }
+    }
+
+    /// A structured view rides to the ledger and nowhere near the model — the
+    /// whole point of the third view is that the context window doesn't pay for it.
+    struct StructuredTool;
+    #[async_trait]
+    impl Tool for StructuredTool {
+        fn name(&self) -> &'static str {
+            "structured"
+        }
+        fn description(&self) -> &'static str {
+            "returns a structured view"
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("done")
+                .with_structured(serde_json::json!({ "exit": 0, "truncated": false })))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_structured_view_reaches_the_ledger_but_not_the_model() {
+        let repo = RecordingRuns::new();
+        let executor = executor(
+            vec![Arc::new(StructuredTool)],
+            ToolExecutionConfig::default(),
+        );
+        let out = one(&executor, call("structured", "{}"), &ledgered(repo.clone())).await;
+
+        assert_eq!(out.content, "done", "the model sees text only");
+        let steps = repo.steps.lock().unwrap();
+        assert_eq!(
+            steps[0].structured,
+            serde_json::json!({ "exit": 0, "truncated": false })
+        );
+    }
+
+    /// A tool that claims the cancel signal (as `shell` does) ends the call, and
+    /// the step it leaves must read like the run's own stop — one wording for one
+    /// event — and must **not** be retried: a deliberate stop is not a transient
+    /// failure, and `web_fetch` is `idempotent`, so the classifier is what stands
+    /// between a cancel and two more attempts.
+    #[tokio::test]
+    async fn a_claimed_cancel_ends_the_call_once_and_reads_as_cancelled() {
+        use crate::domain::cancel::{CANCELLED_ERROR, CancelSignal, Cancelled};
+
+        struct AlreadyCancelled;
+        #[async_trait]
+        impl CancelSignal for AlreadyCancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+            async fn cancelled(&self) {}
+        }
+
+        /// Waits for the signal like `shell` does, counting attempts.
+        struct Claiming(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Tool for Claiming {
+            fn name(&self) -> &'static str {
+                "claiming"
+            }
+            fn description(&self) -> &'static str {
+                "waits for cancellation"
+            }
+            fn idempotent(&self) -> bool {
+                true
+            }
+            async fn call(
+                &self,
+                _input: Value,
+                ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                ctx.cancelled().await;
+                Err(ToolError::Failed(Cancelled.into()))
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let repo = RecordingRuns::new();
+        let executor = executor(
+            vec![Arc::new(Claiming(attempts.clone()))],
+            ToolExecutionConfig::default(),
+        );
+        let context = ToolTurnContext {
+            session: SessionContext::detached("cli:test").with_cancel(Arc::new(AlreadyCancelled)),
+            run: Some(RunContext::new("run-1".into(), repo.clone())),
+            budget: TurnResultBudget::unlimited(),
+        };
+
+        let out = one(&executor, call("claiming", "{}"), &context).await;
+        assert!(out.content.contains(CANCELLED_ERROR), "{}", out.content);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "a cancel is terminal");
+        let steps = repo.steps.lock().unwrap();
+        assert!(!steps[0].ok);
+        assert_eq!(steps[0].error, CANCELLED_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_records_no_structured_view() {
+        let repo = RecordingRuns::new();
+        let executor = executor(
+            vec![Arc::new(PanickingTool)],
+            ToolExecutionConfig::default(),
+        );
+        one(&executor, call("boom", "{}"), &ledgered(repo.clone())).await;
+        let steps = repo.steps.lock().unwrap();
+        assert!(!steps[0].ok);
+        assert!(steps[0].structured.is_null());
+    }
+
+    #[test]
+    fn an_oversized_structured_view_is_replaced_rather_than_cut() {
+        let big = serde_json::json!({ "blob": "x".repeat(STEP_FIELD_CAP) });
+        let capped = cap_structured(big);
+        assert!(capped["_elided"].is_string(), "{capped}");
+        // Still valid JSON — a reader must never have to handle half a document.
+        assert!(capped.is_object());
+        // Under the cap it passes through untouched.
+        let small = serde_json::json!({ "exit": 1 });
+        assert_eq!(cap_structured(small.clone()), small);
+        assert!(cap_structured(serde_json::Value::Null).is_null());
+    }
+
+    /// 10's core promise: an over-limit result keeps its tail, the full text is on
+    /// disk, and the step says where.
+    #[tokio::test]
+    async fn an_over_limit_result_is_stored_and_previewed_with_its_path_on_the_step() {
+        struct Chatty;
+        #[async_trait]
+        impl Tool for Chatty {
+            fn name(&self) -> &'static str {
+                "chatty"
+            }
+            fn description(&self) -> &'static str {
+                "returns many lines"
+            }
+            async fn call(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text(
+                    (0..400).map(|i| format!("line {i}\n")).collect::<String>(),
+                ))
+            }
+        }
+
+        let root = std::env::temp_dir().join("komo_exec_output_store");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(crate::services::tool_output_store::ToolOutputStore::new(
+            root.clone(),
+        ));
+        let repo = RecordingRuns::new();
+        let mut executor = ToolExecutor::new(ToolExecutionConfig {
+            max_result_bytes: 512,
+            ..Default::default()
+        })
+        .with_output_store(store);
+        executor.register(Arc::new(Chatty));
+
+        let out = one(&executor, call("chatty", "{}"), &ledgered(repo.clone())).await;
+        assert!(out.content.contains("line 0"));
+        assert!(out.content.contains("line 399"), "the tail must survive");
+
+        let steps = repo.steps.lock().unwrap();
+        let stored = &steps[0].output_paths[0];
+        assert!(out.content.contains(stored), "the preview names the file");
+        assert!(
+            std::fs::read_to_string(stored)
+                .unwrap()
+                .contains("line 200")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No ledger (aux sub-agent, a sweep) ⇒ no file: there is no run to point an
+    /// operator at and no follow-up turn to `read` it, so it would be litter.
+    #[tokio::test]
+    async fn an_unledgered_call_truncates_instead_of_storing() {
+        let root = std::env::temp_dir().join("komo_exec_output_store_unledgered");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(crate::services::tool_output_store::ToolOutputStore::new(
+            root.clone(),
+        ));
+        let mut executor = ToolExecutor::new(ToolExecutionConfig {
+            max_result_bytes: 1024,
+            ..Default::default()
+        })
+        .with_output_store(store);
+        executor.register(Arc::new(BigTool));
+
+        let out = one(&executor, call("big", "{}"), &unledgered()).await;
+        assert!(out.content.contains("truncated"));
+        assert!(!root.exists(), "nothing should be written without a ledger");
     }
 
     #[tokio::test]

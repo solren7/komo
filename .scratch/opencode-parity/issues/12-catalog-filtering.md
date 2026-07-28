@@ -1,7 +1,34 @@
 # 12 — 按 policy 过滤工具目录（整只被 deny 的工具不进 schema）
 
-Status: ready-for-agent
+Status: done (2026-07-28) — `cargo test` 588 passed
 Phase: 2 管线 · 依赖: 无（改动小，收益直接）
+
+## 落地记录
+
+与 issue 设计的**偏差（有意）**：没有做 `definitions_for(channel)`。
+
+原因：rig 0.40 的工具 schema 在 `build_llm` 构造 agent 时就烘进去了，按 channel
+变化要走它的 `RequestPatch::active_tools` hook 机制，同时 prompt 工厂也得接
+channel 参数 —— 两处新增可变性，换来的只是"channel-scoped deny 规则也能摘工具"。
+按 issue 自己写的保守原则（拿不准就保留），channel-scoped deny 本就该保留工具。
+
+实际做法：`Policy::wholly_denied(category, access)` 纯函数 +
+`ToolExecutor::drop_policy_denied(&policy)`，wiring 在注册完、读目录前调用一次。
+prompt 的工具名单和 schema 都从同一份过滤后的 `definitions()` 出，**结构上**
+不可能不一致；一次性过滤也不动 cache-stable 层。
+
+配套修掉一个**前置缺陷**：`build_rule` 原来把 `value` 为空的规则整条丢弃，所以
+issue 验收里写的 `category="shell" effect="deny"`（无 match）根本进不了 policy。
+现在「同时省略 `match` 和 `value`」= `Matcher::Any` 通配；「有 match 但 value 空」
+仍然无效（把 `prefix ""` 读成"全部"是最糟的发现 typo 的方式）。`komo policy list`
+把通配规则显示成 `any (whole category)`。
+
+名字→category 映射是 `tool_execution::policy_scope`；表里没有的工具永不过滤。
+
+验证：policy 纯函数 3 个单测 + executor 3 个 + config 解析 2 个；另外用临时
+`KOMO_HOME` 起真 gateway 确认日志 `tools withheld by a policy deny rule
+tools=apply_patch, edit, shell, write`（同一份 config 里 network 是 value-scoped
+deny，`web_fetch` 如预期保留）。
 
 ## 目标
 

@@ -1,7 +1,37 @@
 # 11 — `structured` + `output_paths` 落 `RunStep`（additive 迁移）
 
-Status: ready-for-agent
+Status: partly done (2026-07-28) — Rust 侧完成；web 渲染 + TurnEvent 字段仍未做
 Phase: 2 管线 · 依赖: 10（output_paths 来源）· 建议与 10 同批提交
+
+## 落地记录
+
+`STEP_COLUMNS` 加 `structured` / `output_paths` 两个 additive 列，`RunStep` 加
+对应字段（`structured: serde_json::Value`、`output_paths: Vec<String>`，都
+`#[serde(default)]`）。db 侧映射：`Value::Null` ⇄ 空串（不存 `"null"` 四个字节，
+这样"工具没有 structured"和"列存在之前写的行"读起来一样）、`Vec` ⇄ 换行分隔。
+解析失败也读成 `Null`：ledger 是审计记录，一个坏 cell 不该让整次读取失败。
+
+**cap 语义与 issue 不同**：structured 超过 `STEP_FIELD_CAP` 时**整体替换**成
+`{"_elided": …, "bytes": N}`，不截断 —— 截断后的 JSON 解析不了，等于逼每个读侧把
+它当损坏数据处理。
+
+executor 里 `ToolOutput.structured` 原来在 `Ok(out) => Ok(out.text)` 处被丢掉，
+现在捕获到局部变量再落 step；模型看到的仍然只有 text（第三视图的意义就是不烧 token）。
+
+`komo run inspect` 渲染缩进 JSON + 输出文件路径。
+
+### 未做（有意，需要一起落）
+
+`TurnEvent::ToolFinished` **没有**加 `structured`，`apps/app` 的 tool-call 折叠区
+也没渲染。原因：assistant-ui 的 tool-call part 形状里没有第三视图的位置，要么改
+vendored kit 要么另开通道；而 issue 自己写明 live 与 ledger 必须一致 —— 只加 wire
+字段不渲染是死字段，只渲染 ledger 不改 event 就会出现"运行中一种、刷新后另一种"的
+跳变。所以两者作为一个单元留到 UI 侧一起做，现在 web 端行为完全未变（无跳变风险）。
+
+验证：db roundtrip 断言两列往返 + 空值读成 `Null`；executor 3 个测试
+（structured 到 ledger 不到模型 / 失败调用不记 structured / 超限替换）；
+用**改动前的二进制**建的 state.db 跑 `komo skills audit`（`steps_by_tool` 会
+SELECT 全部 step 列）成功返回 → additive 迁移在旧库上生效，无需删库。
 
 ## 目标
 

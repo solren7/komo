@@ -143,6 +143,35 @@ mod tests {
         )
     }
 
+    /// komo's managed tool-output store is readable (see `read`) but must never
+    /// be writable — a read-only root widens reads only, and an approving
+    /// approver must not change that: it is a floor, not a prompt.
+    #[tokio::test]
+    async fn refuses_to_write_into_a_readonly_managed_root() {
+        let base = std::env::temp_dir().join("komo_write_managed");
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace_dir = base.join("project");
+        let managed = base.join("tool-output");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+
+        let tool = WriteTool::new(Arc::new(
+            Workspace::new(vec![workspace_dir]).with_readonly(vec![managed.clone()]),
+        ));
+        let target = managed.join("sneaky.txt");
+        let err = tool
+            .call(
+                json!({ "path": target.display().to_string(), "content": "x" }),
+                &approving_ctx("cli:t"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!target.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn creates_then_overwrites() {
         let (tool, dir) = tool_in("roundtrip");

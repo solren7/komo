@@ -96,6 +96,15 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     )
     .await?;
 
+    // Expire stored tool outputs once, here. Not a `Maintenance` sweep on
+    // purpose: the list of scheduled sweeps is long already, and a scratch file
+    // living a few hours past its week costs nothing (the store also re-sweeps
+    // at most hourly whenever it writes).
+    match wired.output_store.sweep() {
+        0 => {}
+        n => tracing::info!(removed = n, "expired stored tool outputs"),
+    }
+
     let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
         review: wired.review.clone(),
     });

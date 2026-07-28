@@ -23,6 +23,23 @@ pub struct SkillRegistry {
     static_skills: Vec<Skill>,
 }
 
+/// A resolved skill together with where it lives, so `skill view` can tell the
+/// model the base directory its relative paths (`scripts/`, `references/`)
+/// resolve against — without that, a SKILL.md saying "run scripts/foo.py" is
+/// unactionable.
+pub struct LocatedSkill {
+    pub skill: Skill,
+    /// The skill's own directory (the one holding its `SKILL.md`). `None` only
+    /// for a static registry, which never touched disk.
+    pub dir: Option<PathBuf>,
+}
+
+/// How many directory entries [`skill_files`] will look at before giving up.
+/// A skill directory is meant to hold a handful of scripts and references; the
+/// budget is only there so a stray checkout under one can't turn a `view` into
+/// a filesystem crawl.
+const WALK_BUDGET: usize = 1000;
+
 impl SkillRegistry {
     /// A static registry over a fixed skill list — never re-scans disk.
     /// Test-only: production builds the live, disk-backed registry via
@@ -50,23 +67,36 @@ impl SkillRegistry {
     /// The current skills, sorted by name. Live-scans `dirs` when set (first
     /// directory wins on a name clash), otherwise returns the static list.
     fn snapshot(&self) -> Vec<Skill> {
+        self.snapshot_located()
+            .into_iter()
+            .map(|located| located.skill)
+            .collect()
+    }
+
+    /// [`snapshot`](Self::snapshot) keeping each skill's directory.
+    fn snapshot_located(&self) -> Vec<LocatedSkill> {
         if self.dirs.is_empty() {
-            return self.static_skills.clone();
+            return self
+                .static_skills
+                .iter()
+                .cloned()
+                .map(|skill| LocatedSkill { skill, dir: None })
+                .collect();
         }
         let mut skills = Vec::new();
         let mut seen = HashSet::new();
         for dir in &self.dirs {
-            for skill in Self::scan_dir(dir) {
-                if seen.insert(skill.name.clone()) {
-                    skills.push(skill);
+            for located in Self::scan_dir(dir) {
+                if seen.insert(located.skill.name.clone()) {
+                    skills.push(located);
                 }
             }
         }
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills.sort_by(|a, b| a.skill.name.cmp(&b.skill.name));
         skills
     }
 
-    fn scan_dir(dir: &Path) -> Vec<Skill> {
+    fn scan_dir(dir: &Path) -> Vec<LocatedSkill> {
         let mut skills = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
             debug!(?dir, "no skills directory; skipped");
@@ -81,7 +111,10 @@ impl SkillRegistry {
                 Ok(content) => match Skill::parse(&content) {
                     Some(skill) => {
                         debug!(name = %skill.name, ?dir, "loaded skill");
-                        skills.push(skill);
+                        skills.push(LocatedSkill {
+                            skill,
+                            dir: Some(entry.path()),
+                        });
                     }
                     None => warn!(?manifest, "SKILL.md missing valid frontmatter; skipped"),
                 },
@@ -113,8 +146,10 @@ impl SkillRegistry {
 
     /// Look up by name, including disabled skills — the `skill` tool answers a
     /// `view` on a disabled skill with its state rather than "not found".
-    pub fn get(&self, name: &str) -> Option<Skill> {
-        self.snapshot().into_iter().find(|s| s.name == name)
+    pub fn get(&self, name: &str) -> Option<LocatedSkill> {
+        self.snapshot_located()
+            .into_iter()
+            .find(|located| located.skill.name == name)
     }
 
     /// No usable (enabled) skills — gates the system-prompt catalog note.
@@ -131,6 +166,45 @@ impl SkillRegistry {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// Up to `limit` asset paths inside a skill directory (`scripts/foo.py`,
+/// `references/api.md`, …), recursive, sorted, absolute where the OS allows it,
+/// and excluding the `SKILL.md` manifest itself. `.git` is skipped, matching
+/// what the installer copies.
+///
+/// The result is deliberately a **sample**: callers must say so rather than let
+/// the model read it as the complete inventory.
+pub fn skill_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > WALK_BUDGET {
+                pending.clear();
+                break;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if entry.file_name() != ".git" {
+                    pending.push(path);
+                }
+            } else if entry.file_name() != "SKILL.md" {
+                files.push(std::path::absolute(&path).unwrap_or(path));
+            }
+        }
+    }
+    files.sort();
+    files.truncate(limit);
+    files
 }
 
 #[cfg(test)]
@@ -150,7 +224,10 @@ mod tests {
 
         let reg = SkillRegistry::load_from_dirs(std::slice::from_ref(&dir));
         assert_eq!(reg.catalog().lines().count(), 1);
-        assert_eq!(reg.get("greet").unwrap().description, "Say hello nicely");
+        assert_eq!(
+            reg.get("greet").unwrap().skill.description,
+            "Say hello nicely"
+        );
         assert!(reg.catalog().contains("greet: Say hello nicely"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -182,7 +259,7 @@ mod tests {
         // No reconstruction — the same registry now sees it.
         assert!(!reg.is_empty());
         assert_eq!(
-            reg.get("late").unwrap().description,
+            reg.get("late").unwrap().skill.description,
             "Arrived after startup"
         );
         assert!(reg.catalog().contains("late: Arrived after startup"));
@@ -201,7 +278,7 @@ mod tests {
             disabled: false,
             source: "user".into(),
         }]);
-        assert_eq!(reg.get("fixed").unwrap().instructions, "b");
+        assert_eq!(reg.get("fixed").unwrap().skill.instructions, "b");
         assert!(reg.catalog().contains("fixed"));
     }
 
@@ -229,7 +306,7 @@ mod tests {
         assert!(!reg.catalog().contains("paused"));
         assert!(!reg.is_empty());
         // Still resolvable so the `skill` tool can explain its state.
-        assert!(reg.get("paused").unwrap().disabled);
+        assert!(reg.get("paused").unwrap().skill.disabled);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -249,6 +326,30 @@ mod tests {
     }
 
     #[test]
+    fn skill_files_samples_assets_recursively_and_excludes_the_manifest() {
+        let dir = std::env::temp_dir().join("komo_skill_files_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: s\n---\nbody").unwrap();
+        std::fs::write(dir.join("scripts/foo.py"), "print(1)").unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]").unwrap();
+
+        let files = skill_files(&dir, 10);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].ends_with("scripts/foo.py"));
+        assert!(files[0].is_absolute());
+
+        // The cap is a sample, not a filter: 12 assets ⇒ the first 10 by path.
+        for i in 0..12 {
+            std::fs::write(dir.join(format!("ref{i:02}.md")), "x").unwrap();
+        }
+        assert_eq!(skill_files(&dir, 10).len(), 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn first_directory_wins_on_name_collision() {
         let base = std::env::temp_dir().join("komo_skill_dirs_test");
         let local = base.join("local");
@@ -265,7 +366,7 @@ mod tests {
 
         let reg = SkillRegistry::load_from_dirs(&[local.clone(), global.clone()]);
         assert_eq!(reg.catalog().lines().count(), 1);
-        assert!(reg.get("dup").unwrap().instructions.contains("LOCAL"));
+        assert!(reg.get("dup").unwrap().skill.instructions.contains("LOCAL"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

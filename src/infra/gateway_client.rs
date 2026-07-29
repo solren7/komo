@@ -10,9 +10,10 @@
 //! directly (today's path). The read methods return the **domain types** the
 //! endpoints serialize verbatim, so the existing CLI renderers are reused.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::Context;
+use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -20,6 +21,7 @@ use crate::domain::{
     cron::{CronJob, CronJobSpec},
     events::TurnEvent,
     memory::Memory,
+    message::Message,
     reminder::Reminder,
     run::{Run, RunStep},
     task::Task,
@@ -35,6 +37,50 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// The liveness probe must be quick: a stale rendezvous file (crashed gateway)
 /// should fall back to the db fast, not hang the CLI.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Encode a locally chosen directory for the gateway's workspace header.
+///
+/// The gateway accepts this form only from loopback callers, canonicalizes it,
+/// and persists the resulting opaque id when the session is first created.  It
+/// deliberately carries a path as base64url rather than exposing path syntax in
+/// an HTTP header (which also keeps Unicode paths valid).
+pub fn folder_workspace_id(dir: &Path) -> anyhow::Result<String> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("cannot resolve workspace `{}`", dir.display()))?;
+    if !dir.is_dir() {
+        anyhow::bail!("workspace `{}` is not a directory", dir.display());
+    }
+    let path = dir
+        .to_str()
+        .context("workspace path is not valid UTF-8")?;
+    Ok(format!(
+        "folder:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_bytes())
+    ))
+}
+
+/// Resolve a persisted `folder:` workspace identity back to its canonical local
+/// directory. Invalid or no-longer-existing folders deliberately have no
+/// workspace rather than widening a resumed session to the caller's cwd.
+pub fn folder_workspace_path(id: &str) -> Option<std::path::PathBuf> {
+    let encoded = id.strip_prefix("folder:")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    let path = std::path::PathBuf::from(String::from_utf8(bytes).ok()?);
+    let path = path.canonicalize().ok()?;
+    path.is_dir().then_some(path)
+}
+
+/// Convert a persisted API session id into the client-facing header value.
+///
+/// `api:` is Komo's internal channel namespace; callers of the HTTP API only
+/// need to send their UUID. The gateway still accepts the old prefixed form so
+/// previously persisted browser state remains compatible.
+fn api_session_header_value(session_id: &str) -> &str {
+    session_id.trim_start_matches("api:")
+}
 
 pub struct GatewayClient {
     base: String,
@@ -182,6 +228,27 @@ impl GatewayClient {
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         self.get_field("/api/sessions", "sessions").await
+    }
+
+    /// Transcript entries for one known session, used to hydrate a resumed TUI.
+    pub async fn session_messages(&self, id: &str) -> anyhow::Result<Vec<Message>> {
+        let mut url = reqwest::Url::parse(&self.base)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("gateway base URL cannot contain a path"))?
+            .extend(["api", "sessions", id, "messages"]);
+        let mut map: Map<String, Value> = self
+            .http
+            .get(url)
+            .bearer_auth(&self.key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let messages = map
+            .remove("messages")
+            .context("gateway response missing `messages`")?;
+        Ok(serde_json::from_value(messages)?)
     }
 
     pub async fn reminders(&self) -> anyhow::Result<Vec<Reminder>> {
@@ -423,6 +490,31 @@ impl GatewayClient {
         &self,
         session_id: &str,
         message: &str,
+        on_event: impl FnMut(TurnEvent),
+    ) -> anyhow::Result<String> {
+        self.chat_streaming_with_workspace(session_id, message, None, on_event)
+            .await
+    }
+
+    /// As [`chat_streaming`](Self::chat_streaming), but binds a **new** session
+    /// to the caller's startup directory. Existing sessions retain their stored
+    /// workspace server-side, regardless of this header.
+    pub async fn chat_streaming_in_workspace(
+        &self,
+        session_id: &str,
+        message: &str,
+        workspace: &str,
+        on_event: impl FnMut(TurnEvent),
+    ) -> anyhow::Result<String> {
+        self.chat_streaming_with_workspace(session_id, message, Some(workspace), on_event)
+            .await
+    }
+
+    async fn chat_streaming_with_workspace(
+        &self,
+        session_id: &str,
+        message: &str,
+        workspace: Option<&str>,
         mut on_event: impl FnMut(TurnEvent),
     ) -> anyhow::Result<String> {
         let body = json!({
@@ -430,12 +522,18 @@ impl GatewayClient {
             "stream": true,
             "messages": [{ "role": "user", "content": message }],
         });
-        let mut resp = self
+        let request = self
             .http
             .post(self.url("/v1/chat/completions"))
             .bearer_auth(&self.key)
-            .header("X-Komo-Session-Id", session_id)
-            .header("X-Komo-Trusted", "1")
+            .header("X-Komo-Session-Id", api_session_header_value(session_id))
+            .header("X-Komo-Trusted", "1");
+        let request = if let Some(workspace) = workspace {
+            request.header("X-Komo-Workspace", workspace)
+        } else {
+            request
+        };
+        let mut resp = request
             .json(&body)
             .send()
             .await?
@@ -452,11 +550,48 @@ impl GatewayClient {
                 parse_sse_frame(&frame, &mut on_event, &mut reply);
             }
         }
-        // A final frame without a trailing blank line (some servers omit it).
         if !buf.trim().is_empty() {
             parse_sse_frame(&buf, &mut on_event, &mut reply);
         }
         Ok(reply)
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn folder_workspace_id_is_base64url_encoded() {
+        let dir = std::env::temp_dir();
+        let id = folder_workspace_id(&dir).unwrap();
+        let encoded = id.strip_prefix("folder:").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(Path::new(std::str::from_utf8(&decoded).unwrap()), dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn folder_workspace_path_decodes_an_existing_directory() {
+        let dir = std::env::temp_dir();
+        assert_eq!(folder_workspace_path(&folder_workspace_id(&dir).unwrap()), Some(dir.canonicalize().unwrap()));
+        assert_eq!(folder_workspace_path("folder:not-base64"), None);
+    }
+
+    #[test]
+    fn api_session_header_omits_internal_namespace() {
+        assert_eq!(
+            api_session_header_value("api:019fad15-8199-7461-9d48-0a6c779f1c8d"),
+            "019fad15-8199-7461-9d48-0a6c779f1c8d"
+        );
+        // A session accidentally created by an older double-prefixing client
+        // must be sent back as the canonical external UUID too.
+        assert_eq!(
+            api_session_header_value("api:api:019fad15-8199-7461-9d48-0a6c779f1c8d"),
+            "019fad15-8199-7461-9d48-0a6c779f1c8d"
+        );
+        assert_eq!(api_session_header_value("telegram:123"), "telegram:123");
     }
 }
 

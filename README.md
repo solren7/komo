@@ -198,6 +198,11 @@ matching rule). Rules can also scope to channels
 (`channels = ["telegram"]`), and an allow rule only covers
 `Risk::Dangerous` actions when it sets `include_dangerous = true`.
 
+`read`, `grep`, and `glob` may inspect any local path. `write`, `edit`,
+`apply_patch`, and `shell` workdirs remain confined to the session workspace.
+Use a `[policy]` rule with `category = "file"` and `access = "read"` to deny
+specific sensitive paths (for example `.ssh` or credential directories).
+
 | Provider | API key env var |
 |---|---|
 | `deepseek` | `DEEPSEEK_API_KEY` |

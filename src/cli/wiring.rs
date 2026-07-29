@@ -121,11 +121,17 @@ pub async fn build(
         config.runtime.home.join("tool-output"),
     ));
 
-    // File operations are confined to the current working directory — plus a
-    // read-only view of the store above, so a preview's path is one the `read`
-    // and `grep` tools can actually open. No write tool can reach it.
-    let workspace =
-        Arc::new(Workspace::current_dir()?.with_readonly(vec![output_store.root().to_path_buf()]));
+    // Mutations and shell workdirs remain confined to the current working
+    // directory. Local files are readable from any directory (subject to the
+    // file-read permission policy); managed tool output is retained as an
+    // explicit root for session-derived workspaces as well.
+    let mut readonly_roots = config.runtime.readable_roots.clone();
+    readonly_roots.push(output_store.root().to_path_buf());
+    let workspace = Arc::new(
+        Workspace::current_dir()?
+            .with_readonly(readonly_roots)
+            .with_unrestricted_reads(),
+    );
 
     // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Mid-turn clarification (roadmap §7): the sentinel tool suspends the turn

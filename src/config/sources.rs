@@ -269,6 +269,10 @@ pub struct FileConfig {
     /// turn cleanly instead of wedging it in `running` (default: 180; `0` =
     /// no timeout). See `infra::llm::RigLlm`.
     pub llm_timeout_secs: Option<u64>,
+    /// Existing directories the agent may read in addition to its session
+    /// workspace. They remain read-only: writes and shell workdirs stay inside
+    /// the workspace selected when the session was created.
+    pub readable_roots: Option<Vec<std::path::PathBuf>>,
     /// Ingress channel declarations (`[channels.*]` tables), shaped after
     /// hermes-agent's per-platform config blocks.
     pub channels: Option<ChannelsFileConfig>,

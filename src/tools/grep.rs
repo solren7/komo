@@ -80,7 +80,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search, absolute or relative to the workspace root. Defaults to the root."
+                    "description": "Directory or file to search. Absolute paths may be anywhere locally; relative paths resolve from the workspace root. Defaults to the root."
                 },
                 "include": {
                     "type": "string",

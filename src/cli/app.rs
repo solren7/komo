@@ -19,6 +19,11 @@ enum Commands {
     Init,
     /// Start an interactive chat session (full-screen TUI; needs a terminal)
     Chat,
+    /// Resume an existing chat session (shortcut for `komo session resume`)
+    Resume {
+        /// Session id; an API session may be given without its `api:` prefix
+        id: String,
+    },
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
     /// `schedule` in ~/.komo/config.toml (or KOMO_SCHEDULE); default hourly.
@@ -413,7 +418,7 @@ enum SessionAction {
     /// Resume an existing session: reopen the chat TUI bound to its id, so its
     /// history is loaded and the conversation continues where it left off
     Resume {
-        /// Session id (as shown by `session list`)
+        /// Session id (a bare UUID also resolves an API session)
         id: String,
     },
     /// Delete sessions that contain no messages
@@ -461,6 +466,10 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Chat => {
             require_terminal()?;
             crate::tui::run(&config).await
+        }
+        Commands::Resume { id } => {
+            require_terminal()?;
+            crate::tui::resume(&config, &id).await
         }
         Commands::Gateway { action } => match action {
             None => gateway::run(&config).await,
@@ -689,5 +698,26 @@ mod tests {
     fn channel_probe_and_setup_accept_supported_channel_names() {
         assert!(Cli::try_parse_from(["komo", "channel", "probe", "telegram"]).is_ok());
         assert!(Cli::try_parse_from(["komo", "channel", "setup", "telegram"]).is_ok());
+    }
+
+    #[test]
+    fn root_resume_parses_a_bare_session_id() {
+        assert!(Cli::try_parse_from([
+            "komo",
+            "resume",
+            "019fad15-8199-7461-9d48-0a6c779f1c8d",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn session_resume_also_parses_a_bare_api_session_id() {
+        assert!(Cli::try_parse_from([
+            "komo",
+            "session",
+            "resume",
+            "019fad15-8199-7461-9d48-0a6c779f1c8d",
+        ])
+        .is_ok());
     }
 }

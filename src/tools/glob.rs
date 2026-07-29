@@ -52,7 +52,7 @@ impl Tool for GlobTool {
 
     fn description(&self) -> &'static str {
         "Find files by glob pattern (e.g. `**/*.rs`, `src/**/test_*.py`), newest \
-         first. Searches the workspace, honoring .gitignore — so build output and \
+         first. Searches local directories, honoring .gitignore — so build output and \
          dependencies stay out of the results. Use `path` to narrow to a \
          subdirectory. Prefer this over `find`/`ls` through `shell`."
     }
@@ -71,7 +71,7 @@ impl Tool for GlobTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search, absolute or relative to the workspace root. Defaults to the root."
+                    "description": "Directory to search. Absolute paths may be anywhere locally; relative paths resolve from the workspace root. Defaults to the root."
                 },
                 "limit": {
                     "type": "integer",
@@ -84,7 +84,8 @@ impl Tool for GlobTool {
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: GlobArgs = parse_args(&input)?;
-        let root = fs_common::resolve(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
+        let root =
+            fs_common::resolve_readable(&self.workspace, ctx, args.path.as_deref().unwrap_or("."))?;
 
         // The search root is the read being requested: one `ActionRef::File`
         // check, so a `file`/`access = "read"` deny rule fences off a directory
@@ -233,5 +234,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_workspace_can_search_an_absolute_external_directory() {
+        let (_tool, workspace_dir) = tool_in("unrestricted_workspace");
+        let external = std::env::temp_dir().join("komo_globtool_unrestricted_external");
+        let _ = std::fs::remove_dir_all(&external);
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("visible.txt"), "visible\n").unwrap();
+        let tool = GlobTool::new(Arc::new(
+            Workspace::new(vec![workspace_dir]).with_unrestricted_reads(),
+        ));
+
+        let out = tool
+            .call(
+                json!({ "pattern": "*.txt", "path": external.display().to_string() }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.text.contains("visible.txt"), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&external);
     }
 }

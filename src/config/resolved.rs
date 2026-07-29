@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::report::{ConfigIssue, ConfigReport, IssueSeverity, Origin};
 use super::sources::{ConfigSources, KomoEnv, PolicyFileConfig, PolicyRuleFileConfig};
@@ -127,6 +127,10 @@ pub struct RuntimeConfig {
     /// Extra skill directories from `KOMO_SKILLS_PATH` (colon-separated),
     /// highest priority first.
     pub skills_path: Vec<PathBuf>,
+    /// Operator-configured directories that filesystem tools may read in
+    /// addition to the session workspace. Each entry is canonicalized during
+    /// config resolution and is never a write root.
+    pub readable_roots: Vec<PathBuf>,
     /// The `homeassistant` *tool* credentials (`HASS_TOKEN`/`HASS_URL`);
     /// `None` = token unset, tool not registered.
     pub homeassistant_tool: Option<HomeAssistantConfig>,
@@ -559,6 +563,11 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         },
     };
 
+    // Reading outside the workspace is deliberately opt-in. Canonicalize only
+    // existing directories so aliases and duplicate entries do not create
+    // surprising prefixes in the Workspace allow-list.
+    let readable_roots = resolve_readable_roots(file.readable_roots, &mut issues);
+
     // The homeassistant tool credentials, shared with the HA event channel.
     let homeassistant_tool = secrets
         .hass_token
@@ -713,6 +722,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         dream_schedule: resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
         policy,
         skills_path,
+        readable_roots,
         homeassistant_tool,
         feishu,
         telegram,
@@ -727,6 +737,33 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         provider_key_present,
     };
     (runtime, report)
+}
+
+fn resolve_readable_roots(
+    configured: Option<Vec<PathBuf>>,
+    issues: &mut Vec<ConfigIssue>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for path in configured.unwrap_or_default() {
+        match canonical_directory(&path) {
+            Some(path) if !roots.contains(&path) => roots.push(path),
+            Some(_) => {}
+            None => issues.push(ConfigIssue {
+                path: "readable_roots",
+                severity: IssueSeverity::Warning,
+                message: format!(
+                    "{} is not an existing directory; ignoring it",
+                    path.display()
+                ),
+            }),
+        }
+    }
+    roots
+}
+
+fn canonical_directory(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 /// env > file > default, tagging where the value came from.
@@ -953,6 +990,23 @@ mod tests {
         assert_eq!(snap.report.model_origin, Origin::Default);
         assert!(snap.report.fatal().is_none());
         assert!(snap.validate_gateway().is_ok());
+    }
+
+    #[test]
+    fn readable_roots_are_canonicalized_and_invalid_entries_are_reported() {
+        let valid = std::env::temp_dir();
+        let missing = valid.join(format!("komo-missing-{}", uuid::Uuid::new_v4()));
+        let mut s = with_deepseek_key(sources());
+        s.file.readable_roots = Some(vec![valid.clone(), missing]);
+
+        let snap = ConfigSnapshot::from_sources(s);
+        assert_eq!(
+            snap.runtime.readable_roots,
+            vec![valid.canonicalize().unwrap()]
+        );
+        assert!(snap.report.issues.iter().any(|issue| {
+            issue.path == "readable_roots" && issue.severity == IssueSeverity::Warning
+        }));
     }
 
     #[test]

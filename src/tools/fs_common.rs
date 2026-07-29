@@ -38,10 +38,10 @@ pub fn resolve(
     })
 }
 
-/// [`resolve`] for a read: the workspace **plus** the read-only managed roots
-/// (`~/.komo/tool-output`, where an over-limit tool result is stored in full).
-/// A preview hands the model that path, so `read`/`grep` have to be able to open
-/// it; nothing else can, because every mutating tool resolves through [`resolve`].
+/// [`resolve`] for a read: the workspace plus its read-only roots, or any local
+/// path when unrestricted reads are enabled. A preview hands the model a managed
+/// tool-output path, so `read`, `grep`, and `glob` have to be able to open it;
+/// nothing else can, because every mutating tool resolves through [`resolve`].
 pub fn resolve_readable(
     workspace: &Arc<Workspace>,
     ctx: &ToolContext,
@@ -72,9 +72,16 @@ fn effective<'a>(
     ctx: &ToolContext,
 ) -> std::borrow::Cow<'a, Workspace> {
     match ctx.session.workspace_root.as_ref() {
-        Some(root) => std::borrow::Cow::Owned(
-            Workspace::new(vec![root.clone()]).with_readonly(workspace.readonly_roots().to_vec()),
-        ),
+        Some(root) => {
+            let derived = Workspace::new(vec![root.clone()])
+                .with_readonly(workspace.readonly_roots().to_vec());
+            let derived = if workspace.has_unrestricted_reads() {
+                derived.with_unrestricted_reads()
+            } else {
+                derived
+            };
+            std::borrow::Cow::Owned(derived)
+        }
         None => std::borrow::Cow::Borrowed(workspace.as_ref()),
     }
 }

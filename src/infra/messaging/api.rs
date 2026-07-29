@@ -957,7 +957,14 @@ fn resolve_session(headers: &axum::http::HeaderMap) -> (String, bool) {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        (format!("api:{id}"), true)
+        // Dashboard clients may persist the server-returned id. It is already
+        // namespaced, so adding `api:` again creates an empty conversation.
+        // Strip every accidental legacy prefix too, so `api:api:<uuid>` repairs
+        // itself on the next request instead of becoming a third identity.
+        (
+            format!("api:{}", id.trim_start_matches("api:")),
+            true,
+        )
     } else {
         (format!("api:{}", uuid::Uuid::now_v7()), false)
     }
@@ -1596,6 +1603,29 @@ mod tests {
         headers.insert("x-komo-session-id", "panel-1".parse().unwrap());
         let (id, stateful) = resolve_session(&headers);
         assert_eq!(id, "api:panel-1");
+        assert!(stateful);
+    }
+
+    #[test]
+    fn resolve_session_does_not_double_prefix_a_server_id() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-komo-session-id", "api:panel-1".parse().unwrap());
+        let (id, stateful) = resolve_session(&headers);
+        assert_eq!(id, "api:panel-1");
+        assert!(stateful);
+    }
+
+    #[test]
+    fn resolve_session_repairs_repeated_legacy_prefixes() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-komo-session-id",
+            "api:api:019fad15-8199-7461-9d48-0a6c779f1c8d"
+                .parse()
+                .unwrap(),
+        );
+        let (id, stateful) = resolve_session(&headers);
+        assert_eq!(id, "api:019fad15-8199-7461-9d48-0a6c779f1c8d");
         assert!(stateful);
     }
 

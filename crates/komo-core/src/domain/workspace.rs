@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 pub struct Workspace {
     roots: Vec<PathBuf>,
     readonly_roots: Vec<PathBuf>,
+    unrestricted_reads: bool,
 }
 
 impl Workspace {
@@ -13,6 +14,7 @@ impl Workspace {
         Self {
             roots,
             readonly_roots: Vec::new(),
+            unrestricted_reads: false,
         }
     }
 
@@ -31,6 +33,14 @@ impl Workspace {
         self
     }
 
+    /// Permit reads from any local path while keeping every mutation confined to
+    /// [`roots`](Self::roots). The caller is still responsible for applying the
+    /// file-read permission policy before exposing content.
+    pub fn with_unrestricted_reads(mut self) -> Self {
+        self.unrestricted_reads = true;
+        self
+    }
+
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
@@ -39,6 +49,12 @@ impl Workspace {
     /// root) can carry them over.
     pub fn readonly_roots(&self) -> &[PathBuf] {
         &self.readonly_roots
+    }
+
+    /// Whether reads may reach paths outside the workspace and named read-only
+    /// roots. This must be carried into a session-selected workspace.
+    pub fn has_unrestricted_reads(&self) -> bool {
+        self.unrestricted_reads
     }
 
     /// Returns true if `path` resolves to a location inside one of the roots.
@@ -68,11 +84,13 @@ impl Workspace {
     /// read-only in the first place.
     pub fn resolve_readable(&self, path: &Path) -> Option<PathBuf> {
         let resolved = self.resolve(path);
-        self.roots
-            .iter()
-            .chain(&self.readonly_roots)
-            .any(|root| resolved.starts_with(root))
-            .then_some(resolved)
+        (self.unrestricted_reads
+            || self
+                .roots
+                .iter()
+                .chain(&self.readonly_roots)
+                .any(|root| resolved.starts_with(root)))
+        .then_some(resolved)
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -137,5 +155,14 @@ mod tests {
                 .is_none(),
             "only the named subdirectory, not the whole komo home"
         );
+    }
+
+    #[test]
+    fn unrestricted_reads_do_not_widen_write_roots() {
+        let ws =
+            Workspace::new(vec![PathBuf::from("/home/user/project")]).with_unrestricted_reads();
+
+        assert!(ws.resolve_readable(Path::new("/etc/passwd")).is_some());
+        assert!(ws.resolve_contained(Path::new("/etc/passwd")).is_none());
     }
 }

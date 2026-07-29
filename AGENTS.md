@@ -91,7 +91,9 @@ same `operator_control/actions.rs::OperatorActions`**, so business logic can't
 fork — add new operator actions there, not in the CLI or api handlers.
 
 - `komo chat` → `POST /v1/chat/completions` with `X-Komo-Trusted` (loopback
-  only): side-effecting tools auto-approve for the host operator.
+  only): side-effecting tools auto-approve for the host operator. API sessions
+  are stored as `api:<uuid>` internally, while `X-Komo-Session-Id` carries the
+  bare UUID; the gateway accepts the old prefixed form for compatibility.
 - Cancel: `POST /api/interactions/{session}/cancel` flips the session's
   `CancelSignal`; `run_agent_loop` races every await against it. A running tool
   stops only if it claims `ToolContext::cancelled()` (shell kills its process
@@ -245,8 +247,9 @@ content the model can recover from; only a driver/LLM error aborts the turn.
 - `cli/wiring.rs` — shared `AgentRuntime` construction (chat vs gateway differ
   only in `Approver`); register new tools here.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
-  key handling terminal-free in `tui/app.rs`. `komo session resume <id>` is
-  the only way to re-enter a session.
+  key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
+  compatible `komo session resume <id>`) re-enters a session; a bare API UUID
+  resolves its internal `api:<uuid>` id and hydrates the transcript.
 - `cron` (`~/.komo/cron.db`, `CronJobSweep`) — two job modes: **command**
   (operator-authored, runs directly, no approver) and **agent** (unattended
   turn on `cron_runtime`, side effects need `unattended = true` policy rules).

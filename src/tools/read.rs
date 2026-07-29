@@ -52,7 +52,7 @@ struct ReadArgs {
     limit: Option<usize>,
 }
 
-/// Reads text files and directories inside a [`Workspace`].
+/// Reads text files and directories from the local filesystem.
 pub struct ReadTool {
     workspace: Arc<Workspace>,
 }
@@ -70,8 +70,8 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file with line numbers, or list a directory. Relative paths \
-         resolve inside the workspace. Long files are paged: pass `offset` (the \
+        "Read a text file with line numbers, or list a directory. Absolute paths may \
+         be anywhere locally; relative paths resolve inside the workspace. Long files are paged: pass `offset` (the \
          1-based line to start at) and `limit` to walk through one; the result \
          tells you the next offset when there is more. Binary files are refused \
          rather than dumped as garbage."
@@ -88,7 +88,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File or directory path, absolute or relative to the workspace root."
+                    "description": "File or directory path. Absolute paths may be anywhere locally; relative paths resolve from the workspace root."
                 },
                 "offset": {
                     "type": "integer",

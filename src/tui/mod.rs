@@ -23,7 +23,7 @@ mod approver;
 mod markdown;
 mod ui;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
@@ -37,11 +37,12 @@ use crate::{
         approval::Approver,
         events::{ToolEventSink, TurnEvent},
         gateway::ReplySink,
-        repository::SessionRepository,
+        message::{Message, Role as MessageRole},
+        repository::{MessageRepository, SessionRepository},
         session::Session,
     },
     infra::{
-        gateway_client::GatewayClient,
+        gateway_client::{GatewayClient, folder_workspace_id, folder_workspace_path},
         persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
     },
     services::{
@@ -58,7 +59,12 @@ use approver::{ApprovalPrompt, TuiApprover};
 #[derive(Clone)]
 enum Backend {
     /// A running gateway over loopback HTTP (trusted; server-side approvals).
-    Remote(Arc<GatewayClient>),
+    Remote {
+        gateway: Arc<GatewayClient>,
+        /// Opaque, server-validated id for the directory from which this TUI
+        /// was launched. The gateway applies it only when creating a session.
+        workspace: String,
+    },
     /// In-process agent against the local db (approvals via the TUI modal).
     Local {
         runtime: Arc<AgentRuntime>,
@@ -80,8 +86,8 @@ impl Backend {
         match self {
             // Remote turns run server-side; stream their tool events over SSE
             // and forward each onto the loop's event channel.
-            Backend::Remote(gw) => {
-                gw.chat_streaming(session_id, &input, |ev| {
+            Backend::Remote { gateway, workspace } => {
+                gateway.chat_streaming_in_workspace(session_id, &input, workspace, |ev| {
                     let _ = events.send(ev);
                 })
                 .await
@@ -129,28 +135,76 @@ impl ReplySink for ChannelSink {
 /// Start the TUI on a fresh session: a running gateway holds the db lock, so
 /// route turns to it; otherwise run in-process.
 pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    let connected = connect(config).await?;
-    drive(connected, new_session_id(), false).await
+    let workspace = startup_workspace()?;
+    let connected = connect(config, &workspace).await?;
+    drive(connected, new_session_id(), false, workspace).await
 }
 
-/// Continue an existing session (`komo session resume <id>` on a TTY). Errors
-/// if the session doesn't exist — resume never creates one.
-pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result<()> {
-    let connected = connect(config).await?;
-    match &connected.backend {
-        Backend::Remote(gw) => {
-            let known = gw.sessions().await?.iter().any(|s| s.id == session_id);
-            if !known {
-                anyhow::bail!("no session with id `{session_id}` (see `komo session list`)");
-            }
+/// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
+/// session doesn't exist — resume never creates one. A bare API id is accepted
+/// as a convenience for the UUID shown by clients.
+pub async fn resume(config: &ConfigSnapshot, id: &str) -> anyhow::Result<()> {
+    let fallback_workspace = startup_workspace()?;
+    let connected = connect(config, &fallback_workspace).await?;
+    let session_id = resolve_resume_id(&connected.backend, id).await?;
+    let workspace = resume_workspace(&connected.backend, &session_id, fallback_workspace).await?;
+    drive(connected, session_id, true, workspace).await
+}
+
+/// Resolve an exact id first. API sessions are stored as `api:<client-id>`, but
+/// a UUID alone is the ergonomic form for `komo resume`.
+async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String> {
+    let candidate = (!id.contains(':')).then(|| format!("api:{id}"));
+    let resolved = match backend {
+        Backend::Remote { gateway, .. } => {
+            let sessions = gateway.sessions().await?;
+            sessions
+                .iter()
+                .find(|s| s.id == id)
+                .or_else(|| candidate.as_ref().and_then(|candidate| {
+                    sessions.iter().find(|s| s.id == *candidate)
+                }))
+                .map(|s| s.id.clone())
         }
         Backend::Local { db, .. } => {
-            if SessionRepository::find(&**db, session_id).await?.is_none() {
-                anyhow::bail!("no session with id `{session_id}` (see `komo session list`)");
+            if SessionRepository::find(&**db, id).await?.is_some() {
+                Some(id.to_string())
+            } else if let Some(candidate) = candidate
+                && SessionRepository::find(&**db, &candidate).await?.is_some()
+            {
+                Some(candidate)
+            } else {
+                None
             }
         }
+    };
+    resolved
+        .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
+}
+
+async fn resume_messages(backend: &Backend, id: &str) -> anyhow::Result<Vec<Message>> {
+    match backend {
+        Backend::Remote { gateway, .. } => gateway.session_messages(id).await,
+        Backend::Local { db, .. } => MessageRepository::list_by_session(&**db, id).await,
     }
-    drive(connected, session_id.to_string(), true).await
+}
+
+/// Local sessions persist an opaque folder id. Honor it on resume so reopening
+/// a conversation from a different terminal directory cannot redirect its
+/// filesystem tools. Older sessions and unavailable folders retain the startup
+/// directory as their backward-compatible default.
+async fn resume_workspace(
+    backend: &Backend,
+    id: &str,
+    fallback: PathBuf,
+) -> anyhow::Result<PathBuf> {
+    let Backend::Local { db, .. } = backend else {
+        return Ok(fallback);
+    };
+    Ok(SessionRepository::find(&**db, id)
+        .await?
+        .and_then(|session| folder_workspace_path(&session.workspace))
+        .unwrap_or(fallback))
 }
 
 struct Connected {
@@ -168,11 +222,14 @@ struct Connected {
     clarify: Option<Arc<ClarifyState>>,
 }
 
-async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
+async fn connect(config: &ConfigSnapshot, workspace: &PathBuf) -> anyhow::Result<Connected> {
     let (tx, rx) = mpsc::unbounded_channel();
     if let Some(gw) = GatewayClient::try_connect().await {
         return Ok(Connected {
-            backend: Backend::Remote(Arc::new(gw)),
+            backend: Backend::Remote {
+                gateway: Arc::new(gw),
+                workspace: folder_workspace_id(workspace)?,
+            },
             approvals: (tx, rx),
             clarify: None,
         });
@@ -197,9 +254,14 @@ async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
 
 /// Set up the terminal, run the event loop, and always restore — including on
 /// an error path (the panic path is covered by `ratatui::init`'s hook).
-async fn drive(connected: Connected, session: String, resuming: bool) -> anyhow::Result<()> {
+async fn drive(
+    connected: Connected,
+    session: String,
+    resuming: bool,
+    workspace: PathBuf,
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, connected, session, resuming).await;
+    let result = event_loop(&mut terminal, connected, session, resuming, workspace).await;
     ratatui::restore();
     result
 }
@@ -209,6 +271,7 @@ async fn event_loop(
     connected: Connected,
     session: String,
     resuming: bool,
+    workspace: PathBuf,
 ) -> anyhow::Result<()> {
     let Connected {
         backend,
@@ -225,27 +288,43 @@ async fn event_loop(
     // cloned per turn; this original stays alive so the arm never closes.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
+    let history = if resuming {
+        resume_messages(&backend, &session).await?
+    } else {
+        Vec::new()
+    };
     let mut app = App::new(session);
+    for message in history {
+        let role = match message.role {
+            MessageRole::User => Role::You,
+            MessageRole::Assistant => Role::Agent,
+            // Persisted system/tool entries are history, not live tool activity
+            // (which has special spinner/status rendering in the TUI).
+            MessageRole::System | MessageRole::Tool => Role::Info,
+        };
+        app.push(role, message.content);
+    }
     let mode = match &backend {
-        Backend::Remote(_) => "connected to the running gateway (trusted)",
+        Backend::Remote { .. } => "connected to the running gateway (trusted)",
         Backend::Local { .. } => "in-process (no gateway)",
     };
     app.push(
         Role::Info,
         format!(
-            "Komo v0.1 — {mode}, {} `{}`",
+            "Komo v0.1 — {mode}, {} `{}`\nworkspace: `{}`",
             if resuming {
                 "resumed session"
             } else {
                 "session"
             },
-            app.session_id
+            app.session_id,
+            workspace.display(),
         ),
     );
     if let Backend::Local { db, .. } = &backend
         && !resuming
     {
-        ensure_session(db, &app.session_id).await?;
+        ensure_session(db, &app.session_id, &workspace).await?;
     }
 
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<Result<String, String>>();
@@ -314,7 +393,7 @@ async fn event_loop(
                         app.awaiting_answer = false;
                         app.session_id = new_session_id();
                         if let Backend::Local { db, .. } = &backend {
-                            ensure_session(db, &app.session_id).await?;
+                            ensure_session(db, &app.session_id, &workspace).await?;
                         }
                         app.push(
                             Role::Info,
@@ -381,13 +460,26 @@ async fn event_loop(
     Ok(())
 }
 
-async fn ensure_session(db: &Db, session_id: &str) -> anyhow::Result<()> {
+async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {
     if SessionRepository::find(db, session_id).await?.is_none() {
-        SessionRepository::save(db, &Session::new(session_id)).await?;
+        let workspace_id = folder_workspace_id(workspace)?;
+        SessionRepository::save(
+            db,
+            &Session::with_workspace(session_id, workspace_id),
+        )
+        .await?;
     }
     Ok(())
 }
 
 fn new_session_id() -> String {
     uuid::Uuid::now_v7().to_string()
+}
+
+/// Snapshot the TUI's startup folder once. A session's workspace is immutable,
+/// so later `cd`s in child shells must not redirect a conversation's tools.
+fn startup_workspace() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    cwd.canonicalize()
+        .map_err(Into::into)
 }

@@ -85,7 +85,13 @@ fn api_session_header_value(session_id: &str) -> &str {
 pub struct GatewayClient {
     base: String,
     key: String,
+    /// Bounded client for ordinary control-plane requests.
     http: reqwest::Client,
+    /// Streaming turns can legitimately outlive `REQUEST_TIMEOUT`: one turn
+    /// may contain several bounded LLM completions and tool calls. Their
+    /// lifetime is enforced server-side; applying a whole-response timeout in
+    /// the client would instead cut off a healthy SSE body mid-turn.
+    streaming_http: reqwest::Client,
 }
 
 /// The lightweight live snapshot published by the gateway. It deliberately
@@ -118,11 +124,13 @@ impl GatewayClient {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .ok()?;
+        let streaming_http = reqwest::Client::builder().build().ok()?;
         let base = info.base_url();
         Self::health_ok(&http, &base).await.then(|| GatewayClient {
             base,
             key: info.key,
             http,
+            streaming_http,
         })
     }
 
@@ -523,7 +531,7 @@ impl GatewayClient {
             "messages": [{ "role": "user", "content": message }],
         });
         let request = self
-            .http
+            .streaming_http
             .post(self.url("/v1/chat/completions"))
             .bearer_auth(&self.key)
             .header("X-Komo-Session-Id", api_session_header_value(session_id))

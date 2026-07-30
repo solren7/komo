@@ -29,7 +29,7 @@
 //! the bearer-key middleware. Only loopback origins are allowed and credentials
 //! are off, so the bearer key remains the sole thing that grants access.
 
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Duration};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,7 +44,7 @@ use axum::{
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
 };
@@ -944,7 +944,16 @@ fn stream_turn(
             }
         }
     });
-    Sse::new(stream).into_response()
+    // A turn can spend minutes in one completion before it emits a tool event.
+    // Keep the response alive through that quiet period so a healthy long turn
+    // is not mistaken for an idle connection by the TUI or an intermediary.
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 /// Continue an existing conversation only when the client opts in with

@@ -2,7 +2,10 @@
 //! The event loop (`mod.rs`) feeds key events in and interprets the returned
 //! [`Action`]s; rendering (`ui.rs`) reads the state.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -56,6 +59,10 @@ pub struct App {
     /// Scroll offset in wrapped lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: u16,
     pub in_flight: bool,
+    /// Monotonic start time for the active turn. Kept in the UI state so the
+    /// status row can show useful progress without depending on wall-clock
+    /// time (or being affected by a system clock adjustment).
+    turn_started_at: Option<Instant>,
     /// A mid-turn `ask_user` question is pending: the next submit is its
     /// answer (allowed through even though a turn is in flight).
     pub awaiting_answer: bool,
@@ -84,6 +91,7 @@ impl App {
             cursor: 0,
             scroll_from_bottom: 0,
             in_flight: false,
+            turn_started_at: None,
             awaiting_answer: false,
             spinner: 0,
             modal: None,
@@ -108,6 +116,23 @@ impl App {
     pub fn begin_tools(&mut self) {
         self.tool_index.clear();
         self.active_tool = None;
+    }
+
+    /// Mark a turn as running and start its elapsed-time counter.
+    pub fn start_turn(&mut self) {
+        self.in_flight = true;
+        self.turn_started_at = Some(Instant::now());
+    }
+
+    /// Mark a turn as complete and clear its elapsed-time counter.
+    pub fn finish_turn(&mut self) {
+        self.in_flight = false;
+        self.turn_started_at = None;
+    }
+
+    /// Elapsed time for the current turn, if it was started through the UI.
+    pub fn turn_elapsed(&self) -> Option<Duration> {
+        self.turn_started_at.map(|started| started.elapsed())
     }
 
     /// A tool call started: append a running activity line and remember it so
@@ -453,6 +478,20 @@ mod tests {
         type_str(&mut app, "queued?");
         assert_eq!(app.on_key(key(KeyCode::Enter)), None, "one turn at a time");
         assert_eq!(app.input, "queued?", "draft preserved");
+    }
+
+    #[test]
+    fn turn_lifecycle_tracks_running_state_and_elapsed_time() {
+        let mut app = App::new("s".into());
+        assert_eq!(app.turn_elapsed(), None);
+
+        app.start_turn();
+        assert!(app.in_flight);
+        assert!(app.turn_elapsed().is_some());
+
+        app.finish_turn();
+        assert!(!app.in_flight);
+        assert_eq!(app.turn_elapsed(), None);
     }
 
     #[test]

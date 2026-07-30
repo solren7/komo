@@ -18,19 +18,73 @@ use super::markdown::markdown_lines;
 const SPINNER: [&str; 4] = ["⠇", "⠋", "⠙", "⠸"];
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let [transcript_area, status_area, input_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(3),
-    ])
-    .areas(frame.area());
+    // Grok Build keeps persistent identity/progress chrome, but deliberately
+    // sheds optional rows in short terminals. Follow that principle here: the
+    // session header makes a long chat easier to orient in, without starving
+    // the transcript in a small split pane.
+    let (header_area, transcript_area, status_area, input_area) = if frame.area().height <= 8 {
+        let [transcript, status, input] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
+        (None, transcript, status, input)
+    } else {
+        let [header, transcript, status, input] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
+        (Some(header), transcript, status, input)
+    };
 
+    if let Some(area) = header_area {
+        render_header(frame, app, area);
+    }
     render_transcript(frame, app, transcript_area);
     render_status(frame, app, status_area);
     render_input(frame, app, input_area);
     if let Some(prompt) = &app.modal {
         render_modal(frame, prompt, app.modal_reason.as_deref(), frame.area());
     }
+}
+
+/// A quiet identity row keeps the session visible without repeating its full
+/// UUID below every activity update. The compact form leaves the conversation
+/// as the visual focus while still making screenshots/debug reports useful.
+fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    let [brand_area, session_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(18)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " KOMO",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  chat", Style::new().fg(Color::DarkGray)),
+        ])),
+        brand_area,
+    );
+    let short_id: String = app
+        .session_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("session · {short_id} "),
+            Style::new().fg(Color::DarkGray),
+        )))
+        .alignment(ratatui::layout::Alignment::Right),
+        session_area,
+    );
 }
 
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
@@ -78,22 +132,26 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 )
             }
         };
-        for (i, wrapped) in wrap_text(&entry.text, width.saturating_sub(prefix.chars().count()))
+        let prefix_width = display_width(prefix);
+        for (i, wrapped) in wrap_text(&entry.text, width.saturating_sub(prefix_width))
             .into_iter()
             .enumerate()
         {
             let head = if i == 0 {
                 prefix.to_string()
             } else {
-                " ".repeat(prefix.chars().count())
+                " ".repeat(prefix_width)
             };
             lines.push(Line::from(vec![
                 Span::styled(head, head_style.add_modifier(Modifier::BOLD)),
                 Span::styled(wrapped, body_style),
             ]));
         }
-        // A blank separator between messages keeps the transcript scannable.
-        lines.push(Line::default());
+        // Tool calls often arrive in bursts. Keep them as a compact activity
+        // group; conversational messages retain their breathing room.
+        if entry.role != Role::Tool {
+            lines.push(Line::default());
+        }
     }
 
     // Bottom-anchored scroll: 0 = follow the tail; scrolling up moves the
@@ -114,47 +172,61 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::Cyan),
             ),
             Span::styled(
-                format!("session {}", app.session_id),
+                "等待输入期间，当前 turn 保持挂起",
                 Style::new().fg(Color::DarkGray),
             ),
         ])
     } else if app.in_flight && app.active_tool.is_some() {
         let tool = app.active_tool.as_deref().unwrap_or_default();
-        Line::from(vec![
-            Span::styled(
-                format!(" {} {tool} 运行中… ", SPINNER[app.spinner % SPINNER.len()]),
-                Style::new().fg(Color::Cyan),
+        Line::from(vec![Span::styled(
+            format!(
+                " {} {tool} 运行中 · {} ",
+                SPINNER[app.spinner % SPINNER.len()],
+                elapsed_label(app)
             ),
-            Span::styled(
-                format!("session {}", app.session_id),
-                Style::new().fg(Color::DarkGray),
-            ),
-        ])
+            Style::new().fg(Color::Cyan),
+        )])
     } else if app.in_flight {
-        Line::from(vec![
-            Span::styled(
-                format!(" {} thinking… ", SPINNER[app.spinner % SPINNER.len()]),
-                Style::new().fg(Color::Yellow),
+        Line::from(vec![Span::styled(
+            format!(
+                " {} 正在思考 · {} ",
+                SPINNER[app.spinner % SPINNER.len()],
+                elapsed_label(app)
             ),
-            Span::styled(
-                format!("session {}", app.session_id),
-                Style::new().fg(Color::DarkGray),
-            ),
-        ])
+            Style::new().fg(Color::Yellow),
+        )])
     } else {
         Line::from(Span::styled(
-            format!(
-                " session {} · Enter 发送 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出",
-                app.session_id
-            ),
+            format!(" ● 就绪  · Enter 发送 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出"),
             Style::new().fg(Color::DarkGray),
         ))
     };
     frame.render_widget(Paragraph::new(status), area);
 }
 
+fn elapsed_label(app: &App) -> String {
+    let seconds = app.turn_elapsed().map_or(0, |elapsed| elapsed.as_secs());
+    if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::new().borders(Borders::ALL).title(" message ");
+    let title = if app.in_flight {
+        " message · draft preserved "
+    } else {
+        " message · Enter to send "
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(if app.awaiting_answer {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(title);
     let inner = block.inner(area);
     let inner_width = inner.width.max(1) as usize;
 
@@ -419,6 +491,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         let content = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            content.contains("KOMO"),
+            "header rendered on a normal terminal"
+        );
         assert!(content.contains("hello"), "user entry rendered");
         assert!(content.contains("hi there"), "agent entry rendered");
         assert!(content.contains("draft"), "input draft rendered");

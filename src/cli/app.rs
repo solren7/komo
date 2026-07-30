@@ -9,7 +9,7 @@ use super::{
 #[command(name = "komo", version, about = "Personal agent framework")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -448,7 +448,7 @@ fn require_terminal() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`komo chat` is a full-screen TUI and needs a terminal.\n\
+        "`komo` (or `komo chat`) is a full-screen TUI and needs a terminal.\n\
          For scripted access, POST to the gateway's api channel instead \
          (`/v1/chat/completions`; address and key in ~/.komo/gateway.json)."
     )
@@ -462,24 +462,26 @@ pub async fn run() -> anyhow::Result<()> {
     // or a second instance).
     let config = crate::config::ConfigSnapshot::load();
     match cli.command {
-        Commands::Init => init::run(),
-        Commands::Chat => {
+        // The interactive chat is komo's primary surface. Keep `chat` as an
+        // explicit, script-friendly spelling, but make a bare `komo` open it.
+        None | Some(Commands::Chat) => {
             require_terminal()?;
             crate::tui::run(&config).await
         }
-        Commands::Resume { id } => {
+        Some(Commands::Init) => init::run(),
+        Some(Commands::Resume { id }) => {
             require_terminal()?;
             crate::tui::resume(&config, &id).await
         }
-        Commands::Gateway { action } => match action {
+        Some(Commands::Gateway { action }) => match action {
             None => gateway::run(&config).await,
             Some(GatewayAction::Start) => service::start(),
             Some(GatewayAction::Stop) => service::stop(),
             Some(GatewayAction::Restart) => service::restart(),
             Some(GatewayAction::Status) => service::status(),
         },
-        Commands::Upgrade { no_restart } => upgrade::run(no_restart),
-        Commands::Cron { action } => match action {
+        Some(Commands::Upgrade { no_restart }) => upgrade::run(no_restart),
+        Some(Commands::Cron { action }) => match action {
             CronAction::List => inspect::cron_list(&operator(&config).await?).await,
             CronAction::Add {
                 name,
@@ -531,7 +533,7 @@ pub async fn run() -> anyhow::Result<()> {
             }
             CronAction::Run { name } => inspect::cron_run(&operator(&config).await?, &name).await,
         },
-        Commands::Session { action } => match action {
+        Some(Commands::Session { action }) => match action {
             SessionAction::List => inspect::session_list(&operator(&config).await?).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
@@ -539,10 +541,10 @@ pub async fn run() -> anyhow::Result<()> {
             }
             SessionAction::Clean => inspect::session_clean(&operator(&config).await?).await,
         },
-        Commands::Task { action } => match action {
+        Some(Commands::Task { action }) => match action {
             TaskAction::List => inspect::task_list(&operator(&config).await?).await,
         },
-        Commands::Run { action } => match action {
+        Some(Commands::Run { action }) => match action {
             RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,
             RunAction::Inspect { id } => inspect::run_inspect(&operator(&config).await?, &id).await,
             RunAction::Resume { id } => resume::run(&config, &operator(&config).await?, id).await,
@@ -550,7 +552,7 @@ pub async fn run() -> anyhow::Result<()> {
                 run_prune(&operator(&config).await?, before, keep).await
             }
         },
-        Commands::Memory { action } => {
+        Some(Commands::Memory { action }) => {
             let control = operator(&config).await?;
             match action {
                 MemoryAction::List { status } => memory::list(&control, status).await,
@@ -562,8 +564,8 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Report => memory::report(&control).await,
             }
         }
-        Commands::Dream { apply } => dream::run(&operator(&config).await?, apply).await,
-        Commands::Skills { action } => match action {
+        Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,
+        Some(Commands::Skills { action }) => match action {
             SkillsAction::List => skill::list(),
             SkillsAction::Install { source } => skill::install(&source).await,
             SkillsAction::Promote { name } => skill::promote(&name),
@@ -575,12 +577,12 @@ pub async fn run() -> anyhow::Result<()> {
             SkillsAction::Inspect { name } => skill::inspect(&name),
             SkillsAction::Audit { name } => skill::audit(&operator(&config).await?, &name).await,
         },
-        Commands::Journey { limit, since } => {
+        Some(Commands::Journey { limit, since }) => {
             journey::journey(&operator(&config).await?, limit, since).await
         }
-        Commands::Doctor => doctor::doctor(&config, &operator(&config).await?).await,
-        Commands::Health => health::run().await,
-        Commands::Pair { action } => {
+        Some(Commands::Doctor) => doctor::doctor(&config, &operator(&config).await?).await,
+        Some(Commands::Health) => health::run().await,
+        Some(Commands::Pair { action }) => {
             let control = operator(&config).await?;
             match action {
                 PairAction::List => pair::list(&control).await,
@@ -588,7 +590,7 @@ pub async fn run() -> anyhow::Result<()> {
                 PairAction::Revoke { id } => pair::revoke(&control, &id).await,
             }
         }
-        Commands::Policy { action } => match action {
+        Some(Commands::Policy { action }) => match action {
             PolicyAction::List => policy::list(&config),
             PolicyAction::Check {
                 category,
@@ -609,11 +611,11 @@ pub async fn run() -> anyhow::Result<()> {
                 SavedAction::Forget { index, all } => policy::saved_forget(&config, index, all),
             },
         },
-        Commands::Model { action } => match action {
+        Some(Commands::Model { action }) => match action {
             ModelAction::List => model::list(&config).await,
             ModelAction::Set { provider, model } => model::set(&config, &provider, model).await,
         },
-        Commands::Channel { action } => match action {
+        Some(Commands::Channel { action }) => match action {
             ChannelAction::List { json } => channel::list(&config, json).await,
             ChannelAction::Probe { channel: name } => channel::probe(&config, &name).await,
             ChannelAction::Setup { channel: name } => channel::setup(&config, &name).await,
@@ -621,13 +623,13 @@ pub async fn run() -> anyhow::Result<()> {
                 WechatAction::Login => wechat::login().await,
             },
         },
-        Commands::Workday { date } => workday::check(date).await,
-        Commands::Logs {
+        Some(Commands::Workday { date }) => workday::check(date).await,
+        Some(Commands::Logs {
             lines,
             follow,
             stdout,
-        } => logs::run(lines, follow, stdout),
-        Commands::Version => {
+        }) => logs::run(lines, follow, stdout),
+        Some(Commands::Version) => {
             println!("komo {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
@@ -690,6 +692,12 @@ mod tests {
     }
 
     #[test]
+    fn bare_command_defaults_to_chat() {
+        let cli = Cli::try_parse_from(["komo"]).expect("bare komo should parse");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
     fn channel_list_accepts_json_output() {
         assert!(Cli::try_parse_from(["komo", "channel", "list", "--json"]).is_ok());
     }
@@ -702,22 +710,22 @@ mod tests {
 
     #[test]
     fn root_resume_parses_a_bare_session_id() {
-        assert!(Cli::try_parse_from([
-            "komo",
-            "resume",
-            "019fad15-8199-7461-9d48-0a6c779f1c8d",
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from(["komo", "resume", "019fad15-8199-7461-9d48-0a6c779f1c8d",])
+                .is_ok()
+        );
     }
 
     #[test]
     fn session_resume_also_parses_a_bare_api_session_id() {
-        assert!(Cli::try_parse_from([
-            "komo",
-            "session",
-            "resume",
-            "019fad15-8199-7461-9d48-0a6c779f1c8d",
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "komo",
+                "session",
+                "resume",
+                "019fad15-8199-7461-9d48-0a6c779f1c8d",
+            ])
+            .is_ok()
+        );
     }
 }

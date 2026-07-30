@@ -96,7 +96,7 @@ fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> 
         .ok()
 }
 
-/// Whether this invocation will run the full-screen chat TUI (`komo chat` /
+/// Whether this invocation will run the full-screen chat TUI (`komo` / `komo chat` /
 /// `komo resume` / `komo session resume` on a TTY — off a TTY they error out early instead;
 /// see `cli/app.rs::require_terminal`) — checked here because the tracing
 /// writer must be chosen before the CLI parses.
@@ -104,7 +104,8 @@ fn will_run_tui() -> bool {
     use std::io::IsTerminal;
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str);
-    let is_chat = sub == Some("chat")
+    let is_chat = sub.is_none()
+        || sub == Some("chat")
         || sub == Some("resume")
         || (sub == Some("session") && args.get(2).map(String::as_str) == Some("resume"));
     is_chat && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()

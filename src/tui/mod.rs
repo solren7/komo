@@ -263,7 +263,19 @@ async fn drive(
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, connected, session, resuming, workspace).await;
     ratatui::restore();
-    result
+    // Print only after leaving the alternate screen, so the command survives in
+    // the user's normal terminal scrollback and is immediately copyable.
+    if let Ok(session_id) = &result {
+        println!("komo resume {}", resume_command_id(session_id));
+    }
+    result.map(|_| ())
+}
+
+/// API-backed TUI sessions are persisted with an internal `api:` namespace.
+/// Keep that storage detail out of the copyable CLI hint; `resolve_resume_id`
+/// expands the bare UUID when the user resumes it.
+fn resume_command_id(session_id: &str) -> &str {
+    session_id.strip_prefix("api:").unwrap_or(session_id)
 }
 
 async fn event_loop(
@@ -272,7 +284,7 @@ async fn event_loop(
     session: String,
     resuming: bool,
     workspace: PathBuf,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let Connected {
         backend,
         approvals,
@@ -350,7 +362,7 @@ async fn event_loop(
                     Some(Action::Quit) => break,
                     Some(Action::Submit(text)) => {
                         app.push(Role::You, text.clone());
-                        app.in_flight = true;
+                        app.start_turn();
                         // Fresh tool feed for the new turn (seqs restart).
                         app.begin_tools();
                         let backend = backend.clone();
@@ -426,7 +438,7 @@ async fn event_loop(
                 }
             }
             Some(result) = turn_rx.recv() => {
-                app.in_flight = false;
+                app.finish_turn();
                 // A question the turn never resolved dies with it.
                 app.awaiting_answer = false;
                 // No tool is running once the turn is done.
@@ -457,7 +469,7 @@ async fn event_loop(
             }
         }
     }
-    Ok(())
+    Ok(app.session_id)
 }
 
 async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {
@@ -482,4 +494,22 @@ fn startup_workspace() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     cwd.canonicalize()
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_command_id;
+
+    #[test]
+    fn resume_hint_hides_internal_api_namespace() {
+        assert_eq!(
+            resume_command_id("api:019fb0ce-9f7a-7c23-a87d-dab9df9216d8"),
+            "019fb0ce-9f7a-7c23-a87d-dab9df9216d8"
+        );
+    }
+
+    #[test]
+    fn resume_hint_preserves_non_api_session_ids() {
+        assert_eq!(resume_command_id("telegram:12345"), "telegram:12345");
+    }
 }

@@ -64,8 +64,9 @@ is not idempotent):
   `RunRecord`/`RunStepRecord`→state.db).
 - **Column additions never need a reset**: `infra/persistence/mod.rs::ensure_columns`
   ALTERs in place on connect. Extend `EXPECTED` in `memory_db.rs` for
-  `MemoryRecord` columns, `SESSION_COLUMNS`/`STEP_COLUMNS` in `db.rs::connect`
-  for session/run-step columns. Columns must be NOT NULL + DEFAULT, or nullable.
+  `MemoryRecord` columns, and the matching list in `db.rs::connect` for
+  state.db (`SESSION_COLUMNS` / `MESSAGE_COLUMNS` / `RUN_COLUMNS` /
+  `STEP_COLUMNS`). Columns must be NOT NULL + DEFAULT, or nullable.
   Durable data (memory.db) must **only** ever change additively.
 
 Turso/toasty invariants (`infra/persistence/`, `infra/memory/memory_db.rs` —

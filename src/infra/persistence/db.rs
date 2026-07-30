@@ -76,6 +76,12 @@ struct MessageRecord {
     role: String,
     content: String,
     timestamp: i64,
+
+    /// The turn's tool-activity digest for an assistant message (`domain/run.rs
+    /// ::tool_digest`), carried into later turns' model history. Empty = none,
+    /// which is also what a row written before the column reads as. Additive
+    /// column (see `MESSAGE_COLUMNS`).
+    tool_note: String,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -158,6 +164,11 @@ struct RunRecord {
     recoverable: bool,
     started_at: i64,
     ended_at: i64,
+
+    /// Tokens the turn's model round-trips spent. Additive columns (see
+    /// `RUN_COLUMNS`); 0 = unknown, which is what a pre-column row reads as.
+    tokens_in: i64,
+    tokens_out: i64,
 }
 
 /// One tool invocation within a run. `run_id` indexes back to [`RunRecord`];
@@ -244,10 +255,17 @@ impl Db {
                 ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
-            const RUN_COLUMNS: &[(&str, &str)] = &[(
-                "recoverable",
-                "\"recoverable\" boolean NOT NULL DEFAULT false",
-            )];
+            const MESSAGE_COLUMNS: &[(&str, &str)] =
+                &[("tool_note", "\"tool_note\" text NOT NULL DEFAULT ''")];
+            ensure_columns(p, "message_records", MESSAGE_COLUMNS).await?;
+            const RUN_COLUMNS: &[(&str, &str)] = &[
+                (
+                    "recoverable",
+                    "\"recoverable\" boolean NOT NULL DEFAULT false",
+                ),
+                ("tokens_in", "\"tokens_in\" integer NOT NULL DEFAULT 0"),
+                ("tokens_out", "\"tokens_out\" integer NOT NULL DEFAULT 0"),
+            ];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
             const STEP_COLUMNS: &[(&str, &str)] = &[
                 ("elapsed_ms", "\"elapsed_ms\" integer NOT NULL DEFAULT 0"),
@@ -349,6 +367,7 @@ impl SessionRepository for Db {
                 role: parse_role(&r.role),
                 content: r.content,
                 timestamp: r.timestamp,
+                tool_note: r.tool_note,
             })
             .collect();
         Ok(Some(Session {
@@ -488,6 +507,7 @@ impl SessionRepository for Db {
                     role: msg.role.clone(),
                     content: msg.content.clone(),
                     timestamp: msg.timestamp,
+                    tool_note: msg.tool_note.clone(),
                 })
                 .exec(&mut tx)
                 .await?;
@@ -658,6 +678,7 @@ impl MessageRepository for Db {
                 role: parse_role(&r.role),
                 content: r.content,
                 timestamp: r.timestamp,
+                tool_note: r.tool_note,
             })
             .collect();
         Ok(messages)
@@ -689,6 +710,7 @@ impl MessageRepository for Db {
                 role: role,
                 content: message.content.clone(),
                 timestamp: message.timestamp,
+                tool_note: message.tool_note.clone(),
             })
             .exec(&mut conn)
             .await?;
@@ -1031,6 +1053,8 @@ impl RunRepository for Db {
                 recoverable: run.recoverable,
                 started_at: run.started_at,
                 ended_at: run.ended_at.unwrap_or(0),
+                tokens_in: run.tokens_in,
+                tokens_out: run.tokens_out,
             })
             .exec(&mut conn)
             .await?;
@@ -1083,6 +1107,8 @@ impl RunRepository for Db {
                 .final_output(run.final_output.clone())
                 .error(run.error.clone())
                 .ended_at(run.ended_at.unwrap_or(0))
+                .tokens_in(run.tokens_in)
+                .tokens_out(run.tokens_out)
                 .exec(&mut conn)
                 .await?;
             Ok(())
@@ -1215,6 +1241,8 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         recoverable: record.recoverable,
         started_at: record.started_at,
         ended_at: (record.ended_at != 0).then_some(record.ended_at),
+        tokens_in: record.tokens_in,
+        tokens_out: record.tokens_out,
     })
 }
 
@@ -1270,6 +1298,7 @@ async fn session_from_record(
             role: parse_role(&r.role),
             content: r.content,
             timestamp: r.timestamp,
+            tool_note: r.tool_note,
         })
         .collect();
     messages.sort_by_key(|m| m.timestamp);
@@ -1424,6 +1453,8 @@ mod tests {
             recoverable: false,
             started_at,
             ended_at: Some(started_at + 1),
+            tokens_in: 0,
+            tokens_out: 0,
         };
         for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
             let run = make(id, t);
@@ -1903,6 +1934,7 @@ mod tests {
                 },
                 content: format!("m{i}"),
                 timestamp: 1_000,
+                tool_note: String::new(),
             };
             MessageRepository::save(&db, sid, &msg).await.unwrap();
         }
@@ -2038,6 +2070,30 @@ mod tests {
         let candidates = SessionRepository::review_candidates(&db).await.unwrap();
         let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
         assert_eq!(c.reviewed_through, 1);
+
+        // 4. Same contract for `message_records.tool_note`: a pre-migration row
+        //    reads as "no note", and the column is writable straight away.
+        assert!(
+            session.messages[0].tool_note.is_empty(),
+            "a pre-column message has no tool note"
+        );
+        MessageRepository::save(
+            &db,
+            "cli:old",
+            &Message::assistant("done").with_tool_note("[tools used] read foo"),
+        )
+        .await
+        .unwrap();
+        // Located by content, not position: the seeded legacy row's key is the
+        // literal `m1`, which sorts *after* a UUIDv7 id.
+        let messages = MessageRepository::list_by_session(&db, "cli:old")
+            .await
+            .unwrap();
+        let saved = messages
+            .iter()
+            .find(|m| m.content == "done")
+            .expect("the note-bearing message round-trips");
+        assert!(saved.tool_note.contains("read foo"));
     }
 
     /// A state.db created before `recoverable` existed must gain the column
@@ -2096,6 +2152,21 @@ mod tests {
         assert_eq!(flipped, 1);
         let runs = RunRepository::list(&db, 10).await.unwrap();
         assert!(runs[0].recoverable, "interrupted run became resumable");
+        assert_eq!(
+            (runs[0].tokens_in, runs[0].tokens_out),
+            (0, 0),
+            "pre-column rows read as unknown usage, not as a free turn"
+        );
+
+        // 4. The token columns are writable on the same connection.
+        let mut fresh = Run::start("cli:old", "how much did that cost");
+        fresh.tokens_in = 900;
+        fresh.tokens_out = 120;
+        RunRepository::start(&db, &fresh).await.unwrap();
+        fresh.status = RunStatus::Done;
+        RunRepository::finish(&db, &fresh).await.unwrap();
+        let stored = RunRepository::get(&db, &fresh.id).await.unwrap().unwrap();
+        assert_eq!((stored.tokens_in, stored.tokens_out), (900, 120));
     }
 
     /// A stale watermark write (the runtime reviewer's detached task finishing

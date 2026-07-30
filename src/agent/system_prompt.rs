@@ -426,6 +426,7 @@ mod tests {
             max_turn_result_bytes: crate::config::DEFAULT_MAX_TURN_RESULT_BYTES,
             tool_timeout_secs: crate::config::DEFAULT_TOOL_TIMEOUT_SECS,
             max_history_messages: crate::config::DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: crate::config::DEFAULT_MAX_HISTORY_BYTES,
             llm_timeout_secs: crate::config::DEFAULT_LLM_TIMEOUT_SECS,
         }
     }

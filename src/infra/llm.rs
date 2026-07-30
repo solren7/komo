@@ -10,7 +10,8 @@ use rig::{
     agent::Agent,
     client::{ClientBuilder, CompletionClient},
     completion::{
-        AssistantContent, Completion, CompletionModel, Message as RigMessage, Prompt,
+        AssistantContent, Completion, CompletionModel, GetTokenUsage, Message as RigMessage,
+        Prompt, Usage,
         message::{ToolResultContent, UserContent},
     },
     providers::{anthropic, deepseek, openai, openrouter},
@@ -21,7 +22,7 @@ use serde_json::{Value, json};
 use crate::{
     config::{ModelConfig, Provider, split_model_id},
     domain::{
-        llm::{LlmClient, Step, ToolCallReq, ToolOutcome, TurnDriver},
+        llm::{LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
         message::{Message, Role},
         session::Session,
     },
@@ -29,7 +30,7 @@ use crate::{
         codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
         rig_tool::RigTool,
     },
-    services::memory_enrichment::MemoryEnricher,
+    services::{memory_enrichment::MemoryEnricher, tool_execution::retry::should_retry},
 };
 
 /// Produces the system prompt (preamble) on demand. Called once per user turn
@@ -79,6 +80,11 @@ pub struct RigLlm<M: CompletionModel> {
     /// long-lived chat session sending its entire transcript every turn — see
     /// [`RigLlm::assemble`].
     max_history_messages: usize,
+    /// Byte budget for the replayed history (`0` = unlimited). The message-count
+    /// window alone can't bound context: a handful of pasted logs or diffs blows
+    /// past any token limit while sitting well inside the count. Applied after the
+    /// count window, trimming from the oldest end.
+    max_history_bytes: usize,
     /// Optional per-turn memory enrichment. `Some` only for the main agent —
     /// aux/delegate sub-agents must not be fed the user's memory library. The
     /// enricher owns the whole memory policy (selection, screening, rendering,
@@ -97,9 +103,61 @@ pub struct RigLlm<M: CompletionModel> {
     timeout: Option<Duration>,
 }
 
+/// Total attempts for one model round-trip whose failure classifies as transient
+/// (1 initial + retries). A constant rather than config, for the same reason the
+/// tool executor's is: transient retry is an internal robustness backstop.
+const LLM_RETRY_MAX_ATTEMPTS: usize = 3;
+/// Backoff before each retry, indexed by retry number (last entry reused). Longer
+/// than the tool executor's: the usual transient completion failure is provider
+/// rate-limiting, which does not clear in a quarter second.
+const LLM_RETRY_BACKOFF_MS: [u64; 2] = [500, 2_000];
+
+/// Re-run `attempt` while its failure looks transient, bounded by
+/// [`LLM_RETRY_MAX_ATTEMPTS`].
+///
+/// Without this, the single most failure-prone call in a turn was the only one
+/// with no retry: tool calls have classified retry (`tool_execution::retry`),
+/// while one 429 or connection reset on round 11 of a long tool chain threw away
+/// all ten rounds of work and handed the user a failure placeholder. A completion
+/// has no side effect that could double-apply, so it is idempotent by
+/// construction — both connection-level and ambiguous failures are safe to
+/// re-send, and the classifier is shared with the tool path so the two can't
+/// drift on what "transient" means.
+///
+/// Deliberately nested *inside* [`with_timeout`] by every caller: the configured
+/// timeout is then a budget for the whole round (attempts included), so retrying
+/// can't multiply a turn's worst-case latency, and our own timeout error — whose
+/// text would otherwise classify as ambiguous — is never itself retried.
+async fn with_retry<F, Fut, T>(mut attempt: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut retries = 0usize;
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if retries + 1 >= LLM_RETRY_MAX_ATTEMPTS || !should_retry(&error, true) {
+            return Err(error);
+        }
+        let delay = LLM_RETRY_BACKOFF_MS[retries.min(LLM_RETRY_BACKOFF_MS.len() - 1)];
+        tracing::warn!(
+            attempt = retries + 1,
+            delay_ms = delay,
+            error = %format!("{error:#}"),
+            "transient LLM failure; retrying the completion"
+        );
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        retries += 1;
+    }
+}
+
 /// Run `fut` under `timeout` (if set), turning a stall into a clean error rather
 /// than an indefinite await. Shared by the tool-less `complete` path and every
-/// tool-loop round.
+/// tool-loop round. Wraps [`with_retry`], so the budget covers every attempt of
+/// one round rather than each attempt separately.
 async fn with_timeout<F, T>(timeout: Option<Duration>, fut: F) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
@@ -250,18 +308,19 @@ where
         // unbounded token cost and latency, eventually overflowing the context
         // window. The stable system-prompt + memory prefix is untouched, so the
         // upstream prompt cache is unaffected by trimming the tail.
-        let prior = &session.messages[..last_user_idx];
-        let mut window: &[Message] = match self.max_history_messages {
-            0 => prior,
-            n => &prior[prior.len().saturating_sub(n)..],
-        };
-        // The transcript strictly alternates user/assistant, so a tail cut can
-        // open on an assistant message; drop it so the history starts on a user
-        // turn (Anthropic rejects a leading assistant message).
-        if window.first().is_some_and(|m| m.role == Role::Assistant) {
-            window = &window[1..];
-        }
-        let history: Vec<RigMessage> = window.iter().filter_map(to_rig_message).collect();
+        let window = window_history(
+            &session.messages[..last_user_idx],
+            self.max_history_messages,
+            self.max_history_bytes,
+        );
+        // Tool notes only ride along for the most recent turns (see
+        // [`TOOL_NOTE_TURNS`]): find where that tail starts.
+        let notes_from = tool_note_cutoff(window);
+        let history: Vec<RigMessage> = window
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, m)| to_rig_message(m, idx >= notes_from))
+            .collect();
 
         // Rebuild the system prompt for this turn. `Agent` is cheap to clone
         // (`Arc<model>` + an `Arc`-backed tool handle), and its `preamble` field
@@ -346,21 +405,26 @@ where
         if self.stream {
             // Codex: one streamed completion, aggregated to its text. (No tools
             // are exposed here, so a single round is the whole answer.)
-            let (choice, _) = with_timeout(
+            let (choice, _, _) = with_timeout(
                 self.timeout,
-                stream_completion(&agent, RigMessage::user(prompt), history),
+                with_retry(|| {
+                    stream_completion(&agent, RigMessage::user(prompt.clone()), history.clone())
+                }),
             )
             .await?;
             return Ok(choice_text(&choice));
         }
-        let reply = with_timeout(self.timeout, async {
-            agent
-                .prompt(prompt)
-                .history(history)
-                .max_turns(self.max_turns)
-                .await
-                .context("LLM completion failed")
-        })
+        let reply = with_timeout(
+            self.timeout,
+            with_retry(|| async {
+                agent
+                    .prompt(prompt.clone())
+                    .history(history.clone())
+                    .max_turns(self.max_turns)
+                    .await
+                    .context("LLM completion failed")
+            }),
+        )
         .await?;
         Ok(reply)
     }
@@ -373,6 +437,7 @@ where
             pending: Some(RigMessage::user(prompt)),
             stream: self.stream,
             timeout: self.timeout,
+            usage: TokenUsage::default(),
         }))
     }
 }
@@ -390,38 +455,54 @@ struct RigTurnDriver<M: CompletionModel> {
     stream: bool,
     /// Per-round completion timeout (see [`RigLlm::timeout`]).
     timeout: Option<Duration>,
+    /// Tokens spent so far this turn, summed over rounds; read by the runtime for
+    /// the ledger once the turn ends.
+    usage: TokenUsage,
 }
 
 impl<M> RigTurnDriver<M>
 where
     M: CompletionModel + 'static,
 {
-    /// Send one round-trip: complete over `history + prompt`, then commit both
-    /// the prompt and the assistant turn (verbatim — text + tool calls +
-    /// reasoning together) to history so the next round sees a provider-correct
-    /// transcript.
+    /// Send one round-trip: complete over `history + prompt`, then commit the
+    /// assistant turn (verbatim — text + tool calls + reasoning together) to
+    /// history so the next round sees a provider-correct transcript.
+    ///
+    /// The prompt is pushed onto `history` up front and split back off a single
+    /// clone per attempt. rig's `completion(prompt, chat_history)` takes both by
+    /// value, so one clone of the round's messages is unavoidable; what this
+    /// avoids is cloning the prompt *separately* from the history it will join,
+    /// and it keeps every retry attempt reading one source of truth for the
+    /// round's transcript.
     async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
-        let (choice, message_id) = if self.stream {
-            with_timeout(
-                self.timeout,
-                stream_completion(&self.agent, prompt.clone(), self.history.clone()),
-            )
-            .await?
-        } else {
-            with_timeout(self.timeout, async {
-                let resp = self
-                    .agent
-                    .completion(prompt.clone(), self.history.clone())
+        self.history.push(prompt);
+        let stream = self.stream;
+        let agent = &self.agent;
+        let history = &self.history;
+
+        let (choice, message_id, usage) = with_timeout(
+            self.timeout,
+            with_retry(|| async move {
+                let mut messages = history.clone();
+                let prompt = messages
+                    .pop()
+                    .expect("history holds the prompt pushed just above");
+                if stream {
+                    return stream_completion(agent, prompt, messages).await;
+                }
+                let resp = agent
+                    .completion(prompt, messages)
                     .await
                     .context("failed to build completion request")?
                     .send()
                     .await
                     .context("LLM completion failed")?;
-                Ok::<_, anyhow::Error>((resp.choice, resp.message_id))
-            })
-            .await?
-        };
-        self.history.push(prompt);
+                Ok((resp.choice, resp.message_id, token_usage(&resp.usage)))
+            }),
+        )
+        .await?;
+
+        self.usage.add(usage);
         self.history.push(RigMessage::Assistant {
             id: message_id,
             content: choice.clone(),
@@ -458,6 +539,19 @@ where
             .map_err(|_| anyhow::anyhow!("no tool results to send back"))?;
         self.run(RigMessage::User { content }).await
     }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+}
+
+/// rig's per-response usage in komo's ledger units. A provider that reports
+/// nothing yields zeros, which the ledger already reads as *unknown*.
+fn token_usage(usage: &Usage) -> TokenUsage {
+    TokenUsage {
+        input: usage.input_tokens as i64,
+        output: usage.output_tokens as i64,
+    }
 }
 
 /// Run one streamed completion to exhaustion and return the aggregated assistant
@@ -470,7 +564,7 @@ async fn stream_completion<M>(
     agent: &Agent<M>,
     prompt: RigMessage,
     history: Vec<RigMessage>,
-) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>)>
+) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>, TokenUsage)>
 where
     M: CompletionModel + 'static,
 {
@@ -484,7 +578,14 @@ where
     while let Some(item) = stream.next().await {
         item.context("LLM completion failed")?;
     }
-    Ok((stream.choice.clone(), stream.message_id.clone()))
+    // Usage rides on the provider's final response frame, which not every
+    // provider sends — absent means unknown, same as zeros.
+    let usage = stream
+        .response
+        .as_ref()
+        .map(|r| token_usage(&r.token_usage()))
+        .unwrap_or_default();
+    Ok((stream.choice.clone(), stream.message_id.clone(), usage))
 }
 
 /// Concatenate the text blocks of an assistant turn (ignoring tool calls /
@@ -503,6 +604,11 @@ fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
 /// a [`Step::ToolCalls`]; otherwise the concatenated text is the final answer.
 /// Reasoning/image blocks are ignored for control flow (the driver still echoes
 /// them back into history verbatim).
+///
+/// Text found *alongside* tool calls travels with them rather than being dropped:
+/// it is the model narrating what it is about to do, which is the only account of
+/// its reasoning a watcher gets (komo has no token streaming) and the honest thing
+/// to fall back on if the round budget ends the turn early.
 fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
     let mut calls = Vec::new();
     let mut text = String::new();
@@ -521,7 +627,7 @@ fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
     if calls.is_empty() {
         Step::Final(text)
     } else {
-        Step::ToolCalls(calls)
+        Step::ToolCalls { calls, text }
     }
 }
 
@@ -614,6 +720,7 @@ fn build_provider_llm(
     let base = config.base_url.as_deref();
     let max_turns = config.max_turns;
     let max_history_messages = config.max_history_messages;
+    let max_history_bytes = config.max_history_bytes;
     // The ChatGPT Codex backend only accepts streamed requests; everyone else
     // uses the simpler one-shot path. Declared before `rig_llm!` so the macro's
     // (hygienic) body can capture it alongside `max_turns`/`preamble`/`enricher`.
@@ -648,6 +755,7 @@ fn build_provider_llm(
                 max_turns,
                 preamble,
                 max_history_messages,
+                max_history_bytes,
                 enricher,
                 stream,
                 timeout,
@@ -731,12 +839,82 @@ where
     }
 }
 
+/// Trim `prior` (the transcript before this turn's prompt) to the slice replayed
+/// as model history, under two independent bounds.
+///
+/// Without a window, a long-lived chat session — telegram/feishu/wechat are keyed
+/// by chat id and only rotate on an explicit `/new` — resends its whole transcript
+/// every turn. `max_messages` is the count bound (`0` = keep everything);
+/// `max_bytes` is the size bound (`0` = no size limit), and it exists because a
+/// count says nothing about volume: twenty messages of pasted build output
+/// overflow a context that two hundred chat lines sit inside. Both trim from the
+/// oldest end, so the stable system prompt and memory prefix are untouched and the
+/// upstream prompt cache is unaffected.
+fn window_history(prior: &[Message], max_messages: usize, max_bytes: usize) -> &[Message] {
+    let mut window = match max_messages {
+        0 => prior,
+        n => &prior[prior.len().saturating_sub(n)..],
+    };
+    if max_bytes > 0 {
+        let size = |m: &Message| m.content.len() + m.tool_note.len();
+        let mut total: usize = window.iter().map(size).sum();
+        let mut start = 0;
+        // A single message over the whole budget still gets dropped (the loop runs
+        // to the end): sending it would blow the context on its own, and the turn's
+        // own prompt is never part of this slice, so the model is not left mute.
+        while start < window.len() && total > max_bytes {
+            total -= size(&window[start]);
+            start += 1;
+        }
+        window = &window[start..];
+    }
+    // The transcript strictly alternates user/assistant, so either cut can open on
+    // an assistant message; drop it so history starts on a user turn (Anthropic
+    // rejects a leading assistant message). Applied after both bounds, since
+    // either one can be the cut that lands there.
+    if window.first().is_some_and(|m| m.role == Role::Assistant) {
+        window = &window[1..];
+    }
+    window
+}
+
+/// How many of the most recent assistant turns carry their tool-activity note
+/// (`Message::tool_note`) into the model's history. Older notes are dropped:
+/// "which file did I just read" decays in usefulness far faster than it decays in
+/// context cost, and the run ledger keeps the full record either way.
+const TOOL_NOTE_TURNS: usize = 3;
+
+/// Index in `window` from which assistant messages may carry their tool note —
+/// the start of the last [`TOOL_NOTE_TURNS`] note-bearing turns (`window.len()`
+/// when there are none, i.e. attach nothing).
+fn tool_note_cutoff(window: &[Message]) -> usize {
+    let mut cutoff = window.len();
+    let mut found = 0;
+    for (idx, msg) in window.iter().enumerate().rev() {
+        if msg.role == Role::Assistant && !msg.tool_note.is_empty() {
+            cutoff = idx;
+            found += 1;
+            if found == TOOL_NOTE_TURNS {
+                break;
+            }
+        }
+    }
+    cutoff
+}
+
 /// Map a komo message into a rig chat-history message. The system prompt is
 /// supplied via the preamble, and tool outputs are folded into the following
 /// assistant reply, so both `System` and `Tool` roles are skipped here.
-fn to_rig_message(msg: &Message) -> Option<RigMessage> {
+///
+/// `with_note` appends the turn's tool-activity digest to an assistant message,
+/// which is what lets the *next* turn know tools ran at all — the user-visible
+/// `content` stays exactly what every client renders.
+fn to_rig_message(msg: &Message, with_note: bool) -> Option<RigMessage> {
     match msg.role {
         Role::User => Some(RigMessage::user(msg.content.clone())),
+        Role::Assistant if with_note && !msg.tool_note.is_empty() => Some(RigMessage::assistant(
+            format!("{}\n\n{}", msg.content, msg.tool_note),
+        )),
         Role::Assistant => Some(RigMessage::assistant(msg.content.clone())),
         Role::System | Role::Tool => None,
     }
@@ -861,6 +1039,192 @@ mod tests {
                 .unwrap(),
             "codex"
         );
+    }
+
+    fn turn(user: &str, assistant: &str, note: &str) -> Vec<Message> {
+        vec![
+            Message::user(user),
+            Message::assistant(assistant).with_tool_note(note),
+        ]
+    }
+
+    #[test]
+    fn the_byte_budget_trims_where_the_count_window_cannot() {
+        // Two turns, the first carrying a pasted log. Both fit the count window,
+        // so only the byte bound can keep the big one out — the case the count
+        // window was blind to.
+        let mut prior = turn("here is the log", &"x".repeat(5_000), "");
+        prior.extend(turn("and now?", "short answer", ""));
+
+        let counted = window_history(&prior, 50, 0);
+        assert_eq!(counted.len(), 4, "the count window keeps everything");
+
+        let bounded = window_history(&prior, 50, 1_000);
+        assert_eq!(
+            bounded.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            vec!["and now?", "short answer"],
+            "the oversized turn is trimmed from the oldest end"
+        );
+    }
+
+    #[test]
+    fn a_window_never_opens_on_an_assistant_message() {
+        // Whichever bound makes the cut, a leading assistant message must go:
+        // Anthropic rejects one outright.
+        let mut prior = turn("q1", "a1", "");
+        prior.extend(turn("q2", "a2", ""));
+
+        for window in [
+            window_history(&prior, 3, 0), // count cut lands on "a1"
+            window_history(&prior, 0, 5), // byte cut lands on "a1"
+        ] {
+            assert_eq!(
+                window.first().map(|m| m.role.clone()),
+                Some(Role::User),
+                "history must start on a user turn, got {:?}",
+                window.first().map(|m| &m.content)
+            );
+        }
+    }
+
+    #[test]
+    fn the_byte_budget_is_off_at_zero_and_counts_tool_notes() {
+        let prior = turn("q", "a", &"n".repeat(5_000));
+        assert_eq!(window_history(&prior, 0, 0).len(), 2, "0 = unlimited");
+        // The note is real context sent to the model, so it has to be weighed.
+        assert!(
+            window_history(&prior, 0, 1_000).is_empty(),
+            "a note over the budget must be trimmed like content"
+        );
+    }
+
+    #[test]
+    fn only_the_most_recent_tool_notes_ride_along() {
+        // Five note-bearing turns; the model should see the last TOOL_NOTE_TURNS.
+        let mut prior = Vec::new();
+        for i in 0..5 {
+            prior.extend(turn(
+                &format!("q{i}"),
+                &format!("a{i}"),
+                &format!("note{i}"),
+            ));
+        }
+        let cutoff = tool_note_cutoff(&prior);
+        let rendered: Vec<String> = prior
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, m)| to_rig_message(m, idx >= cutoff))
+            .map(|m| format!("{m:?}"))
+            .collect();
+        let carried = |note: &str| rendered.iter().any(|m| m.contains(note));
+
+        for recent in ["note2", "note3", "note4"] {
+            assert!(carried(recent), "{recent} should still be carried");
+        }
+        for stale in ["note0", "note1"] {
+            assert!(!carried(stale), "{stale} should have aged out");
+        }
+    }
+
+    #[test]
+    fn a_tool_note_never_touches_the_user_visible_content() {
+        let msg = Message::assistant("the answer").with_tool_note("[tools used] read foo.rs");
+        // Carried: the model sees both. Not carried: exactly the reply.
+        let with = format!("{:?}", to_rig_message(&msg, true).unwrap());
+        assert!(with.contains("the answer") && with.contains("read foo.rs"));
+        let without = format!("{:?}", to_rig_message(&msg, false).unwrap());
+        assert!(without.contains("the answer") && !without.contains("read foo.rs"));
+        // And the stored message itself is untouched — every client renders this.
+        assert_eq!(msg.content, "the answer");
+    }
+
+    /// The point of #1: one 429 on a late round must not throw the turn away.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_completion_failure_is_retried() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_retry(|| async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 2 {
+                anyhow::bail!("HTTP 429 Too Many Requests");
+            }
+            Ok("answered")
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "answered");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_completion_failure_is_not_retried() {
+        // An auth or schema error will fail identically forever; retrying it just
+        // delays the message the user needs to see.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("invalid api key") as anyhow::Result<()>
+        })
+        .await
+        .expect_err("terminal errors surface");
+        assert!(format!("{error:#}").contains("invalid api key"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_retries_are_bounded() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let _ = with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("connection refused") as anyhow::Result<()>
+        })
+        .await
+        .expect_err("a permanently down provider still fails");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            LLM_RETRY_MAX_ATTEMPTS
+        );
+    }
+
+    /// The retry budget lives *inside* the timeout, so a flapping provider can't
+    /// multiply a turn's worst-case latency by the attempt count.
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_bounds_every_retry_together() {
+        let started = tokio::time::Instant::now();
+        let error = with_timeout(
+            Some(Duration::from_secs(1)),
+            with_retry(|| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                anyhow::bail!("connection refused") as anyhow::Result<()>
+            }),
+        )
+        .await
+        .expect_err("the round times out");
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn text_alongside_tool_calls_survives_the_step_split() {
+        use rig::completion::message::{ToolCall, ToolFunction};
+        let choice = OneOrMany::many(vec![
+            AssistantContent::text("Let me check the config first."),
+            AssistantContent::ToolCall(ToolCall::new(
+                "call-1".into(),
+                ToolFunction {
+                    name: "read".into(),
+                    arguments: json!({ "path": "config.toml" }),
+                },
+            )),
+        ])
+        .unwrap();
+
+        match choice_to_step(&choice) {
+            Step::ToolCalls { calls, text } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(text, "Let me check the config first.");
+            }
+            Step::Final(_) => panic!("a tool call must not read as a final answer"),
+        }
     }
 
     #[test]

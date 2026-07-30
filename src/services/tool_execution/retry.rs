@@ -6,10 +6,10 @@ use crate::domain::tool::RetryHint;
 /// retries). Kept a constant, not config: transient-error retry is an internal
 /// robustness backstop, not a user tuning knob. Promote to config only when a
 /// real consumer needs to vary it.
-pub(super) const TOOL_RETRY_MAX_ATTEMPTS: usize = 3;
+pub(crate) const TOOL_RETRY_MAX_ATTEMPTS: usize = 3;
 /// Backoff before each retry, indexed by the retry number (the first retry
 /// waits the first entry, etc.); the last entry is reused beyond its length.
-pub(super) const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
+pub(crate) const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
 
 /// How a failed tool call may be retried. Preferred path: a tool classifies its
 /// own failure at the source via [`crate::domain::tool::TransientError`] (the
@@ -20,7 +20,7 @@ pub(super) const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
 /// dropped the typed source. Deliberately conservative: an error matching
 /// neither is [`Retry::No`] (never retried).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Retry {
+pub(crate) enum Retry {
     /// Don't retry — terminal (bad arguments, denied, blocked) or unknown.
     No,
     /// The request provably never reached the server (connection refused, DNS
@@ -60,7 +60,7 @@ const AMBIGUOUS_MARKERS: &[&str] = &[
     "429 too many",
 ];
 
-pub(super) fn classify_error(err: &anyhow::Error) -> Retry {
+pub(crate) fn classify_error(err: &anyhow::Error) -> Retry {
     // Typed hint first: lossless, set where the failure arose. anyhow walks the
     // chain, so a `.context(...)`-wrapped `TransientError` is still found.
     if let Some(te) = err.downcast_ref::<crate::domain::tool::TransientError>() {
@@ -81,7 +81,7 @@ pub(super) fn classify_error(err: &anyhow::Error) -> Retry {
 }
 
 /// Whether a failed call should be retried, given the tool's idempotency.
-pub(super) fn should_retry(err: &anyhow::Error, idempotent: bool) -> bool {
+pub(crate) fn should_retry(err: &anyhow::Error, idempotent: bool) -> bool {
     match classify_error(err) {
         Retry::No => false,
         Retry::ConnLevel => true,

@@ -7,10 +7,11 @@ use crate::{
     agent::review_coordinator::{ReviewCoordinator, ReviewTrigger},
     domain::{
         cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
-        llm::{LlmClient, Step, ToolOutcome},
+        events::TurnEvent,
+        llm::{LlmClient, Step, TokenUsage, ToolOutcome},
         message::Message,
         repository::{MessageRepository, SessionRepository},
-        run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, truncate},
+        run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
         session::Session,
     },
     services::tool_execution::{
@@ -113,6 +114,14 @@ impl AgentRuntime {
             n => format!("{n} tool call(s)"),
         };
         run.ended_at = Some(now());
+        // What the turn's model round-trips cost. Only a completed turn reports
+        // it: a failure surfaces before the driver can be asked, and 0 already
+        // reads as unknown in the ledger.
+        if let Ok((_, usage)) = &outcome {
+            run.tokens_in = usage.input;
+            run.tokens_out = usage.output;
+        }
+        let outcome = outcome.map(|(reply, _)| reply);
         match &outcome {
             Ok(reply) => {
                 run.status = RunStatus::Done;
@@ -148,7 +157,7 @@ impl AgentRuntime {
         session_id: &str,
         user_input: String,
         run: RunContext,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, TokenUsage)> {
         // Load only the recent window for the agent loop — the LLM windows the
         // history to the same bound anyway, so a long-lived chat session no
         // longer deserializes its whole transcript every turn. The reviewer
@@ -170,8 +179,11 @@ impl AgentRuntime {
         self.messages.save(session_id, &user_msg).await?;
         session.messages.push(user_msg);
 
-        let reply = match self.run_agent_loop(&session, run).await {
-            Ok(reply) => reply,
+        // Keep a handle on the run to read the tool-step count after the loop (the
+        // counter is shared via `Arc`) and to fetch the steps themselves.
+        let probe = run.clone();
+        let (reply, usage) = match self.run_agent_loop(&session, run).await {
+            Ok(outcome) => outcome,
             Err(error) => {
                 // The turn failed *after* the user message was persisted. Persist
                 // an assistant turn too, so the transcript stays user/assistant-
@@ -202,7 +214,25 @@ impl AgentRuntime {
             }
         };
 
-        let assistant_msg = Message::assistant(&reply);
+        // Fold this turn's tool activity into a note on the assistant message, so
+        // the *next* turn knows tools ran, what they found, and where an
+        // over-limit output was kept. Without it the transcript carries only
+        // user/assistant text: a follow-up question about something a tool just
+        // read has to re-run the tool or be answered from nothing. Read from the
+        // ledger (already redacted and truncated) rather than tracked separately,
+        // and best-effort like every other ledger interaction.
+        let tool_note = match probe.steps_count() {
+            0 => String::new(),
+            _ => match self.runs.steps(&probe.run_id).await {
+                Ok(steps) => tool_digest(&steps),
+                Err(error) => {
+                    warn!(%error, "failed to read run steps for the tool note (non-fatal)");
+                    String::new()
+                }
+            },
+        };
+
+        let assistant_msg = Message::assistant(&reply).with_tool_note(tool_note);
         self.messages.save(session_id, &assistant_msg).await?;
         session.messages.push(assistant_msg);
 
@@ -224,7 +254,7 @@ impl AgentRuntime {
             });
         }
 
-        Ok(reply)
+        Ok((reply, usage))
     }
 
     /// Await `work`, unless the turn is cancelled first.
@@ -257,7 +287,11 @@ impl AgentRuntime {
     /// the ledger, and the result cap) and the outcomes are threaded back. Once
     /// the per-turn *round* budget is exceeded, feed [`BUDGET_REACHED_NOTE`]
     /// back in place of results and force a final answer.
-    async fn run_agent_loop(&self, session: &Session, run: RunContext) -> anyhow::Result<String> {
+    async fn run_agent_loop(
+        &self,
+        session: &Session,
+        run: RunContext,
+    ) -> anyhow::Result<(String, TokenUsage)> {
         // The executor gets the turn's context explicitly: the run handle this
         // turn opened, and the session established by the dispatcher / api /
         // handle_input (read once here — the one ambient-to-explicit bridge).
@@ -277,13 +311,28 @@ impl AgentRuntime {
         let mut driver = self.llm.begin_turn(session).await?;
         let mut step = Self::until_cancelled(cancel, driver.first()).await?;
         let mut rounds = 0usize;
+        // The model's most recent narration alongside its tool calls. Kept so the
+        // budget cutoff below can answer in the model's own words instead of a
+        // canned line — by then it has usually said what it was doing.
+        let mut narration = String::new();
 
-        loop {
+        let reply = loop {
             match step {
-                Step::Final(text) => return Ok(non_empty(text)),
-                Step::ToolCalls(calls) => {
+                Step::Final(text) => break non_empty(text),
+                Step::ToolCalls { calls, text } => {
                     rounds += 1;
                     let over_budget = rounds > self.max_turns;
+
+                    // Text the model wrote in the same breath as its tool calls.
+                    // It never reaches a chat channel (the turn hasn't answered
+                    // yet), but a watching client can render it, which is the
+                    // only view komo offers into the model's reasoning mid-turn.
+                    if !text.trim().is_empty() {
+                        if let Some(sink) = &context.session.event_sink {
+                            sink.emit(TurnEvent::AssistantText { text: text.clone() });
+                        }
+                        narration = text;
+                    }
 
                     let results: Vec<ToolOutcome> = if over_budget {
                         calls
@@ -312,18 +361,36 @@ impl AgentRuntime {
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
                     step = if over_budget {
-                        return Ok(non_empty(match next {
+                        break non_empty(match next {
                             Step::Final(text) => text,
-                            Step::ToolCalls(_) => "(Reached the tool-call limit for this turn; \
-                                 answering with what I have.)"
-                                .to_string(),
-                        }));
+                            // It asked for more tools instead of answering. Its
+                            // own last narration is a better account of where the
+                            // turn got to than a canned apology, so prefer it.
+                            Step::ToolCalls { text, .. } => budget_stop_reply(&text, &narration),
+                        });
                     } else {
                         next
                     };
                 }
             }
-        }
+        };
+        Ok((reply, driver.usage()))
+    }
+}
+
+/// The reply for a turn the round budget cut short. The model's own words (this
+/// round's text, else the last narration it managed) beat a canned line — but the
+/// user still has to be told the turn stopped early rather than finished.
+fn budget_stop_reply(current: &str, narration: &str) -> String {
+    const STOPPED: &str = "(Reached the tool-call limit for this turn; \
+         answering with what I have.)";
+    let said = [current, narration]
+        .into_iter()
+        .map(str::trim)
+        .find(|t| !t.is_empty());
+    match said {
+        Some(text) => format!("{text}\n\n{STOPPED}"),
+        None => STOPPED.to_string(),
     }
 }
 
@@ -385,6 +452,13 @@ mod tests {
             self.received.lock().unwrap().push(results);
             Ok(self.steps.pop_front().expect("script exhausted at step()"))
         }
+        fn usage(&self) -> TokenUsage {
+            // A fixed, non-zero pair, so a test can tell "recorded" from "unknown".
+            TokenUsage {
+                input: 1_200,
+                output: 340,
+            }
+        }
     }
 
     /// A tool that echoes its raw input, for asserting result threading.
@@ -435,6 +509,14 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         crate::infra::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
+    }
+
+    /// A tool-call step with no narration — the shape most tests care about.
+    fn tool_calls(calls: Vec<ToolCallReq>) -> Step {
+        Step::ToolCalls {
+            calls,
+            text: String::new(),
+        }
     }
 
     fn call(name: &str, args: &str) -> ToolCallReq {
@@ -521,7 +603,7 @@ mod tests {
         let (rt, _) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("block", "{}")]),
+                tool_calls(vec![call("block", "{}")]),
                 Step::Final("never reached".into()),
             ],
             vec![Arc::new(BlockingTool {
@@ -626,7 +708,7 @@ mod tests {
         let (rt, _) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("time", "{}")]),
+                tool_calls(vec![call("time", "{}")]),
                 Step::Final("the time is now".into()),
             ],
             vec![Arc::new(TimeTool)],
@@ -683,8 +765,8 @@ mod tests {
         let (rt, received) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("echo", "A")]),
-                Step::ToolCalls(vec![call("echo", "B")]),
+                tool_calls(vec![call("echo", "A")]),
+                tool_calls(vec![call("echo", "B")]),
                 Step::Final("done".into()),
             ],
             vec![Arc::new(EchoArgsTool)],
@@ -711,7 +793,7 @@ mod tests {
         let (rt, received) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("fail", "{}")]),
+                tool_calls(vec![call("fail", "{}")]),
                 Step::Final("recovered".into()),
             ],
             vec![Arc::new(FailTool)],
@@ -736,7 +818,7 @@ mod tests {
         let (rt, received) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("nope", "{}")]),
+                tool_calls(vec![call("nope", "{}")]),
                 Step::Final("ok".into()),
             ],
             vec![],
@@ -815,6 +897,142 @@ mod tests {
         assert_eq!(reply, EMPTY_REPLY_FALLBACK);
     }
 
+    /// #5: what the turn cost is recorded on the run, so `komo run list` can price
+    /// a conversation. 0 stays reserved for "the provider told us nothing".
+    #[tokio::test]
+    async fn a_finished_turn_records_its_token_usage() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_tokens.db")).await.unwrap());
+        let (rt, _) = scripted_runtime(db.clone(), vec![Step::Final("hi".into())], vec![], 30);
+        rt.handle_input("cli:tok", "hello".into()).await.unwrap();
+
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs[0].tokens_in, 1_200);
+        assert_eq!(runs[0].tokens_out, 340);
+    }
+
+    /// #3: the turn's tool activity is folded onto the assistant message, so the
+    /// next turn knows tools ran — while the user-visible reply stays the reply.
+    #[tokio::test]
+    async fn a_tool_turn_leaves_a_note_for_the_next_turn() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_tool_note.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("echo", "hello")]),
+                Step::Final("it said hello".into()),
+            ],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+        rt.handle_input("cli:note", "echo something".into())
+            .await
+            .unwrap();
+
+        let messages = MessageRepository::list_by_session(&*db, "cli:note")
+            .await
+            .unwrap();
+        let assistant = messages.last().unwrap();
+        assert_eq!(assistant.content, "it said hello", "reply stays clean");
+        assert!(
+            assistant.tool_note.contains("echo"),
+            "the note should name the tool: {:?}",
+            assistant.tool_note
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_less_turn_leaves_no_note() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_no_note.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![Step::Final("just talk".into())],
+            vec![],
+            30,
+        );
+        rt.handle_input("cli:nonote", "hi".into()).await.unwrap();
+
+        let messages = MessageRepository::list_by_session(&*db, "cli:nonote")
+            .await
+            .unwrap();
+        assert!(messages.last().unwrap().tool_note.is_empty());
+    }
+
+    /// #6: text the model wrote alongside its tool calls reaches a watching
+    /// client. Nothing else in komo surfaces the model's mid-turn reasoning.
+    #[tokio::test]
+    async fn narration_alongside_tool_calls_reaches_the_event_sink() {
+        use crate::domain::events::ToolEventSink;
+
+        #[derive(Default)]
+        struct Captured(Mutex<Vec<TurnEvent>>);
+        impl ToolEventSink for Captured {
+            fn emit(&self, event: TurnEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_narration.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls {
+                    calls: vec![call("time", "{}")],
+                    text: "Checking the clock first.".into(),
+                },
+                Step::Final("it is late".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+
+        let sink = Arc::new(Captured::default());
+        let ctx = SessionContext::detached("cli:narr").with_event_sink(sink.clone());
+        let reply = with_session(ctx, rt.handle_input("cli:narr", "what time".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(reply, "it is late", "narration is not the answer");
+        let narrated: Vec<String> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::AssistantText { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrated, vec!["Checking the clock first."]);
+    }
+
+    #[test]
+    fn the_budget_cutoff_prefers_the_models_own_words() {
+        // This round's text wins; the last narration is the fallback; a silent
+        // model gets the canned line. Either way the user is told it stopped early.
+        let reply = budget_stop_reply("Still digging through the logs.", "earlier note");
+        assert!(reply.starts_with("Still digging through the logs."));
+        assert!(reply.contains("tool-call limit"));
+
+        let fallback = budget_stop_reply("  ", "earlier note");
+        assert!(fallback.starts_with("earlier note"));
+
+        let silent = budget_stop_reply("", "");
+        assert!(silent.contains("tool-call limit"));
+        assert!(!silent.contains("\n\n"));
+    }
+
     #[tokio::test]
     async fn round_budget_forces_a_final_answer() {
         let db = Arc::new(Db::connect(&sqlite_url("komo_rt_budget.db")).await.unwrap());
@@ -822,10 +1040,10 @@ mod tests {
         let (rt, _) = scripted_runtime(
             db.clone(),
             vec![
-                Step::ToolCalls(vec![call("time", "{}")]),
-                Step::ToolCalls(vec![call("time", "{}")]),
-                Step::ToolCalls(vec![call("time", "{}")]),
-                Step::ToolCalls(vec![call("time", "{}")]),
+                tool_calls(vec![call("time", "{}")]),
+                tool_calls(vec![call("time", "{}")]),
+                tool_calls(vec![call("time", "{}")]),
+                tool_calls(vec![call("time", "{}")]),
             ],
             vec![Arc::new(TimeTool)],
             2,

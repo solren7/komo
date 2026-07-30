@@ -16,7 +16,10 @@
 
 pub mod context;
 mod result;
-mod retry;
+/// Transient-error classification. `pub(crate)` because the LLM adapter retries
+/// its completions on the same classification (`infra::llm::with_retry`) — one
+/// definition of "transient", so the tool path and the model path can't drift.
+pub(crate) mod retry;
 
 use std::collections::HashMap;
 use std::sync::Arc;

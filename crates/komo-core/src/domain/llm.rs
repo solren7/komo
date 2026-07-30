@@ -8,7 +8,38 @@ use super::session::Session;
 /// tools the runtime must execute and feed back.
 pub enum Step {
     Final(String),
-    ToolCalls(Vec<ToolCallReq>),
+    ToolCalls {
+        calls: Vec<ToolCallReq>,
+        /// Text the model wrote in the *same* assistant turn as the calls — the
+        /// "let me check the config first" narration providers emit alongside
+        /// tool use. Not part of the final reply (the turn hasn't answered yet),
+        /// but the only place a watcher can see the model's reasoning as it
+        /// works, and the honest thing to say when the round budget cuts the
+        /// turn short. Empty for a model that only emits calls.
+        text: String,
+    },
+}
+
+/// Tokens one turn spent, accumulated across its model round-trips. Zero means
+/// *unknown* (a provider that reports no usage) as much as it means "none" —
+/// the ledger treats both as absent, same convention as `elapsed_ms`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: i64,
+    pub output: i64,
+}
+
+impl TokenUsage {
+    /// Fold another round's usage in. Saturating: a provider reporting nonsense
+    /// must not panic a turn in release *or* debug.
+    pub fn add(&mut self, other: TokenUsage) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0
+    }
 }
 
 /// A tool call the model requested. Rig-agnostic on purpose — the seam carries
@@ -44,6 +75,12 @@ pub trait TurnDriver: Send {
     async fn first(&mut self) -> anyhow::Result<Step>;
     /// Feed the previous round's tool results back and get the next round-trip.
     async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step>;
+    /// Tokens spent across every round this driver has run so far. Read by the
+    /// runtime once the turn ends, for the ledger. Defaults to zero — a backend
+    /// whose provider reports no usage simply records nothing.
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
 }
 
 /// Abstraction over a large-language-model backend.

@@ -51,9 +51,7 @@ pub fn folder_workspace_id(dir: &Path) -> anyhow::Result<String> {
     if !dir.is_dir() {
         anyhow::bail!("workspace `{}` is not a directory", dir.display());
     }
-    let path = dir
-        .to_str()
-        .context("workspace path is not valid UTF-8")?;
+    let path = dir.to_str().context("workspace path is not valid UTF-8")?;
     Ok(format!(
         "folder:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_bytes())
@@ -541,11 +539,7 @@ impl GatewayClient {
         } else {
             request
         };
-        let mut resp = request
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut resp = request.json(&body).send().await?.error_for_status()?;
 
         let mut reply = String::new();
         let mut buf = String::new();
@@ -577,13 +571,19 @@ mod workspace_tests {
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .unwrap();
-        assert_eq!(Path::new(std::str::from_utf8(&decoded).unwrap()), dir.canonicalize().unwrap());
+        assert_eq!(
+            Path::new(std::str::from_utf8(&decoded).unwrap()),
+            dir.canonicalize().unwrap()
+        );
     }
 
     #[test]
     fn folder_workspace_path_decodes_an_existing_directory() {
         let dir = std::env::temp_dir();
-        assert_eq!(folder_workspace_path(&folder_workspace_id(&dir).unwrap()), Some(dir.canonicalize().unwrap()));
+        assert_eq!(
+            folder_workspace_path(&folder_workspace_id(&dir).unwrap()),
+            Some(dir.canonicalize().unwrap())
+        );
         assert_eq!(folder_workspace_path("folder:not-base64"), None);
     }
 

@@ -222,6 +222,17 @@ pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
 
 /// A step's measured duration, at the precision a reader cares about: whole
 /// milliseconds below a second, then one decimal, then whole seconds.
+/// Token usage as a compact ` (12.3k tok)` suffix for the run list; empty when
+/// the provider reported nothing (0 = unknown, never "free").
+fn fmt_tokens(tokens_in: i64, tokens_out: i64) -> String {
+    let total = tokens_in.saturating_add(tokens_out);
+    match total {
+        0 => String::new(),
+        n if n < 1000 => format!("  {n} tok"),
+        n => format!("  {:.1}k tok", n as f64 / 1000.0),
+    }
+}
+
 fn fmt_elapsed(ms: i64) -> String {
     match ms {
         ms if ms < 1000 => format!("{ms}ms"),
@@ -256,12 +267,13 @@ pub async fn run_list(control: &OperatorControl, limit: usize) -> anyhow::Result
     }
     for r in runs {
         println!(
-            "{}  [{}]{}  {}  {}  {}",
+            "{}  [{}]{}  {}  {}{}  {}",
             r.id,
             r.status.as_str(),
             if r.recoverable { " ⟲" } else { "" },
             local_time(r.started_at),
             if r.plan.is_empty() { "-" } else { &r.plan },
+            fmt_tokens(r.tokens_in, r.tokens_out),
             oneline(&r.input, 60),
         );
     }
@@ -290,6 +302,11 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     }
     if !run.plan.is_empty() {
         println!("plan    {}", run.plan);
+    }
+    // 0/0 means the provider reported no usage (or the row predates the columns),
+    // so say nothing rather than claim a free turn.
+    if run.tokens_in != 0 || run.tokens_out != 0 {
+        println!("tokens  {} in / {} out", run.tokens_in, run.tokens_out);
     }
     println!("input   {}", oneline(&run.input, 200));
     if !run.error.is_empty() {

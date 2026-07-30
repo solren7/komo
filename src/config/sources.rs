@@ -69,6 +69,7 @@ pub struct KomoEnv {
     pub max_turn_result_bytes: Option<usize>,
     pub tool_timeout_secs: Option<u64>,
     pub max_history_messages: Option<usize>,
+    pub max_history_bytes: Option<usize>,
     pub llm_timeout_secs: Option<u64>,
     pub review_interval: Option<usize>,
     pub skills_path: Option<String>,
@@ -146,6 +147,7 @@ impl KomoEnv {
             max_turn_result_bytes,
             tool_timeout_secs,
             max_history_messages,
+            max_history_bytes,
             llm_timeout_secs,
             review_interval,
             skills_path,
@@ -265,6 +267,10 @@ pub struct FileConfig {
     /// model every turn (default: 50; `0` = unlimited). See
     /// `infra::llm::RigLlm::assemble`.
     pub max_history_messages: Option<usize>,
+    /// Byte budget for the replayed history per turn (default: 262144; `0` =
+    /// unlimited). The companion bound to `max_history_messages`: a count window
+    /// cannot stop a few pasted logs or diffs from overflowing the context.
+    pub max_history_bytes: Option<usize>,
     /// Per-completion timeout in seconds — a hung provider request fails the
     /// turn cleanly instead of wedging it in `running` (default: 180; `0` =
     /// no timeout). See `infra::llm::RigLlm`.

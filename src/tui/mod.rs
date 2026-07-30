@@ -87,10 +87,11 @@ impl Backend {
             // Remote turns run server-side; stream their tool events over SSE
             // and forward each onto the loop's event channel.
             Backend::Remote { gateway, workspace } => {
-                gateway.chat_streaming_in_workspace(session_id, &input, workspace, |ev| {
-                    let _ = events.send(ev);
-                })
-                .await
+                gateway
+                    .chat_streaming_in_workspace(session_id, &input, workspace, |ev| {
+                        let _ = events.send(ev);
+                    })
+                    .await
             }
             // Local turns emit tool events through the sink on `ctx` (set by the
             // caller); the `events` sender is unused on this arm.
@@ -161,9 +162,11 @@ async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String
             sessions
                 .iter()
                 .find(|s| s.id == id)
-                .or_else(|| candidate.as_ref().and_then(|candidate| {
-                    sessions.iter().find(|s| s.id == *candidate)
-                }))
+                .or_else(|| {
+                    candidate
+                        .as_ref()
+                        .and_then(|candidate| sessions.iter().find(|s| s.id == *candidate))
+                })
                 .map(|s| s.id.clone())
         }
         Backend::Local { db, .. } => {
@@ -178,8 +181,7 @@ async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String
             }
         }
     };
-    resolved
-        .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
+    resolved.ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
 }
 
 async fn resume_messages(backend: &Backend, id: &str) -> anyhow::Result<Vec<Message>> {
@@ -435,6 +437,13 @@ async fn event_loop(
                     TurnEvent::ToolFinished { seq, name, ok, summary, .. } => {
                         app.tool_finished(seq, name, ok, summary);
                     }
+                    // Mid-turn narration: the agent saying what it is about to
+                    // do. Rendered as agent speech (which it is) ahead of the
+                    // tool lines it explains; the turn's answer still arrives
+                    // separately via `turn_rx`.
+                    TurnEvent::AssistantText { text } => {
+                        app.push(Role::Agent, text);
+                    }
                 }
             }
             Some(result) = turn_rx.recv() => {
@@ -475,11 +484,7 @@ async fn event_loop(
 async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {
     if SessionRepository::find(db, session_id).await?.is_none() {
         let workspace_id = folder_workspace_id(workspace)?;
-        SessionRepository::save(
-            db,
-            &Session::with_workspace(session_id, workspace_id),
-        )
-        .await?;
+        SessionRepository::save(db, &Session::with_workspace(session_id, workspace_id)).await?;
     }
     Ok(())
 }
@@ -492,8 +497,7 @@ fn new_session_id() -> String {
 /// so later `cd`s in child shells must not redirect a conversation's tools.
 fn startup_workspace() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    cwd.canonicalize()
-        .map_err(Into::into)
+    cwd.canonicalize().map_err(Into::into)
 }
 
 #[cfg(test)]

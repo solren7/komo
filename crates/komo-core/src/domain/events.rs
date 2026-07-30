@@ -40,6 +40,12 @@ pub enum TurnEvent {
         #[serde(default)]
         started_at_ms: i64,
     },
+    /// Text the model wrote in the same assistant turn as its tool calls — the
+    /// "checking the config first" narration. It is not the turn's answer (that
+    /// arrives as the reply), and it is never persisted; this is the one place a
+    /// client can watch the model reason, since komo's tool loop does no
+    /// token-level streaming.
+    AssistantText { text: String },
     /// A tool call finished (after any transient-error retries collapse).
     ToolFinished {
         seq: i64,

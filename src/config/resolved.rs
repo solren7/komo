@@ -72,6 +72,14 @@ pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 /// disables the window (replay the whole transcript, the pre-windowing behavior).
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
+/// Built-in default for `max_history_bytes`. The companion bound to
+/// [`DEFAULT_MAX_HISTORY_MESSAGES`]: a message *count* says nothing about size, so
+/// fifty messages of pasted build logs overflow a context that fifty chat lines
+/// sit comfortably inside. 256 KB is roughly 64k tokens of history — generous for
+/// a chat assistant, and well clear of every menu model's window once the system
+/// prompt and this turn's tool output are added. `0` disables the byte bound.
+pub const DEFAULT_MAX_HISTORY_BYTES: usize = 256 * 1024;
+
 /// Built-in reviewer cadence: run the reflective reviewer every N user turns
 /// when `KOMO_REVIEW_INTERVAL` doesn't set one.
 pub const DEFAULT_REVIEW_INTERVAL: usize = 10;
@@ -215,6 +223,9 @@ pub struct ModelConfig {
     pub tool_timeout_secs: u64,
     /// Max prior messages replayed as history per turn (`0` = unlimited).
     pub max_history_messages: usize,
+    /// Byte budget for that replayed history (`0` = unlimited). Applied after the
+    /// count window, trimming from the oldest end.
+    pub max_history_bytes: usize,
     /// Per-completion timeout in seconds — a hung provider request fails the
     /// turn cleanly rather than wedging it forever (`0` = no timeout).
     pub llm_timeout_secs: u64,
@@ -234,6 +245,7 @@ impl fmt::Debug for ModelConfig {
             .field("max_turn_result_bytes", &self.max_turn_result_bytes)
             .field("tool_timeout_secs", &self.tool_timeout_secs)
             .field("max_history_messages", &self.max_history_messages)
+            .field("max_history_bytes", &self.max_history_bytes)
             .field("llm_timeout_secs", &self.llm_timeout_secs)
             .finish()
     }
@@ -345,6 +357,7 @@ impl ModelConfig {
             max_turn_result_bytes: self.max_turn_result_bytes,
             tool_timeout_secs: self.tool_timeout_secs,
             max_history_messages: self.max_history_messages,
+            max_history_bytes: self.max_history_bytes,
             llm_timeout_secs: self.llm_timeout_secs,
         }
     }
@@ -367,6 +380,7 @@ impl ModelConfig {
             max_turn_result_bytes: self.max_turn_result_bytes,
             tool_timeout_secs: self.tool_timeout_secs,
             max_history_messages: self.max_history_messages,
+            max_history_bytes: self.max_history_bytes,
             llm_timeout_secs: self.llm_timeout_secs,
         }
     }
@@ -548,6 +562,10 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .max_history_messages
             .or(file.max_history_messages)
             .unwrap_or(DEFAULT_MAX_HISTORY_MESSAGES),
+        max_history_bytes: env
+            .max_history_bytes
+            .or(file.max_history_bytes)
+            .unwrap_or(DEFAULT_MAX_HISTORY_BYTES),
         llm_timeout_secs: env
             .llm_timeout_secs
             .or(file.llm_timeout_secs)
@@ -1339,6 +1357,7 @@ mod tests {
             max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
             llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
         }
     }
@@ -1426,6 +1445,7 @@ mod tests {
             max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
             llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
         };
         let s = format!("{cfg:?}");

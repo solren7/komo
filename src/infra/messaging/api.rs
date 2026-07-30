@@ -29,9 +29,9 @@
 //! the bearer-key middleware. Only loopback origins are allowed and credentials
 //! are off, so the bearer key remains the sole thing that grants access.
 
-use std::{convert::Infallible, time::Duration};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{convert::Infallible, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -970,10 +970,7 @@ fn resolve_session(headers: &axum::http::HeaderMap) -> (String, bool) {
         // namespaced, so adding `api:` again creates an empty conversation.
         // Strip every accidental legacy prefix too, so `api:api:<uuid>` repairs
         // itself on the next request instead of becoming a third identity.
-        (
-            format!("api:{}", id.trim_start_matches("api:")),
-            true,
-        )
+        (format!("api:{}", id.trim_start_matches("api:")), true)
     } else {
         (format!("api:{}", uuid::Uuid::now_v7()), false)
     }

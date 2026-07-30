@@ -91,6 +91,15 @@ pub struct Run {
     pub recoverable: bool,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    /// Tokens the turn's model round-trips spent, summed across rounds. `0` reads
+    /// as *unknown* — a provider that reports no usage, a row written before the
+    /// columns existed, or a turn that failed before its first completion — never
+    /// as "this turn was free". `default` for the same
+    /// forward/backward-compatibility reason as [`RunStep::elapsed_ms`].
+    #[serde(default)]
+    pub tokens_in: i64,
+    #[serde(default)]
+    pub tokens_out: i64,
 }
 
 impl Run {
@@ -107,6 +116,8 @@ impl Run {
             recoverable: false,
             started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             ended_at: None,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 }
@@ -219,6 +230,63 @@ pub fn resume_prompt(run: &Run, steps: &[RunStep]) -> String {
          it stopped. Do not re-apply side effects that already succeeded — \
          verify first when unsure. Reply with the completed outcome.",
     );
+    out
+}
+
+/// Caps for [`tool_digest`]. Tighter than the resume digest's: a resume prompt is
+/// written once for one turn, whereas a tool note rides along in *every*
+/// subsequent turn's history until it ages out of the window — so its per-line
+/// and total budgets are what keep cross-turn continuity from becoming a context
+/// leak.
+const TOOL_NOTE_SNIPPET_CAP: usize = 160;
+const TOOL_NOTE_CAP: usize = 1500;
+
+/// Fold a finished turn's tool calls into a compact note carried into later
+/// turns' history (attached to the turn's assistant message as
+/// [`Message::tool_note`](crate::domain::message::Message::tool_note)).
+///
+/// Without this, a turn's tool activity dies with the turn: only user and
+/// assistant *text* is persisted, so the next turn's model cannot tell whether a
+/// file was read, a command ran, or where a stored over-limit output went — it
+/// re-runs the tool (paying twice) or answers from nothing. The note is a
+/// summary, not a replay: provider-native `tool_use`/`tool_result` messages are
+/// not portable across the model menu, and the ledger's args are already
+/// redacted and truncated, so reconstructing a faithful transcript is not on
+/// offer. Naming what happened is.
+///
+/// Returns an empty string for a turn with no tool calls (the common case), so
+/// callers can store it unconditionally.
+pub fn tool_digest(steps: &[RunStep]) -> String {
+    if steps.is_empty() {
+        return String::new();
+    }
+    let snip = |s: &str| truncate(&s.replace('\n', " "), TOOL_NOTE_SNIPPET_CAP);
+
+    let mut out = String::from("[tools used in this turn]\n");
+    for (idx, s) in steps.iter().enumerate() {
+        if out.len() > TOOL_NOTE_CAP {
+            out.push_str(&format!("…and {} more call(s).\n", steps.len() - idx));
+            break;
+        }
+        let outcome = if s.ok {
+            snip(&s.result)
+        } else {
+            format!("error: {}", snip(&s.error))
+        };
+        out.push_str(&format!(
+            "{}. {} {} → {}\n",
+            idx + 1,
+            s.tool_name,
+            snip(&s.args),
+            outcome
+        ));
+        // The whole point of storing an over-limit output (`tool_output_store`)
+        // is that the model can go back for the part the preview elided — which
+        // it can only do if the path outlives the turn that produced it.
+        for path in &s.output_paths {
+            out.push_str(&format!("   full output kept at: {path}\n"));
+        }
+    }
     out
 }
 
@@ -348,6 +416,54 @@ mod tests {
         let prompt = resume_prompt(&run, &steps);
         assert!(prompt.contains("elided for length"));
         assert!(prompt.len() < RESUME_DIGEST_CAP + 2000);
+    }
+
+    #[test]
+    fn tool_digest_names_each_call_and_its_outcome() {
+        let run = interrupted_run();
+        let steps = vec![step(&run, 0, "read", true), step(&run, 1, "shell", false)];
+        let digest = tool_digest(&steps);
+
+        assert!(digest.contains("1. read"));
+        assert!(digest.contains("2. shell"));
+        assert!(digest.contains("error: boom"));
+        // One line per call: this rides in every later turn's context.
+        assert_eq!(digest.lines().count(), 3, "header + two calls: {digest}");
+    }
+
+    /// The digest is what carries a stored over-limit output past the turn that
+    /// produced it — without the path, `tool_output_store` keeps a file the model
+    /// can no longer ask for.
+    #[test]
+    fn tool_digest_carries_stored_output_paths() {
+        let run = interrupted_run();
+        let mut s = step(&run, 0, "shell", true);
+        s.output_paths = vec!["/tmp/komo/tool-output/s/run-1-0000.txt".to_string()];
+        let digest = tool_digest(&[s]);
+        assert!(
+            digest.contains("/tmp/komo/tool-output/s/run-1-0000.txt"),
+            "{digest}"
+        );
+    }
+
+    #[test]
+    fn a_turn_without_tools_has_no_digest() {
+        assert!(tool_digest(&[]).is_empty());
+    }
+
+    #[test]
+    fn tool_digest_elides_past_its_budget() {
+        let run = interrupted_run();
+        let steps: Vec<RunStep> = (0..100)
+            .map(|seq| {
+                let mut s = step(&run, seq, "web_fetch", true);
+                s.result = "r".repeat(400);
+                s
+            })
+            .collect();
+        let digest = tool_digest(&steps);
+        assert!(digest.contains("more call(s)"), "{digest}");
+        assert!(digest.len() < TOOL_NOTE_CAP + 500);
     }
 
     #[test]

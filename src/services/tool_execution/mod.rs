@@ -10,9 +10,9 @@
 //! **instance-owned** [`ToolExecutionConfig`], not process globals, so two
 //! executors can carry different policies.
 //!
-//! Every execution path funnels through the one internal core: the runtime's
-//! loop via [`ToolExecutor::execute_round`], and rig's trait-required fallback
-//! via the same core shared with each `RigTool` adapter.
+//! Every execution path funnels through the one internal core, reached via
+//! [`ToolExecutor::execute_round`]: the LLM backend only ever *declares* the
+//! tools to the provider, so nothing else can run one.
 
 pub mod context;
 mod result;
@@ -153,8 +153,8 @@ impl ToolExecutionConfig {
 }
 
 /// The tool-execution module's external interface. Cheap to clone (one `Arc`);
-/// the runtime and every `RigTool` adapter share the same core, so all
-/// execution paths carry identical retry/ledger/cap semantics.
+/// every caller shares the same core, so all execution paths carry identical
+/// retry/ledger/cap semantics.
 #[derive(Clone)]
 pub struct ToolExecutor {
     core: Arc<ToolExecutionCore>,
@@ -162,8 +162,6 @@ pub struct ToolExecutor {
 
 /// The shared implementation: the immutable catalog plus the execution policy
 /// and the approver every migrated tool reaches through its [`ToolContext`].
-/// Holds only tools, config, and the approver — never the adapters wrapping it —
-/// so there is no reference cycle with `RigTool`.
 pub struct ToolExecutionCore {
     tools: HashMap<String, Arc<dyn Tool>>,
     config: ToolExecutionConfig,
@@ -258,12 +256,6 @@ impl ToolExecutor {
     /// unlimited). The runtime seeds each turn's [`TurnResultBudget`] from it.
     pub fn turn_result_cap(&self) -> usize {
         self.core.config.max_turn_result_bytes
-    }
-
-    /// The shared execution core, for adapters (`RigTool`) that must satisfy a
-    /// foreign trait's call signature while keeping one execution semantics.
-    pub fn core(&self) -> Arc<ToolExecutionCore> {
-        self.core.clone()
     }
 
     /// Execute one round of model-requested tool calls concurrently, preserving
@@ -621,23 +613,6 @@ impl ToolExecutionCore {
                 output_paths: Vec::new(),
             },
         }
-    }
-
-    /// The trait-required fallback for a rig-driven completion (not on komo's
-    /// hot path — the runtime owns the loop). Bridges from rig's fixed call
-    /// signature: session from the ambient context if any, no run ledger.
-    pub async fn execute_fallback(
-        &self,
-        tool: Arc<dyn Tool>,
-        input: String,
-    ) -> anyhow::Result<String> {
-        let context = ToolTurnContext {
-            session: current_session().unwrap_or_else(|| SessionContext::detached("")),
-            run: None,
-            // No per-turn accounting on the rig fallback path.
-            budget: TurnResultBudget::unlimited(),
-        };
-        self.execute(tool, input, &context).await
     }
 }
 

@@ -36,7 +36,7 @@ open-lark = { version = "0.14", default-features = false, features = [
     "websocket",
     "im",
 ] }
-rig = { package = "rig-core", version = "0.40" }
+rig = { package = "rig-core", version = "0.41" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { workspace = true }

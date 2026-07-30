@@ -60,8 +60,10 @@ impl TurnResultBudget {
         }
     }
 
-    /// A disabled budget — for execution paths with no per-turn accounting
-    /// (rig's fallback, tests).
+    /// A disabled budget, for tests that assert on something other than the cap.
+    /// Every production path seeds its budget from the executor's configured cap
+    /// (`ToolExecutor::turn_result_cap`), so nothing outside tests opts out.
+    #[cfg(test)]
     pub fn unlimited() -> Self {
         Self::new(0)
     }

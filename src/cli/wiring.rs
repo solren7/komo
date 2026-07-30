@@ -368,7 +368,7 @@ pub async fn build(
         messages: db.clone(),
         runs: db.clone(),
         // The in-house agent loop hands each round to this executor; the LLM
-        // was handed RigTool adapters over the same core above.
+        // above was handed the same catalog's schemas, declaration only.
         tool_executor: tools,
         max_turns: model_config.max_turns,
         // Mirror the LLM's history window so the turn loads exactly what the

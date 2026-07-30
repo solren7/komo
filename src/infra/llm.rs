@@ -7,15 +7,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use rig::{
     OneOrMany,
-    agent::Agent,
     client::{ClientBuilder, CompletionClient},
     completion::{
-        AssistantContent, Completion, CompletionModel, GetTokenUsage, Message as RigMessage,
-        Prompt, Usage,
+        AssistantContent, CompletionModel, CompletionRequestBuilder, GetTokenUsage,
+        Message as RigMessage, ToolDefinition, Usage,
         message::{ToolResultContent, UserContent},
     },
     providers::{anthropic, deepseek, openai, openrouter},
-    tool::ToolDyn,
 };
 use serde_json::{Value, json};
 
@@ -26,10 +24,7 @@ use crate::{
         message::{Message, Role},
         session::Session,
     },
-    infra::{
-        codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
-        rig_tool::RigTool,
-    },
+    infra::codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
     services::{memory_enrichment::MemoryEnricher, tool_execution::retry::should_retry},
 };
 
@@ -58,21 +53,30 @@ impl LlmClient for UnconfiguredLlm {
 
 /// Generic [`LlmClient`] over any `rig` completion model. The concrete provider
 /// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
+///
+/// komo talks to the provider's [`CompletionModel`] directly rather than through
+/// rig's `Agent`: since 0.41 a configured `Agent` runs exclusively through rig's
+/// own `AgentRunner` loop, and komo owns the tool loop (`run_agent_loop`), so the
+/// raw per-request API is the matching seam. Everything an `Agent` used to carry
+/// for us — model handle, preamble, tool schemas — lives here instead.
 pub struct RigLlm<M: CompletionModel> {
-    agent: Agent<M>,
-    /// The provider client the `agent` was built from, kept so a turn whose
-    /// session names a different model can mint a model handle for it
-    /// (`M::make`). Only the handle is swapped — tools, preamble and every other
-    /// agent field stay the ones assembled at startup.
+    /// Handle for the configured model, minted once at startup — the one a
+    /// session with no `model` override runs on.
+    model: M,
+    /// The provider client the `model` was minted from, kept so a turn whose
+    /// session names a different model can mint a handle for it (`M::make`).
+    /// Only the handle is swapped — tools and preamble stay the ones assembled
+    /// at startup.
     client: Arc<M::Client>,
+    /// Tool schemas advertised to the provider (name + description + parameters).
+    /// Only the *declaration* goes over the wire: komo dispatches every requested
+    /// call itself in `ToolExecutor::execute_round`, so rig never runs a tool.
+    tools: Vec<ToolDefinition>,
     /// The configured model: what a session with no override runs on.
     default_model: String,
     /// Which provider this is, for mapping a session's reasoning-effort level
     /// onto request params (see [`reasoning_params`]).
     provider: Provider,
-    /// Maximum tool-calling round-trips per user turn before the agent must
-    /// answer (config `max_turns`, env `KOMO_MAX_TURNS`).
-    max_turns: usize,
     /// Rebuilds the system prompt each turn (see [`PreambleFn`]).
     preamble: PreambleFn,
     /// Max prior messages replayed as history per turn (config
@@ -322,10 +326,9 @@ where
             .filter_map(|(idx, m)| to_rig_message(m, idx >= notes_from))
             .collect();
 
-        // Rebuild the system prompt for this turn. `Agent` is cheap to clone
-        // (`Arc<model>` + an `Arc`-backed tool handle), and its `preamble` field
-        // is public, so we clone-and-override rather than mutate shared state —
-        // keeping concurrent sessions in the gateway independent.
+        // Rebuild the system prompt for this turn. It rides on the per-turn
+        // request rather than on shared state, so concurrent sessions in the
+        // gateway stay independent.
         let mut preamble = (self.preamble)();
 
         // Memory injection (main agent only): the enricher returns the finished
@@ -343,20 +346,24 @@ where
         Ok((preamble, prompt, history))
     }
 
-    /// Clone the agent for this turn: install the assembled preamble, then the
+    /// Resolve this turn's model settings: the assembled preamble, then the
     /// session's own model / reasoning-effort choices.
     ///
-    /// `Agent` is cheap to clone (`Arc<model>` + an `Arc`-backed tool handle) and
-    /// its fields are public, so per-session settings are applied to a private
-    /// copy — concurrent sessions in the gateway never see each other's.
+    /// A model handle is cheap to clone (`Arc`-backed provider client + a model
+    /// id), so per-session settings land on a private [`TurnModel`] — concurrent
+    /// sessions in the gateway never see each other's.
     ///
     /// Only the *main* agent is ever handed a stored session: every aux path
     /// (reviewer, delegate, recall screening, sweeps) builds a synthetic
     /// `Session`, whose overrides are empty. That is what keeps a conversation's
     /// model choice from leaking onto the aux model.
-    fn agent_for(&self, preamble: String, session: &Session) -> Agent<M> {
-        let mut agent = self.agent.clone();
-        agent.preamble = Some(preamble);
+    fn model_for(&self, preamble: String, session: &Session) -> TurnModel<M> {
+        let mut turn = TurnModel {
+            model: self.model.clone(),
+            preamble,
+            max_tokens: None,
+            additional_params: None,
+        };
 
         // A session's model may be provider-qualified (`deepseek:deepseek-chat`).
         // Routing on the prefix is `RoutingLlm`'s job — by the time we get here
@@ -368,7 +375,7 @@ where
             .map(|id| split_model_id(id).1)
             .filter(|name| *name != self.default_model)
         {
-            agent.model = Arc::new(M::make(&self.client, name));
+            turn.model = M::make(&self.client, name);
         }
 
         if let Some(params) = session
@@ -383,11 +390,43 @@ where
                 .and_then(Value::as_u64)
             {
                 let needed = budget + THINKING_ANSWER_HEADROOM;
-                agent.max_tokens = Some(agent.max_tokens.unwrap_or(0).max(needed));
+                turn.max_tokens = Some(turn.max_tokens.unwrap_or(0).max(needed));
             }
-            agent.additional_params = Some(merge_params(agent.additional_params.take(), params));
+            turn.additional_params = Some(merge_params(turn.additional_params.take(), params));
         }
-        agent
+        turn
+    }
+}
+
+/// One turn's model settings: which handle runs it, the system prompt assembled
+/// for it, and the request knobs the session's reasoning-effort choice implies.
+///
+/// This is the per-turn state rig's `Agent` used to hold for us. Requests are
+/// built off it round by round, so a round is exactly one provider completion and
+/// komo's loop stays in charge of what happens between rounds.
+struct TurnModel<M: CompletionModel> {
+    model: M,
+    preamble: String,
+    max_tokens: Option<u64>,
+    additional_params: Option<Value>,
+}
+
+impl<M: CompletionModel> TurnModel<M> {
+    /// Build one round's request: `history + prompt` under this turn's preamble,
+    /// with `tools` advertised as declarations only (komo dispatches the calls).
+    fn request(
+        &self,
+        prompt: RigMessage,
+        history: Vec<RigMessage>,
+        tools: &[ToolDefinition],
+    ) -> CompletionRequestBuilder<M> {
+        self.model
+            .completion_request(prompt)
+            .preamble(self.preamble.clone())
+            .messages(history)
+            .tools(tools.to_vec())
+            .max_tokens_opt(self.max_tokens)
+            .additional_params_opt(self.additional_params.clone())
     }
 }
 
@@ -398,41 +437,33 @@ where
     M::Client: Send + Sync + 'static,
 {
     async fn complete(&self, session: &Session) -> anyhow::Result<String> {
-        // Tool-less callers (aux/delegate/reviewer/briefing): rig's own loop does
-        // a single completion and returns, since no tools are exposed.
+        // Tool-less by contract: this is the single-shot path for aux callers
+        // (reviewer / recall screening / briefing fallback), and it advertises no
+        // tools at all — nothing here would dispatch a call the model made, so it
+        // must not be able to ask for one. One completion is the whole answer.
         let (preamble, prompt, history) = self.assemble(session).await?;
-        let agent = self.agent_for(preamble, session);
-        if self.stream {
-            // Codex: one streamed completion, aggregated to its text. (No tools
-            // are exposed here, so a single round is the whole answer.)
-            let (choice, _, _) = with_timeout(
-                self.timeout,
-                with_retry(|| {
-                    stream_completion(&agent, RigMessage::user(prompt.clone()), history.clone())
-                }),
-            )
-            .await?;
-            return Ok(choice_text(&choice));
-        }
-        let reply = with_timeout(
+        let turn = self.model_for(preamble, session);
+        let (choice, _, _) = with_timeout(
             self.timeout,
-            with_retry(|| async {
-                agent
-                    .prompt(prompt.clone())
-                    .history(history.clone())
-                    .max_turns(self.max_turns)
-                    .await
-                    .context("LLM completion failed")
+            with_retry(|| {
+                complete_once(
+                    &turn,
+                    &[],
+                    RigMessage::user(prompt.clone()),
+                    history.clone(),
+                    self.stream,
+                )
             }),
         )
         .await?;
-        Ok(reply)
+        Ok(choice_text(&choice))
     }
 
     async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
         let (preamble, prompt, history) = self.assemble(session).await?;
         Ok(Box::new(RigTurnDriver {
-            agent: self.agent_for(preamble, session),
+            turn: self.model_for(preamble, session),
+            tools: self.tools.clone(),
             history,
             pending: Some(RigMessage::user(prompt)),
             stream: self.stream,
@@ -442,12 +473,13 @@ where
     }
 }
 
-/// A [`TurnDriver`] backed by a per-turn rig [`Agent`] clone. Holds the growing
-/// conversation history (excluding the not-yet-sent prompt) so each round is a
-/// single `agent.completion(...).send()` — rig does one completion, komo owns
-/// the loop.
+/// A [`TurnDriver`] over a per-turn [`TurnModel`]. Holds the growing conversation
+/// history (excluding the not-yet-sent prompt) so each round is a single provider
+/// completion — rig does one round-trip, komo owns the loop.
 struct RigTurnDriver<M: CompletionModel> {
-    agent: Agent<M>,
+    turn: TurnModel<M>,
+    /// Tool schemas re-sent every round (see [`RigLlm::tools`]).
+    tools: Vec<ToolDefinition>,
     history: Vec<RigMessage>,
     /// The opening prompt; consumed by `first()`, then `None`.
     pending: Option<RigMessage>,
@@ -469,15 +501,15 @@ where
     /// history so the next round sees a provider-correct transcript.
     ///
     /// The prompt is pushed onto `history` up front and split back off a single
-    /// clone per attempt. rig's `completion(prompt, chat_history)` takes both by
-    /// value, so one clone of the round's messages is unavoidable; what this
-    /// avoids is cloning the prompt *separately* from the history it will join,
-    /// and it keeps every retry attempt reading one source of truth for the
-    /// round's transcript.
+    /// clone per attempt. A request builder takes prompt and history by value, so
+    /// one clone of the round's messages is unavoidable; what this avoids is
+    /// cloning the prompt *separately* from the history it will join, and it keeps
+    /// every retry attempt reading one source of truth for the round's transcript.
     async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
         self.history.push(prompt);
         let stream = self.stream;
-        let agent = &self.agent;
+        let turn = &self.turn;
+        let tools = &self.tools;
         let history = &self.history;
 
         let (choice, message_id, usage) = with_timeout(
@@ -487,17 +519,7 @@ where
                 let prompt = messages
                     .pop()
                     .expect("history holds the prompt pushed just above");
-                if stream {
-                    return stream_completion(agent, prompt, messages).await;
-                }
-                let resp = agent
-                    .completion(prompt, messages)
-                    .await
-                    .context("failed to build completion request")?
-                    .send()
-                    .await
-                    .context("LLM completion failed")?;
-                Ok((resp.choice, resp.message_id, token_usage(&resp.usage)))
+                complete_once(turn, tools, prompt, messages, stream).await
             }),
         )
         .await?;
@@ -528,7 +550,10 @@ where
         let contents: Vec<UserContent> = results
             .into_iter()
             .map(|r| {
-                let content = ToolResultContent::from_tool_output(r.content);
+                // A komo tool's model-facing result is plain text by contract
+                // (`domain::tool::ToolOutput::text`), so it goes over as one text
+                // block — no sniffing the payload for an image/multipart envelope.
+                let content = OneOrMany::one(ToolResultContent::text(r.content));
                 match r.call_id {
                     Some(call_id) => UserContent::tool_result_with_call_id(r.id, call_id, content),
                     None => UserContent::tool_result(r.id, content),
@@ -554,27 +579,31 @@ fn token_usage(usage: &Usage) -> TokenUsage {
     }
 }
 
-/// Run one streamed completion to exhaustion and return the aggregated assistant
-/// turn — `(choice, message_id)`, the same pair the non-streaming `send()` yields.
-/// rig accumulates the streamed deltas into `choice`/`message_id` as the inner
-/// stream drains, so we consume every chunk (surfacing any provider error) and
-/// then read the final aggregate. Used for backends that require streaming
-/// (Codex); identical downstream handling to the one-shot path.
-async fn stream_completion<M>(
-    agent: &Agent<M>,
+/// One provider round-trip, returning the assistant turn as
+/// `(choice, message_id, usage)`.
+///
+/// `stream` picks the transport, not the semantics: backends that require
+/// streaming (Codex) get their deltas aggregated back into the same triple the
+/// one-shot `send()` yields, so every caller downstream is identical either way.
+async fn complete_once<M>(
+    turn: &TurnModel<M>,
+    tools: &[ToolDefinition],
     prompt: RigMessage,
     history: Vec<RigMessage>,
+    stream: bool,
 ) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>, TokenUsage)>
 where
     M: CompletionModel + 'static,
 {
-    let mut stream = agent
-        .completion(prompt, history)
-        .await
-        .context("failed to build completion request")?
-        .stream()
-        .await
-        .context("LLM completion failed")?;
+    let request = turn.request(prompt, history, tools);
+    if !stream {
+        let resp = request.send().await.context("LLM completion failed")?;
+        return Ok((resp.choice, resp.message_id, token_usage(&resp.usage)));
+    }
+    // rig accumulates the streamed deltas into `choice`/`message_id` as the inner
+    // stream drains, so we consume every chunk (surfacing any provider error) and
+    // then read the final aggregate.
+    let mut stream = request.stream().await.context("LLM completion failed")?;
     while let Some(item) = stream.next().await {
         item.context("LLM completion failed")?;
     }
@@ -703,56 +732,53 @@ fn build_provider_llm(
             ),
         }));
     }
-    // Each RigTool shares the executor's core, so the trait-required fallback
-    // path carries the same retry/ledger/cap semantics as the runtime's loop.
-    let adapters: Vec<Box<dyn ToolDyn>> = tools
+    // Only the schemas cross to the provider: the executor stays the single
+    // dispatcher, so there is exactly one execution semantics (retry/ledger/cap)
+    // for every tool call, and rig is never in a position to run one.
+    let tool_defs: Vec<ToolDefinition> = tools
         .map(|executor| {
-            let core = executor.core();
             executor
                 .definitions()
                 .into_iter()
-                .map(|t| Box::new(RigTool::new(t, core.clone())) as Box<dyn ToolDyn>)
+                .map(|t| ToolDefinition {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters_schema(),
+                })
                 .collect()
         })
         .unwrap_or_default();
     let model = config.model.clone();
     let key = config.api_key.clone();
     let base = config.base_url.as_deref();
-    let max_turns = config.max_turns;
     let max_history_messages = config.max_history_messages;
     let max_history_bytes = config.max_history_bytes;
     // The ChatGPT Codex backend only accepts streamed requests; everyone else
     // uses the simpler one-shot path. Declared before `rig_llm!` so the macro's
-    // (hygienic) body can capture it alongside `max_turns`/`preamble`/`enricher`.
+    // (hygienic) body can capture it alongside `preamble`/`enricher`.
     let stream = matches!(config.provider, Provider::Codex);
     // Cap each completion so a hung provider request fails the turn instead of
     // wedging it in `running` (rig's client sets no request timeout). `0` = off.
     let timeout =
         (config.llm_timeout_secs > 0).then(|| Duration::from_secs(config.llm_timeout_secs));
-    // Seed the agent with an initial preamble; `complete` overrides it per turn.
-    let initial = preamble();
 
-    // Each provider's client/agent type differs (erased to `Arc<dyn LlmClient>`
-    // at the end), so the four arms can't share a value — but the agent-build
-    // and `RigLlm` wrapping are identical. This macro factors that tail out;
-    // only one arm runs, so moving `adapters`/`preamble`/`enricher` per arm is
-    // fine. `client` is the only thing that varies.
+    // Each provider's client/model type differs (erased to `Arc<dyn LlmClient>`
+    // at the end), so the five arms can't share a value — but minting the model
+    // handle and wrapping it in `RigLlm` are identical. This macro factors that
+    // tail out; only one arm runs, so moving `tool_defs`/`preamble`/`enricher`
+    // per arm is fine. `client` is the only thing that varies.
     macro_rules! rig_llm {
         ($client:expr) => {{
-            // Kept past `build()` so a per-session model override can mint a
-            // model handle for the turn (`RigLlm::agent_for`).
+            // Retained alongside the handle so a per-session model override can
+            // mint a fresh one for the turn (`RigLlm::model_for`).
             let client = Arc::new($client);
-            let agent = client
-                .agent(model.clone())
-                .preamble(&initial)
-                .tools(adapters)
-                .build();
+            let handle = client.completion_model(model.clone());
             Arc::new(RigLlm {
-                agent,
+                model: handle,
                 client,
+                tools: tool_defs,
                 default_model: model,
                 provider: config.provider,
-                max_turns,
                 preamble,
                 max_history_messages,
                 max_history_bytes,

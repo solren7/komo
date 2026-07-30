@@ -83,7 +83,9 @@ impl Tool for TodoTool {
          Pass `todos` to replace the whole list — send every item each time with its \
          latest status. List order is priority. Keep at most ONE item in_progress; \
          mark an item completed as soon as it is done, and cancel one that no longer \
-         applies. Use it for multi-step work (3+ steps) so the user can see progress."
+         applies. Use it only for longer, non-trivial work (many tool calls, or \
+         steps that can fail independently) so the user can see progress; skip it \
+         for quick linear tasks like a single commit-and-push."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

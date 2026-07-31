@@ -232,7 +232,7 @@ pub async fn build(
             // komo's own tracing log, so a failed tool call can be diagnosed
             // from the `tool` span in the same conversation that hit it.
             tools.register(Arc::new(LogsTool));
-            tools.register(Arc::new(SessionTool::new(db.clone())));
+            tools.register(Arc::new(SessionTool::new(db.clone(), db.clone())));
             tools.register(Arc::new(ReminderTool::new(db.clone())));
             // Scheduled jobs from inside a conversation. Every mutation is gated
             // through this tool set's approver — a chat-authored job is

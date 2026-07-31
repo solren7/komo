@@ -63,10 +63,17 @@ const READ_GUIDANCE: &str = "Use `read` for file contents and directory listings
     need, rather than concluding from the first page alone.";
 
 /// Gated on any of the state-backed tools (`session` / `memory` / `skill`).
+/// The retrieval sentence is deliberately unconditional (rather than injected
+/// only when the window actually trimmed): a constant prompt stays
+/// byte-identical across turns for the provider cache, and the sentence is
+/// harmlessly true for short conversations too.
 const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, \
     conversation history, memories, or skills — refer to Komo's database, not the \
     operating system: answer them with the `session`, `memory`, or `skill` tools, \
-    never with shell commands like `tmux ls` or `who`.";
+    never with shell commands like `tmux ls` or `who`. Only a recent window of \
+    this conversation is replayed to you each turn; when the user refers to \
+    something earlier that you can no longer see, search the stored transcript \
+    with `session` (action=search) instead of guessing.";
 
 /// Gated on the `reminder` tool.
 const REMINDER_GUIDANCE: &str = "You CAN schedule reminders: call the `reminder` tool \

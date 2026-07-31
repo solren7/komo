@@ -11,6 +11,7 @@ pub mod glob;
 pub mod grep;
 pub mod homeassistant;
 pub mod http;
+pub mod logs;
 pub mod memory;
 pub mod read;
 pub mod reminder;

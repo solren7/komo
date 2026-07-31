@@ -115,9 +115,14 @@ fn will_run_tui() -> bool {
 fn open_tui_log() -> Option<std::fs::File> {
     let dir = config::ensure_komo_home().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
-    std::fs::OpenOptions::new()
+    let path = dir.join("chat-tui.log");
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("chat-tui.log"))
-        .ok()
+        .open(&path)
+        .ok()?;
+    // Tell the `logs` tool where this process's own diagnostics land, so the
+    // agent can read them mid-conversation without guessing at a filename.
+    infra::logs::set_active(path);
+    Some(file)
 }

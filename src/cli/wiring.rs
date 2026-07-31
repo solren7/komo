@@ -34,9 +34,9 @@ use crate::{
     tools::{
         apply_patch::ApplyPatchTool, ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
         edit::EditTool, glob::GlobTool, grep::GrepTool, homeassistant::HomeAssistantTool,
-        memory::MemoryTool, read::ReadTool, reminder::ReminderTool, session::SessionTool,
-        shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteTool,
+        logs::LogsTool, memory::MemoryTool, read::ReadTool, reminder::ReminderTool,
+        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteTool,
     },
 };
 
@@ -229,6 +229,9 @@ pub async fn build(
             tools.register(Arc::new(ShellTool::new(workspace.clone())));
             tools.register(Arc::new(WebFetchTool::new()));
             tools.register(Arc::new(WebSearchTool::new()));
+            // komo's own tracing log, so a failed tool call can be diagnosed
+            // from the `tool` span in the same conversation that hit it.
+            tools.register(Arc::new(LogsTool));
             tools.register(Arc::new(SessionTool::new(db.clone())));
             tools.register(Arc::new(ReminderTool::new(db.clone())));
             // Scheduled jobs from inside a conversation. Every mutation is gated

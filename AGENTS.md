@@ -42,7 +42,10 @@ Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 `~/.komo/logs/gateway.YYYY-MM-DD.log` (what `komo logs` reads). Level via
 `KOMO_LOG` (default `info,toasty=warn,rig_core=warn`; set `KOMO_LOG=debug` to
 see full tool results). Turns run in `run` spans, tool calls in `tool` spans,
-matching the run ledger.
+matching the run ledger. The chat TUI logs to `~/.komo/logs/chat-tui.log`
+instead (stderr would tear the alternate screen) and registers that path with
+`infra::logs::set_active`, which is how the `logs` tool finds the current
+process's own log mid-conversation.
 
 ## Data & storage rules
 
@@ -188,7 +191,9 @@ content the model can recover from; only a driver/LLM error aborts the turn.
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
   hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
-  `skill`, `cron`, `delegate`, `ask_user` (clarify).
+  `skill`, `cron`, `delegate`, `ask_user` (clarify), `logs` (tail of komo's own
+  tracing log — file lookup shared with `komo logs` via `infra/logs.rs`, same
+  deny-only file-read gate as `read`).
 - `tools/delegate.rs` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally

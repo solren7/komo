@@ -93,7 +93,7 @@ fn cap_structured(structured: serde_json::Value) -> serde_json::Value {
 fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
     match name {
         "shell" => Some((Category::Shell, None)),
-        "read" | "grep" | "glob" => Some((Category::File, Some(Access::Read))),
+        "read" | "grep" | "glob" | "logs" => Some((Category::File, Some(Access::Read))),
         "write" | "edit" | "apply_patch" => Some((Category::File, Some(Access::Write))),
         "web_fetch" | "web_search" => Some((Category::Network, None)),
         "homeassistant" => Some((Category::HomeAssistant, None)),

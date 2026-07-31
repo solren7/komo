@@ -64,10 +64,16 @@ pub struct RigLlm<M: CompletionModel> {
     /// session with no `model` override runs on.
     model: M,
     /// The provider client the `model` was minted from, kept so a turn whose
-    /// session names a different model can mint a handle for it (`M::make`).
+    /// session names a different model can mint a handle for it (via `mint`).
     /// Only the handle is swapped — tools and preamble stay the ones assembled
     /// at startup.
     client: Arc<M::Client>,
+    /// Mints a model handle for a session's model override. Providers whose
+    /// handles carry per-handle switches install a closure that re-applies
+    /// them — Anthropic's prompt-caching flag would otherwise be silently
+    /// dropped the moment a session switched models (`M::make` builds a bare
+    /// handle). Everyone else uses `M::make` verbatim.
+    mint: Arc<dyn Fn(&M::Client, &str) -> M + Send + Sync>,
     /// Tool schemas advertised to the provider (name + description + parameters).
     /// Only the *declaration* goes over the wire: komo dispatches every requested
     /// call itself in `ToolExecutor::execute_round`, so rig never runs a tool.
@@ -289,9 +295,10 @@ where
 {
     /// Assemble this turn's `(preamble, prompt, history)`: split the session
     /// into the latest user prompt + prior history, rebuild the system prompt,
-    /// and append the memory-enrichment prefix (main agent only). Run once
-    /// per turn — never per tool-loop round (recall is keyed on the user
-    /// message, and re-running it each round would churn the cached prefix).
+    /// and inject the memory blocks (main agent only) — pinned into the
+    /// preamble, recall in front of the prompt (see below for why they split).
+    /// Run once per turn — never per tool-loop round (recall is keyed on the
+    /// user message, and re-running it each round would churn the prompt).
     async fn assemble(
         &self,
         session: &Session,
@@ -331,16 +338,28 @@ where
         // gateway stay independent.
         let mut preamble = (self.preamble)();
 
-        // Memory injection (main agent only): the enricher returns the finished
-        // pinned+recall prefix, appended after the volatile tier so the
-        // stable+context+volatile bytes stay cache-stable. Enrichment failure
-        // is absorbed inside the enricher (memory is background context — it
-        // must never fail a reply).
+        // Memory injection (main agent only). The two tiers land in different
+        // places, and the split is what keeps the provider prompt cache warm:
+        // pinned is cross-turn stable so it may join the system prompt, but
+        // recall is keyed on this turn's user message — putting it in the
+        // system prompt would rewrite the cached prefix every turn and
+        // invalidate everything after it (which is exactly what it used to
+        // do). Recall rides in front of the turn's user message instead: new
+        // bytes were arriving at the tail anyway, so it costs the cache
+        // nothing. Render-time only — the stored transcript keeps the user's
+        // raw words. Enrichment failure is absorbed inside the enricher
+        // (memory is background context — it must never fail a reply).
+        let mut prompt = prompt;
         if let Some(enricher) = &self.enricher
-            && let Some(prefix) = enricher.enrich(&session.id, &prompt).await
+            && let Some(injection) = enricher.enrich(&session.id, &prompt).await
         {
-            preamble.push_str("\n\n");
-            preamble.push_str(prefix.as_str());
+            if let Some(pinned) = injection.pinned {
+                preamble.push_str("\n\n");
+                preamble.push_str(&pinned);
+            }
+            if let Some(recall) = injection.recall {
+                prompt = format!("{recall}\n\n{prompt}");
+            }
         }
 
         Ok((preamble, prompt, history))
@@ -375,7 +394,20 @@ where
             .map(|id| split_model_id(id).1)
             .filter(|name| *name != self.default_model)
         {
-            turn.model = M::make(&self.client, name);
+            turn.model = (self.mint)(&self.client, name);
+        }
+
+        // OpenAI's Responses API (which Codex speaks too) caches by prefix
+        // automatically, but shard routing is best-effort; `prompt_cache_key`
+        // pins every request from one session to the same cache shard — the
+        // Codex CLI itself sends its session id here for the same reason.
+        // Only these two providers: the key is a Responses API parameter, and
+        // Anthropic/DeepSeek reject or ignore unknown request fields.
+        if matches!(self.provider, Provider::OpenAi | Provider::Codex) {
+            turn.additional_params = Some(merge_params(
+                turn.additional_params.take(),
+                json!({ "prompt_cache_key": format!("komo:{}", session.id) }),
+            ));
         }
 
         if let Some(params) = session
@@ -766,15 +798,25 @@ fn build_provider_llm(
     // at the end), so the five arms can't share a value — but minting the model
     // handle and wrapping it in `RigLlm` are identical. This macro factors that
     // tail out; only one arm runs, so moving `tool_defs`/`preamble`/`enricher`
-    // per arm is fine. `client` is the only thing that varies.
+    // per arm is fine. `client` is the only thing that varies; `$tune`
+    // (optional) applies per-handle switches — it runs on the startup handle
+    // *and* inside `mint`, so a session's model override keeps the same
+    // switches (Anthropic's prompt-caching flag lives here).
     macro_rules! rig_llm {
-        ($client:expr) => {{
+        ($client:expr) => {
+            rig_llm!($client, |handle| handle)
+        };
+        ($client:expr, $tune:expr) => {{
             // Retained alongside the handle so a per-session model override can
             // mint a fresh one for the turn (`RigLlm::model_for`).
             let client = Arc::new($client);
-            let handle = client.completion_model(model.clone());
+            let tune = $tune;
+            let handle = tune(client.completion_model(model.clone()));
             Arc::new(RigLlm {
                 model: handle,
+                mint: Arc::new(move |client: &_, name: &str| {
+                    tune(CompletionModel::make(client, name))
+                }),
                 client,
                 tools: tool_defs,
                 default_model: model,
@@ -806,7 +848,15 @@ fn build_provider_llm(
             let client = with_base_url(anthropic::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build Anthropic client")?;
-            rig_llm!(client)
+            // Anthropic caches nothing without explicit `cache_control`
+            // breakpoints (unlike OpenAI/DeepSeek's automatic prefix caches),
+            // and rig only writes them when the handle opts in. This marks the
+            // system prompt, the last tool definition, and the last message —
+            // the moving message breakpoint is what lets each tool-loop round
+            // reuse the previous round's prefix.
+            rig_llm!(client, |handle: anthropic::completion::CompletionModel| {
+                handle.with_prompt_caching()
+            })
         }
         Provider::OpenRouter => {
             let client = with_base_url(openrouter::Client::builder().api_key(key), base)
@@ -881,6 +931,22 @@ fn window_history(prior: &[Message], max_messages: usize, max_bytes: usize) -> &
         0 => prior,
         n => &prior[prior.len().saturating_sub(n)..],
     };
+    // Once the transcript is at the count cap, the naive cut advances every
+    // turn (each turn pushes the oldest message out), so the replayed history
+    // opens with different bytes every turn and the provider prompt cache
+    // misses everything after the system prompt. Snap the cut forward to the
+    // nearest *anchor* message instead: anchors are a deterministic property
+    // of the message itself (a hash of its stored bytes), so consecutive
+    // turns keep opening the window on the same message until the cap
+    // genuinely passes it — the prefix then stays byte-identical for
+    // ~[`WINDOW_ANCHOR_SPACING`] turns at a stretch, at the cost of a
+    // slightly shorter window. No anchor in the window ⇒ keep the naive cut
+    // (slides, but never under-delivers history).
+    if max_messages > 0 && prior.len() >= max_messages {
+        if let Some(offset) = window.iter().position(is_window_anchor) {
+            window = &window[offset..];
+        }
+    }
     if max_bytes > 0 {
         let size = |m: &Message| m.content.len() + m.tool_note.len();
         let mut total: usize = window.iter().map(size).sum();
@@ -902,6 +968,36 @@ fn window_history(prior: &[Message], max_messages: usize, max_bytes: usize) -> &
         window = &window[1..];
     }
     window
+}
+
+/// Average anchor spacing, in *user* messages: a user message is an anchor
+/// when its hash lands in `1/WINDOW_ANCHOR_SPACING` of the space, so the
+/// window start advances roughly once per this many turns instead of every
+/// turn. Larger = warmer cache but a shorter average window (the cut snaps
+/// further forward); 6 trades ≤ ~12 messages of tail for a prefix that holds
+/// still ~6 turns at a time.
+const WINDOW_ANCHOR_SPACING: u64 = 6;
+
+/// Whether `m` is a window-anchor message (see [`window_history`]): a user
+/// message whose FNV-1a hash of its stored bytes selects it. Keyed on stored
+/// fields only (content + timestamp — never the render-time tool-note
+/// decision), so every turn, in every process, agrees on which messages are
+/// anchors. User role so a snapped window always opens on a user message,
+/// which providers require anyway.
+fn is_window_anchor(m: &Message) -> bool {
+    if m.role != Role::User {
+        return false;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in m
+        .content
+        .as_bytes()
+        .iter()
+        .chain(m.timestamp.to_le_bytes().iter())
+    {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+    }
+    h % WINDOW_ANCHOR_SPACING == 0
 }
 
 /// How many of the most recent assistant turns carry their tool-activity note
@@ -1111,6 +1207,44 @@ mod tests {
                 window.first().map(|m| &m.content)
             );
         }
+    }
+
+    #[test]
+    fn the_window_cut_holds_still_between_anchor_jumps() {
+        // A long transcript with fixed timestamps (anchor selection hashes
+        // stored bytes, so pinning them makes the test deterministic), replayed
+        // as a growing session at the count cap — the shape of every long-lived
+        // chat session. Without the anchor snap the window start advances every
+        // turn and the replayed prefix is never the same twice.
+        let mut all = Vec::new();
+        for i in 0..120 {
+            let mut user = Message::user(format!("question number {i}"));
+            user.timestamp = 1_700_000_000 + i;
+            let mut assistant = Message::assistant(format!("answer number {i}"));
+            assistant.timestamp = 1_700_000_000 + i;
+            all.push(user);
+            all.push(assistant);
+        }
+
+        let max = 50;
+        let mut starts = Vec::new();
+        for end in (max..=all.len()).step_by(2) {
+            // What the DB layer hands the adapter each turn: the last `max`.
+            let prior = &all[end - max..end];
+            let window = window_history(prior, max, 0);
+            assert!(window.len() <= max, "budget respected");
+            assert!(!window.is_empty(), "the cut must not starve the model");
+            assert_eq!(window.first().unwrap().role, Role::User);
+            starts.push(window.first().unwrap().content.clone());
+        }
+
+        let turns = starts.len();
+        let changes = starts.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(
+            changes * 2 < turns,
+            "window start moved {changes} times over {turns} turns — \
+             the anchor snap should hold it still most turns"
+        );
     }
 
     #[test]

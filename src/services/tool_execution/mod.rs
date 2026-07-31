@@ -21,7 +21,7 @@ mod result;
 /// definition of "transient", so the tool path and the model path can't drift.
 pub(crate) mod retry;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,7 +163,12 @@ pub struct ToolExecutor {
 /// The shared implementation: the immutable catalog plus the execution policy
 /// and the approver every migrated tool reaches through its [`ToolContext`].
 pub struct ToolExecutionCore {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    /// Keyed by tool name. A `BTreeMap` so [`ToolExecutor::definitions`] yields
+    /// a stable, name-sorted catalog: the tool schemas are serialized into every
+    /// request, and a provider prompt cache matches on exact bytes — an
+    /// order that shifts across restarts (as `HashMap`'s did) invalidates the
+    /// whole cached prefix for no reason.
+    tools: BTreeMap<String, Arc<dyn Tool>>,
     config: ToolExecutionConfig,
     /// The approver placed into each call's [`ToolContext`]. Defaults to
     /// deny-all; wiring installs the real (policy-wrapped) approver via
@@ -178,7 +183,7 @@ impl ToolExecutor {
     pub fn new(config: ToolExecutionConfig) -> Self {
         Self {
             core: Arc::new(ToolExecutionCore {
-                tools: HashMap::new(),
+                tools: BTreeMap::new(),
                 config,
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
@@ -215,7 +220,9 @@ impl ToolExecutor {
     }
 
     /// The catalog as the model adapter needs it (schemas for function
-    /// calling). A read-only view — execution always goes through the executor.
+    /// calling), name-sorted so the serialized tool block is byte-stable
+    /// across restarts — a provider prompt cache matches on exact bytes. A
+    /// read-only view — execution always goes through the executor.
     pub fn definitions(&self) -> Vec<Arc<dyn Tool>> {
         self.core.tools.values().cloned().collect()
     }
@@ -950,6 +957,23 @@ mod tests {
             .execute_round(std::slice::from_ref(&req), context)
             .await
             .remove(0)
+    }
+
+    #[test]
+    fn the_catalog_is_name_sorted_regardless_of_registration_order() {
+        // The tool schemas are serialized into every request; a provider
+        // prompt cache matches on exact bytes, so the order must be stable
+        // across restarts no matter how wiring happens to register.
+        let executor = executor(
+            vec![
+                Arc::new(NamedTool("zeta")),
+                Arc::new(NamedTool("alpha")),
+                Arc::new(NamedTool("mid")),
+            ],
+            ToolExecutionConfig::default(),
+        );
+        let names: Vec<&str> = executor.definitions().iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 
     #[tokio::test]

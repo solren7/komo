@@ -1,12 +1,12 @@
 //! Per-turn memory enrichment (architecture deepening plan §7): everything
-//! between "a turn is starting" and "these bytes join the system prompt".
+//! between "a turn is starting" and "these bytes join the prompt".
 //!
 //! [`MemoryEnricher::enrich`] owns the whole policy — one store load, scope
 //! derivation, L1 pinned selection, L3 recall (fetch wide, inject narrow),
 //! the aux screening with its strict-JSON validation and lexical fallback,
 //! prompt-block rendering with budgets and safety markers, and the async
 //! recall-usage signal. The caller (an LLM adapter) sees only the finished
-//! [`MemoryPrefix`] — never ids, scores, aux replies, or usage hashes — so a
+//! [`MemoryInjection`] — never ids, scores, aux replies, or usage hashes — so a
 //! future second adapter can't fork the memory policy.
 //!
 //! There is deliberately no `MemoryEnricher` trait: one production
@@ -24,17 +24,34 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::session::Session;
 
-/// The finished, injection-ready memory suffix for one turn: pinned block
-/// first, recall block second (fixed `volatile | pinned | recall` prompt
-/// order — pinned is cross-turn stable, recall is per-query cold, so the
-/// stabler bytes come first for the upstream prompt cache), already wrapped
-/// in the anti-self-amplification markers and untrusted-data caveats. The
-/// caller appends it after the volatile tier, adding its own separator.
-pub struct MemoryPrefix(String);
+/// The finished, injection-ready memory blocks for one turn, already wrapped
+/// in the anti-self-amplification markers and untrusted-data caveats. The two
+/// tiers land in different places *on purpose* — the split is what keeps the
+/// provider prompt cache warm:
+///
+/// * `pinned` (L1) is cross-turn stable — it changes only when the operator
+///   pins/unpins — so the caller appends it to the system prompt, where its
+///   bytes stay identical turn after turn.
+/// * `recall` (L3) is keyed on this turn's user message and differs almost
+///   every turn. It must NOT touch the system prompt (that would re-write the
+///   cached prefix every turn and invalidate everything after it); the caller
+///   rides it along with the turn's user message instead, where new bytes
+///   were arriving anyway.
+pub struct MemoryInjection {
+    pub pinned: Option<String>,
+    pub recall: Option<String>,
+}
 
-impl MemoryPrefix {
-    pub fn as_str(&self) -> &str {
-        &self.0
+#[cfg(test)]
+impl MemoryInjection {
+    /// Both blocks as one string, for assertions that don't care where each
+    /// tier lands.
+    fn joined(&self) -> String {
+        [self.pinned.as_deref(), self.recall.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -95,12 +112,12 @@ impl MemoryEnricher {
         }
     }
 
-    /// Produce this turn's memory prefix, or `None` when nothing qualifies (so
+    /// Produce this turn's memory blocks, or `None` when nothing qualifies (so
     /// the caller appends no bytes and the prompt prefix stays cache-stable).
     /// Failure is non-fatal by contract — memory is background context and
     /// must never fail a reply — but logged, or "why doesn't it know me
     /// today" is unanswerable.
-    pub async fn enrich(&self, session_id: &str, user_message: &str) -> Option<MemoryPrefix> {
+    pub async fn enrich(&self, session_id: &str, user_message: &str) -> Option<MemoryInjection> {
         let ctx = MemoryContext::from_session(session_id);
 
         // Load the store once and derive both tiers from it — pinned and
@@ -159,13 +176,13 @@ impl MemoryEnricher {
             });
         }
 
-        let prefix = match (pinned_block, recall_block) {
-            (Some(p), Some(r)) => format!("{p}\n\n{r}"),
-            (Some(p), None) => p,
-            (None, Some(r)) => r,
-            (None, None) => return None,
-        };
-        Some(MemoryPrefix(prefix))
+        if pinned_block.is_none() && recall_block.is_none() {
+            return None;
+        }
+        Some(MemoryInjection {
+            pinned: pinned_block,
+            recall: recall_block,
+        })
     }
 
     /// Screen recall candidates through the aux sub-agent: keep the genuinely
@@ -531,19 +548,25 @@ mod tests {
         library.push(active_fact("m-r", "durable kanban tasks live in kanban.db"));
         let store = FakeStore::new(library);
         let e = enricher(store, None);
-        let prefix = e
+        let injection = e
             .enrich("cli:s", "where do kanban tasks live?")
             .await
             .expect("both tiers inject");
-        let s = prefix.as_str();
-        let pinned_at = s.find("komo:memory:pinned").unwrap();
-        let recall_at = s.find("komo:memory:recall").unwrap();
-        assert!(pinned_at < recall_at, "pinned block must precede recall");
-        assert!(s.contains("prefers concise answers"));
-        assert!(s.contains("kanban.db"));
+        let pinned = injection.pinned.as_deref().expect("pinned tier present");
+        let recall = injection.recall.as_deref().expect("recall tier present");
+        assert!(pinned.contains("komo:memory:pinned"));
+        assert!(pinned.contains("prefers concise answers"));
+        assert!(recall.contains("komo:memory:recall"));
+        assert!(recall.contains("kanban.db"));
         // The pinned memory is active + in-scope, so recall would also match
         // it — it must appear exactly once (in the pinned block).
-        assert_eq!(s.matches("prefers concise answers").count(), 1);
+        assert_eq!(
+            injection
+                .joined()
+                .matches("prefers concise answers")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -576,8 +599,8 @@ mod tests {
             reply: Err(anyhow::anyhow!("aux must not be consulted")),
         });
         let e = enricher(store, Some(aux));
-        let prefix = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
-        assert!(prefix.as_str().contains("kanban.db"));
+        let injection = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
+        assert!(injection.joined().contains("kanban.db"));
     }
 
     fn crowded_store() -> FakeStore {
@@ -599,8 +622,8 @@ mod tests {
             reply: Ok(r#"{"keep":[{"id":"m-3","line":"the third kanban fact"}]}"#.into()),
         });
         let e = enricher(crowded_store(), Some(aux));
-        let prefix = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
-        let s = prefix.as_str();
+        let injection = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
+        let s = injection.joined();
         assert!(s.contains("the third kanban fact"), "condensation applied");
         assert_eq!(
             s.matches("kanban fact number").count(),
@@ -615,9 +638,9 @@ mod tests {
             reply: Err(anyhow::anyhow!("aux down")),
         });
         let e = enricher(crowded_store(), Some(aux));
-        let prefix = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
-        let bullets = prefix
-            .as_str()
+        let injection = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
+        let bullets = injection
+            .joined()
             .lines()
             .filter(|l| l.starts_with("- ["))
             .count();
@@ -630,9 +653,9 @@ mod tests {
             reply: Ok("sorry, I can't help with that".into()),
         });
         let e = enricher(crowded_store(), Some(aux));
-        let prefix = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
-        let bullets = prefix
-            .as_str()
+        let injection = e.enrich("cli:s", "kanban tasks?").await.expect("injects");
+        let bullets = injection
+            .joined()
             .lines()
             .filter(|l| l.starts_with("- ["))
             .count();

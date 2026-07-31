@@ -320,7 +320,11 @@ fn spawn_ws_thread(
                         if let Some(msg) = admit(event, &admit_policy) {
                             let _ = tx.send(msg);
                         }
-                    }) {
+                    })
+                    // Komo does not consume read receipts, but acknowledging
+                    // subscribed events prevents Feishu from redelivering them.
+                    .and_then(|builder| builder.register_p2_im_message_read_v1(|_event| {}))
+                {
                     Ok(builder) => builder.build(),
                     Err(error) => {
                         error!(%error, "failed to register feishu event handler");

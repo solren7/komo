@@ -12,32 +12,38 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use super::app::{App, Role};
+use super::app::{App, PasteChip, Role};
 use super::markdown::markdown_lines;
 
 const SPINNER: [&str; 4] = ["⠇", "⠋", "⠙", "⠸"];
+
+/// Visible rows the composer may grow to before it scrolls internally.
+const INPUT_MAX_ROWS: u16 = 8;
 
 pub fn render(frame: &mut Frame, app: &App) {
     // Grok Build keeps persistent identity/progress chrome, but deliberately
     // sheds optional rows in short terminals. Follow that principle here: the
     // session header makes a long chat easier to orient in, without starving
     // the transcript in a small split pane.
-    let (header_area, transcript_area, status_area, input_area) = if frame.area().height <= 8 {
+    let area = frame.area();
+    let compact = area.height <= 8;
+    let input_height = input_height(app, area, if compact { 0 } else { 1 });
+    let (header_area, transcript_area, status_area, input_area) = if compact {
         let [transcript, status, input] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
-        .areas(frame.area());
+        .areas(area);
         (None, transcript, status, input)
     } else {
         let [header, transcript, status, input] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
-        .areas(frame.area());
+        .areas(area);
         (Some(header), transcript, status, input)
     };
 
@@ -197,7 +203,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         )])
     } else {
         Line::from(Span::styled(
-            format!(" ● 就绪  · Enter 发送 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出"),
+            " ● 就绪  · Enter 发送 · Shift-Enter/Ctrl-J 换行 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出",
             Style::new().fg(Color::DarkGray),
         ))
     };
@@ -213,11 +219,23 @@ fn elapsed_label(app: &App) -> String {
     }
 }
 
+/// How tall the composer box should be, borders included: it grows with the
+/// draft (Shift-Enter and pastes make it multi-line) but never eats the header,
+/// the status row, or the transcript's last line.
+fn input_height(app: &App, area: Rect, header_rows: u16) -> u16 {
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let rows = wrap_input(&app.input, &app.chips, inner_width, app.cursor)
+        .0
+        .len() as u16;
+    let ceiling = area.height.saturating_sub(header_rows + 2).max(3);
+    (rows.clamp(1, INPUT_MAX_ROWS) + 2).min(ceiling)
+}
+
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.in_flight {
         " message · draft preserved "
     } else {
-        " message · Enter to send "
+        " message · Enter 发送 · Shift-Enter 换行 "
     };
     let block = Block::new()
         .borders(Borders::ALL)
@@ -229,19 +247,142 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
         .title(title);
     let inner = block.inner(area);
     let inner_width = inner.width.max(1) as usize;
+    let height = inner.height.max(1) as usize;
 
-    // Keep the cursor visible: show the window of the input ending no earlier
-    // than the cursor (simple left-trim by display width).
-    let before: String = app.input.chars().take(app.cursor).collect();
-    let cursor_col = display_width(&before);
-    let skip_cols = cursor_col.saturating_sub(inner_width.saturating_sub(1));
-    let (visible, skipped) = trim_left_cols(&app.input, skip_cols);
+    // Soft-wrapped rows; scroll down just far enough to keep the cursor row in
+    // the box (a long paste shows its tail, which is where editing happens).
+    let (rows, (cursor_row, cursor_col)) =
+        wrap_input(&app.input, &app.chips, inner_width, app.cursor);
+    let first = cursor_row.saturating_sub(height - 1);
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .skip(first)
+        .take(height)
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .map(|seg| {
+                        // A chip reads as one object rather than editable text,
+                        // so it is styled as a unit.
+                        if seg.chip {
+                            Span::styled(
+                                seg.text,
+                                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            Span::raw(seg.text)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
 
     frame.render_widget(Paragraph::new(visible).block(block), area);
-    // `skipped` can overshoot `skip_cols` by one column (a double-width char is
-    // dropped whole), so saturate rather than underflow.
-    let x = inner.x + cursor_col.saturating_sub(skipped) as u16;
-    frame.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), inner.y));
+    let x = inner.x + cursor_col.min(inner_width.saturating_sub(1)) as u16;
+    let y = inner.y + (cursor_row - first) as u16;
+    frame.set_cursor_position((x, y));
+}
+
+/// A run of same-kind text inside one wrapped composer row: either ordinary
+/// draft text or a folded paste chip, which is styled differently.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Seg {
+    pub text: String,
+    pub chip: bool,
+}
+
+/// Soft-wrap the draft to `width` columns and locate `cursor` (a char index)
+/// within the wrapped rows. Wrapping and cursor placement must happen in one
+/// pass — otherwise the cursor lands on a different row than the char it sits
+/// in front of. Same CJK width rules as [`wrap_text`].
+///
+/// A chip renders as its label and is never split, and the loop *slices past* the
+/// folded text (`chip.bytes`) instead of walking it — so the per-frame cost is
+/// the size of what's on screen, not the size of what was pasted.
+fn wrap_input(
+    text: &str,
+    chips: &[PasteChip],
+    width: usize,
+    cursor: usize,
+) -> (Vec<Vec<Seg>>, (usize, usize)) {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Seg>> = Vec::new();
+    let mut line: Vec<Seg> = Vec::new();
+    let mut cols = 0usize;
+    let mut at: Option<(usize, usize)> = None;
+    let mut i = 0usize; // char index
+    let mut b = 0usize; // byte index
+    let mut next_chip = 0usize;
+
+    loop {
+        // A chip starting here: emit the whole label, then jump the hidden text.
+        if let Some(chip) = chips.get(next_chip).filter(|c| c.range.start == i) {
+            let w = display_width(&chip.label);
+            if cols + w > width && !line.is_empty() {
+                rows.push(std::mem::take(&mut line));
+                cols = 0;
+            }
+            if at.is_none() && cursor == i {
+                at = Some((rows.len(), cols));
+            }
+            line.push(Seg {
+                text: chip.label.clone(),
+                chip: true,
+            });
+            cols += w;
+            i = chip.range.end;
+            b = chip.bytes.end;
+            next_chip += 1;
+            // The cursor is never inside a chip; if it somehow is, it belongs on
+            // the far side rather than in text nobody can see.
+            if at.is_none() && cursor <= i {
+                at = Some((rows.len(), cols));
+            }
+            continue;
+        }
+
+        let Some(c) = text[b..].chars().next() else {
+            break;
+        };
+        if c == '\n' {
+            if at.is_none() && cursor == i {
+                at = Some((rows.len(), cols));
+            }
+            rows.push(std::mem::take(&mut line));
+            cols = 0;
+        } else {
+            let w = c.width().unwrap_or(0);
+            if cols + w > width && !line.is_empty() {
+                rows.push(std::mem::take(&mut line));
+                cols = 0;
+            }
+            if at.is_none() && cursor == i {
+                at = Some((rows.len(), cols));
+            }
+            match line.last_mut() {
+                Some(seg) if !seg.chip => seg.text.push(c),
+                _ => line.push(Seg {
+                    text: c.to_string(),
+                    chip: false,
+                }),
+            }
+            cols += w;
+        }
+        i += 1;
+        b += c.len_utf8();
+    }
+
+    // Cursor at (or past) the end: a full last row means it belongs on a fresh one.
+    let at = at.unwrap_or_else(|| {
+        if cols >= width {
+            rows.push(std::mem::take(&mut line));
+            cols = 0;
+        }
+        (rows.len(), cols)
+    });
+    rows.push(line);
+    (rows, at)
 }
 
 /// Draw the approval modal. `reason` is `Some` while the user is typing a
@@ -338,27 +479,6 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
 /// Display width of a string (CJK double-width aware).
 fn display_width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
-}
-
-/// Drop columns from the left until at least `cols` display columns are gone,
-/// returning the remainder and how many columns were actually dropped.
-fn trim_left_cols(s: &str, cols: usize) -> (String, usize) {
-    if cols == 0 {
-        return (s.to_string(), 0);
-    }
-    let mut dropped = 0usize;
-    let mut out = String::new();
-    let mut trimming = true;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
-        if trimming && dropped < cols {
-            dropped += w;
-        } else {
-            trimming = false;
-            out.push(c);
-        }
-    }
-    (out, dropped)
 }
 
 /// Hard-wrap `text` (which may contain newlines) to `width` display columns.
@@ -466,13 +586,88 @@ mod tests {
         assert_eq!(lines.len(), 4);
     }
 
+    /// The rows' plain text, for assertions that don't care about chip styling.
+    fn row_texts(rows: &[Vec<Seg>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.iter().map(|s| s.text.as_str()).collect())
+            .collect()
+    }
+
     #[test]
-    fn trim_left_drops_whole_wide_chars() {
-        // Trimming 1 column out of a double-width char drops the whole char
-        // (2 columns) — the cursor math accounts for the actual drop.
-        let (rest, dropped) = trim_left_cols("你ab", 1);
-        assert_eq!(rest, "ab");
-        assert_eq!(dropped, 2);
+    fn wrap_input_places_cursor_after_an_explicit_newline() {
+        let (rows, at) = wrap_input("ab\ncd", &[], 10, 3);
+        assert_eq!(row_texts(&rows), vec!["ab", "cd"]);
+        assert_eq!(at, (1, 0), "cursor sits at the start of the second line");
+    }
+
+    #[test]
+    fn wrap_input_moves_the_cursor_to_a_fresh_row_when_the_last_is_full() {
+        let (rows, at) = wrap_input("abc", &[], 3, 3);
+        assert_eq!(row_texts(&rows), vec!["abc", ""]);
+        assert_eq!(at, (1, 0));
+    }
+
+    #[test]
+    fn wrap_input_keeps_the_cursor_inside_a_soft_wrapped_row() {
+        // Width 3, cursor before 'd' — 'd' opens the second row.
+        let (rows, at) = wrap_input("abcde", &[], 3, 3);
+        assert_eq!(row_texts(&rows), vec!["abc", "de"]);
+        assert_eq!(at, (1, 0));
+    }
+
+    #[test]
+    fn a_chip_renders_as_its_label_and_never_splits() {
+        // "see: " + a folded 4-line paste. The label is wider than the remaining
+        // columns, so it moves to its own row whole.
+        let pasted = "one\ntwo\nthree\nfour";
+        let text = format!("see: {pasted}");
+        let chips = [PasteChip {
+            range: 5..5 + pasted.chars().count(),
+            bytes: 5..5 + pasted.len(),
+            label: "[Pasted: 4 lines]".into(),
+        }];
+        let (rows, at) = wrap_input(&text, &chips, 12, text.chars().count());
+        assert_eq!(row_texts(&rows), vec!["see: ", "[Pasted: 4 lines]"]);
+        assert!(rows[1][0].chip, "the label is styled as a chip");
+        assert_eq!(at, (1, 17), "cursor sits just past the label");
+    }
+
+    #[test]
+    fn wrapping_does_not_walk_a_folded_paste() {
+        // A megabyte paste must cost what its label costs, not what its content
+        // does — this is the whole point of folding it.
+        let pasted = "x".repeat(1_000_000);
+        let chips = [PasteChip {
+            range: 0..pasted.chars().count(),
+            bytes: 0..pasted.len(),
+            label: "[Pasted: 1.0 MB]".into(),
+        }];
+        let started = std::time::Instant::now();
+        let (rows, at) = wrap_input(&pasted, &chips, 40, pasted.chars().count());
+        assert_eq!(row_texts(&rows), vec!["[Pasted: 1.0 MB]"]);
+        assert_eq!(at, (0, 16));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(5),
+            "wrapping a folded paste must not scale with its size: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn input_box_grows_with_the_draft() {
+        let area = Rect::new(0, 0, 20, 24);
+        let mut app = App::new("s".into());
+        assert_eq!(input_height(&app, area, 1), 3, "one row + borders");
+        app.input = "a\nb\nc".into();
+        app.cursor = app.input.chars().count();
+        assert_eq!(input_height(&app, area, 1), 5);
+        app.input = "x\n".repeat(40);
+        app.cursor = app.input.chars().count();
+        assert_eq!(
+            input_height(&app, area, 1),
+            INPUT_MAX_ROWS + 2,
+            "capped, then scrolls internally"
+        );
     }
 
     /// Headless render smoke: a full frame (transcript + status + input, then
@@ -512,6 +707,26 @@ mod tests {
         let content = format!("{:?}", terminal.backend().buffer());
         assert!(content.contains("rm -rf"), "modal summary rendered");
         assert!(content.contains("拒绝"), "modal key hints rendered");
+    }
+
+    /// Full render path with a folded paste in the composer: the label shows, the
+    /// pasted content does not, and the box stays one row tall.
+    #[test]
+    fn renders_a_folded_paste_chip_in_the_composer() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new("sess-1".into());
+        app.on_paste("alpha\nbeta\ngamma\ndelta");
+        assert_eq!(app.chips.len(), 1, "precondition: the paste folded");
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("[Pasted: 4 lines]"), "chip label rendered");
+        assert!(
+            !content.contains("gamma"),
+            "the folded content stays off screen"
+        );
     }
 
     /// Headless render smoke for the tool activity feed: a running line shows

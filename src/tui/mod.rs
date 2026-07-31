@@ -5,7 +5,12 @@
 //! server-side), or the in-process [`AgentRuntime`] against the local db.
 //!
 //! Layout: scrollable transcript · status line (spinner while a turn runs) ·
-//! bordered input box. As the agent works, each tool call renders as a live
+//! bordered input box. Enter sends; Shift/Alt-Enter or Ctrl-J insert a newline,
+//! and the box grows with the draft. Pastes follow grok build (see
+//! `tui/paste.rs`): a big one folds to a `[Pasted: N lines]` chip that edits and
+//! deletes as one object while the draft keeps the text verbatim, and a burst of
+//! keystrokes from a terminal without bracketed paste is coalesced back into one
+//! paste instead of submitting at its first newline. As the agent works, each tool call renders as a live
 //! activity line (`⚙ shell …` → `✓`/`✗` with a result preview) fed by the
 //! turn's [`TurnEvent`] stream — from the in-process executor's event sink in
 //! local mode, or parsed from the gateway's SSE stream in remote mode; the
@@ -21,11 +26,19 @@
 mod app;
 mod approver;
 mod markdown;
+mod paste;
 mod ui;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::{
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::supports_keyboard_enhancement,
+};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
@@ -263,7 +276,23 @@ async fn drive(
     workspace: PathBuf,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // Bracketed paste turns a multi-line clipboard dump into one `Event::Paste`
+    // instead of a stream of Enters (which used to send a message per line).
+    // The kitty keyboard flags are what let a terminal report Shift/Alt-Enter as
+    // a modified Enter; where they are unsupported, Ctrl-J still inserts a
+    // newline.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    let enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
+        && execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
     let result = event_loop(&mut terminal, connected, session, resuming, workspace).await;
+    if enhanced {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     // Print only after leaving the alternate screen, so the command survives in
     // the user's normal terminal scrollback and is immediately copyable.
@@ -342,89 +371,34 @@ async fn event_loop(
     }
 
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<Result<String, String>>();
-    let mut events = EventStream::new();
+    // Terminal input arrives over a channel rather than being awaited inline: a
+    // paste that a terminal delivers as keystrokes has to be *collected* (see
+    // `paste::extend_for_paste`), which needs the receiver free while the batch
+    // is assembled.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
+    tokio::spawn(async move {
+        let mut events = EventStream::new();
+        while let Some(Ok(event)) = events.next().await {
+            if input_tx.send(event).is_err() {
+                break; // the loop is gone
+            }
+        }
+    });
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
 
-    loop {
+    'main: loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
+        let mut batch: Vec<Event> = Vec::new();
         tokio::select! {
             // Biased so ordering is deterministic: keys stay responsive, and
             // queued tool events always drain before the final reply — so the
             // ✓ activity lines never render below the agent's answer.
             biased;
-            maybe_event = events.next() => {
-                let Some(event) = maybe_event.transpose()? else { break };
-                let Event::Key(key) = event else { continue };
-                // kitty-protocol terminals also send Release/Repeat.
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match app.on_key(key) {
-                    Some(Action::Quit) => break,
-                    Some(Action::Submit(text)) => {
-                        app.push(Role::You, text.clone());
-                        app.start_turn();
-                        // Fresh tool feed for the new turn (seqs restart).
-                        app.begin_tools();
-                        let backend = backend.clone();
-                        let session_id = app.session_id.clone();
-                        let turn_tx = turn_tx.clone();
-                        let events = event_tx.clone();
-                        // Local mode: an interactive context whose sink feeds
-                        // mid-turn messages into this loop, so `ask_user` can
-                        // question the user; fresh clarify budget per turn. Its
-                        // event sink drives the tool activity feed.
-                        let ctx = clarify.as_ref().map(|cl| {
-                            cl.begin_turn(&session_id);
-                            SessionContext {
-                                session_id: session_id.clone(),
-                                workspace_root: None,
-                                sink: Arc::new(ChannelSink { tx: sink_tx.clone() }),
-                                interactive: true,
-                                auto_approve: false,
-                                event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
-                                // The TUI has no stop key (yet); Ctrl-C tears
-                                // down the whole process instead.
-                                cancel: None,
-                            }
-                        });
-                        tokio::spawn(async move {
-                            let result = backend
-                                .turn(&session_id, text, ctx, events)
-                                .await
-                                .map_err(|e| format!("{e:#}"));
-                            let _ = turn_tx.send(result);
-                        });
-                    }
-                    Some(Action::NewSession) => {
-                        // Turns are keyed by session id, so an in-flight turn
-                        // for the old id can finish and render harmlessly.
-                        if let Some(cl) = &clarify {
-                            // A pending question belongs to the old session.
-                            cl.clear(&app.session_id);
-                        }
-                        app.awaiting_answer = false;
-                        app.session_id = new_session_id();
-                        if let Backend::Local { db, .. } = &backend {
-                            ensure_session(db, &app.session_id, &workspace).await?;
-                        }
-                        app.push(
-                            Role::Info,
-                            format!("Started new session `{}`", app.session_id),
-                        );
-                    }
-                    Some(Action::Answer(text)) => {
-                        if let Some(cl) = &clarify
-                            && cl.resolve(&app.session_id, &text)
-                        {
-                            app.push(Role::You, text);
-                        } else {
-                            app.push(Role::Info, "问题已失效（超时或会话已重置）。".to_string());
-                        }
-                    }
-                    Some(Action::Answered(_)) | None => {}
-                }
+            maybe_event = input_rx.recv() => {
+                // Collected below, once the receiver is free again.
+                let Some(event) = maybe_event else { break 'main };
+                batch.push(event);
             }
             // Live tool-call events (both backends): render each as an activity
             // line, updating the same line in place when it finishes. Kept above
@@ -475,6 +449,98 @@ async fn event_loop(
                 if app.in_flight {
                     app.spinner = app.spinner.wrapping_add(1);
                 }
+            }
+        }
+
+        // Terminal input. The batch is assembled here, outside the select, so a
+        // paste that arrived as a burst of keystrokes can be collected and folded
+        // back into one `Event::Paste` before anything is interpreted — otherwise
+        // its first newline would submit the message.
+        if batch.is_empty() {
+            continue;
+        }
+        paste::drain_ready(&mut batch, &mut input_rx);
+        if paste::should_extend(&batch) {
+            paste::extend_for_paste(&mut batch, &mut input_rx).await;
+        }
+        for event in paste::coalesce_rapid_keys(batch) {
+            if let Event::Paste(text) = &event {
+                app.on_paste(text);
+                continue;
+            }
+            let Event::Key(key) = event else { continue };
+            // kitty-protocol terminals also send Release/Repeat.
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match app.on_key(key) {
+                Some(Action::Quit) => break 'main,
+                // `shown` folds pasted blocks to their chip label; `text` is
+                // the full draft the agent receives.
+                Some(Action::Submit { text, shown }) => {
+                    app.push(Role::You, shown);
+                    app.start_turn();
+                    // Fresh tool feed for the new turn (seqs restart).
+                    app.begin_tools();
+                    let backend = backend.clone();
+                    let session_id = app.session_id.clone();
+                    let turn_tx = turn_tx.clone();
+                    let events = event_tx.clone();
+                    // Local mode: an interactive context whose sink feeds
+                    // mid-turn messages into this loop, so `ask_user` can
+                    // question the user; fresh clarify budget per turn. Its
+                    // event sink drives the tool activity feed.
+                    let ctx = clarify.as_ref().map(|cl| {
+                        cl.begin_turn(&session_id);
+                        SessionContext {
+                            session_id: session_id.clone(),
+                            workspace_root: None,
+                            sink: Arc::new(ChannelSink {
+                                tx: sink_tx.clone(),
+                            }),
+                            interactive: true,
+                            auto_approve: false,
+                            event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
+                            // The TUI has no stop key (yet); Ctrl-C tears
+                            // down the whole process instead.
+                            cancel: None,
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let result = backend
+                            .turn(&session_id, text, ctx, events)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = turn_tx.send(result);
+                    });
+                }
+                Some(Action::NewSession) => {
+                    // Turns are keyed by session id, so an in-flight turn
+                    // for the old id can finish and render harmlessly.
+                    if let Some(cl) = &clarify {
+                        // A pending question belongs to the old session.
+                        cl.clear(&app.session_id);
+                    }
+                    app.awaiting_answer = false;
+                    app.session_id = new_session_id();
+                    if let Backend::Local { db, .. } = &backend {
+                        ensure_session(db, &app.session_id, &workspace).await?;
+                    }
+                    app.push(
+                        Role::Info,
+                        format!("Started new session `{}`", app.session_id),
+                    );
+                }
+                Some(Action::Answer { text, shown }) => {
+                    if let Some(cl) = &clarify
+                        && cl.resolve(&app.session_id, &text)
+                    {
+                        app.push(Role::You, shown);
+                    } else {
+                        app.push(Role::Info, "问题已失效（超时或会话已重置）。".to_string());
+                    }
+                }
+                Some(Action::Answered(_)) | None => {}
             }
         }
     }

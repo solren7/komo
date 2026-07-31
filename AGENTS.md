@@ -250,7 +250,13 @@ content the model can recover from; only a driver/LLM error aborts the turn.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
   key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
   compatible `komo session resume <id>`) re-enters a session; a bare API UUID
-  resolves its internal `api:<uuid>` id and hydrates the transcript.
+  resolves its internal `api:<uuid>` id and hydrates the transcript. Input:
+  Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline; `tui/paste.rs`
+  holds both paste mechanisms — a chip folds a ≥4-line / >10 KB paste to a label
+  (`input` still holds the full text; the chip's byte range is what keeps
+  rendering off the folded content) and `coalesce_rapid_keys` rebuilds a paste
+  that a terminal without bracketed paste delivered as keystrokes. Input events
+  go through a channel so a batch can be collected before it is interpreted.
 - `cron` (`~/.komo/cron.db`, `CronJobSweep`) — two job modes: **command**
   (operator-authored, runs directly, no approver) and **agent** (unattended
   turn on `cron_runtime`, side effects need `unattended = true` policy rules).

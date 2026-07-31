@@ -10,6 +10,23 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::approver::{Answer, ApprovalPrompt};
+use super::paste;
+
+/// A pasted block the composer folds to a one-line label. Chips never overlap and
+/// stay ordered, so the composer can treat one as a single atomic glyph — grok
+/// build's `KIND_PASTE` element, without the general element machinery.
+///
+/// The range is carried twice on purpose: `range` is in **chars** (the unit
+/// `cursor` uses), `bytes` in **bytes**, which is what lets the renderer *slice
+/// past* a folded block instead of walking it. Without that, every frame would
+/// still traverse a megabyte paste character by character — exactly the cost the
+/// chip exists to avoid.
+#[derive(Debug, Clone)]
+pub struct PasteChip {
+    pub range: std::ops::Range<usize>,
+    pub bytes: std::ops::Range<usize>,
+    pub label: String,
+}
 
 /// Who a transcript entry belongs to (drives the prefix + styling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,15 +55,24 @@ pub struct Entry {
 /// mutation already applied.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Run a turn with this input.
-    Submit(String),
+    /// Run a turn with this input. `text` is the full draft (what the agent
+    /// gets); `shown` is the same draft with pasted blocks folded to their chip
+    /// labels — what belongs in the transcript.
+    Submit {
+        text: String,
+        shown: String,
+    },
     /// Start a fresh session (`/new` / `/clear`).
     NewSession,
     /// The user answered the approval modal.
     Answered(Answer),
     /// The user answered a mid-turn `ask_user` question (local mode): resolve
-    /// it into the suspended turn instead of starting a new one.
-    Answer(String),
+    /// it into the suspended turn instead of starting a new one. Same
+    /// `text`/`shown` split as [`Action::Submit`].
+    Answer {
+        text: String,
+        shown: String,
+    },
     Quit,
 }
 
@@ -56,6 +82,9 @@ pub struct App {
     pub input: String,
     /// Cursor as a char index into `input`.
     pub cursor: usize,
+    /// Folded paste blocks inside `input`, ordered and non-overlapping. Display
+    /// state only: `input` always holds the full text.
+    pub chips: Vec<PasteChip>,
     /// Scroll offset in wrapped lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: u16,
     pub in_flight: bool,
@@ -89,6 +118,7 @@ impl App {
             entries: Vec::new(),
             input: String::new(),
             cursor: 0,
+            chips: Vec::new(),
             scroll_from_bottom: 0,
             in_flight: false,
             turn_started_at: None,
@@ -264,6 +294,21 @@ impl App {
             {
                 Some(Action::Quit)
             }
+            // Newline instead of send. Shift/Alt-Enter needs a terminal that
+            // reports the modifier (kitty keyboard protocol, pushed in `drive`);
+            // Ctrl-J is the fallback everywhere else.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_char('\n');
+                None
+            }
+            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                self.insert_char('\n');
+                None
+            }
             KeyCode::Enter => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
@@ -273,47 +318,63 @@ impl App {
                     self.clear_input();
                     return Some(Action::NewSession);
                 }
+                // The transcript shows the draft as it looked — pasted blocks
+                // stay folded to their chip label. The agent gets `text`, which
+                // is always the full content.
+                let shown = self.folded_input();
                 if self.in_flight {
                     // A pending clarify question lets the input through as its
                     // answer — the suspended turn continues with it.
                     if self.awaiting_answer {
                         self.clear_input();
                         self.awaiting_answer = false;
-                        return Some(Action::Answer(text));
+                        return Some(Action::Answer { text, shown });
                     }
                     // One turn at a time; keep the draft so nothing is lost.
                     return None;
                 }
                 self.clear_input();
-                Some(Action::Submit(text))
+                Some(Action::Submit { text, shown })
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let at = self.byte_cursor();
-                self.input.insert(at, c);
-                self.cursor += 1;
+                self.insert_char(c);
                 None
             }
+            // A chip deletes whole: the cursor is never inside a pasted block,
+            // so one Backspace behind it removes the paste rather than shaving a
+            // character off content the user cannot see.
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_cursor();
-                    self.input.remove(at);
+                match self.chip_ending_at(self.cursor) {
+                    Some(i) => self.delete_chars(self.chips[i].range.clone()),
+                    None if self.cursor > 0 => self.delete_chars(self.cursor - 1..self.cursor),
+                    None => {}
                 }
                 None
             }
             KeyCode::Delete => {
-                if self.cursor < self.input.chars().count() {
-                    let at = self.byte_cursor();
-                    self.input.remove(at);
+                match self.chip_starting_at(self.cursor) {
+                    Some(i) => self.delete_chars(self.chips[i].range.clone()),
+                    None if self.cursor < self.input.chars().count() => {
+                        self.delete_chars(self.cursor..self.cursor + 1)
+                    }
+                    None => {}
                 }
                 None
             }
+            // Chips are atomic to the cursor too: stepping over one lands on the
+            // far side instead of inside the hidden text.
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = match self.chip_ending_at(self.cursor) {
+                    Some(i) => self.chips[i].range.start,
+                    None => self.cursor.saturating_sub(1),
+                };
                 None
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                self.cursor = match self.chip_starting_at(self.cursor) {
+                    Some(i) => self.chips[i].range.end,
+                    None => (self.cursor + 1).min(self.input.chars().count()),
+                };
                 None
             }
             KeyCode::Home => {
@@ -346,16 +407,139 @@ impl App {
 
     /// Byte offset of the char cursor (input is UTF-8; CJK chars are multibyte).
     fn byte_cursor(&self) -> usize {
-        self.input
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
+        self.byte_at(self.cursor)
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.chips.clear();
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let at = self.byte_cursor();
+        self.input.insert(at, c);
+        self.shift_chips(self.cursor, 1, c.len_utf8() as isize);
+        self.cursor += 1;
+    }
+
+    /// Bracketed paste (or a burst of keystrokes a terminal without bracketed
+    /// paste turned into one — see `paste::coalesce_rapid_keys`): the clipboard
+    /// text lands in the draft verbatim, newlines included, so a multi-line paste
+    /// can never fire a send per line.
+    ///
+    /// A paste past the chip threshold is *displayed* as a one-line label. The
+    /// draft still holds every character, so submitting needs no expansion — the
+    /// fold is purely how it renders, which is also what keeps a megabyte paste
+    /// from being re-wrapped on every frame.
+    pub fn on_paste(&mut self, text: &str) {
+        // The approval modal owns the keyboard; a stray paste must not leak into
+        // the draft behind it.
+        if self.modal.is_some() {
+            return;
+        }
+        let text = paste::normalize_cr(text);
+        if text.is_empty() {
+            return;
+        }
+
+        // Repaste-to-expand, from grok build: "paste didn't do what I want?
+        // paste again." Pasting a chip's exact content with the cursor on it
+        // unfolds that chip instead of inserting a second copy.
+        if let Some(i) = self
+            .chip_ending_at(self.cursor)
+            .or_else(|| self.chip_starting_at(self.cursor))
+            && self.chip_text(i) == text
+        {
+            let chip = self.chips.remove(i);
+            self.cursor = chip.range.end;
+            return;
+        }
+
+        let at = self.byte_cursor();
+        self.input.insert_str(at, &text);
+        let len = text.chars().count();
+        self.shift_chips(self.cursor, len as isize, text.len() as isize);
+        if paste::is_chip_worthy(&text) {
+            let chip = PasteChip {
+                range: self.cursor..self.cursor + len,
+                bytes: at..at + text.len(),
+                label: paste::chip_label(&text),
+            };
+            let index = self
+                .chips
+                .partition_point(|c| c.range.start < chip.range.start);
+            self.chips.insert(index, chip);
+        }
+        self.cursor += len;
+    }
+
+    /// The draft as it is shown: every chip range replaced by its label. Used for
+    /// the transcript entry when the draft is sent (the agent gets `input`).
+    fn folded_input(&self) -> String {
+        if self.chips.is_empty() {
+            return self.input.trim().to_string();
+        }
+        let mut out = String::new();
+        let mut at = 0usize;
+        for chip in &self.chips {
+            out.extend(self.input.chars().skip(at).take(chip.range.start - at));
+            out.push_str(&chip.label);
+            at = chip.range.end;
+        }
+        out.extend(self.input.chars().skip(at));
+        out.trim().to_string()
+    }
+
+    /// Index of the chip that ends exactly at `at` (the cursor sits behind it).
+    fn chip_ending_at(&self, at: usize) -> Option<usize> {
+        self.chips.iter().position(|c| c.range.end == at)
+    }
+
+    /// Index of the chip that starts exactly at `at` (the cursor sits in front).
+    fn chip_starting_at(&self, at: usize) -> Option<usize> {
+        self.chips.iter().position(|c| c.range.start == at)
+    }
+
+    fn chip_text(&self, i: usize) -> &str {
+        &self.input[self.chips[i].bytes.clone()]
+    }
+
+    /// Move every chip starting at or after `at` (a char index) by `delta` chars
+    /// / `delta_bytes` bytes — the draft changed length in front of them.
+    fn shift_chips(&mut self, at: usize, delta: isize, delta_bytes: isize) {
+        for chip in &mut self.chips {
+            if chip.range.start >= at {
+                chip.range.start = chip.range.start.saturating_add_signed(delta);
+                chip.range.end = chip.range.end.saturating_add_signed(delta);
+                chip.bytes.start = chip.bytes.start.saturating_add_signed(delta_bytes);
+                chip.bytes.end = chip.bytes.end.saturating_add_signed(delta_bytes);
+            }
+        }
+    }
+
+    /// Delete a char range from the draft, dropping any chip it covers and
+    /// pulling the later chips back. The cursor lands where the text was.
+    fn delete_chars(&mut self, range: std::ops::Range<usize>) {
+        let (start, end) = (self.byte_at(range.start), self.byte_at(range.end));
+        self.input.replace_range(start..end, "");
+        self.chips
+            .retain(|c| !(c.range.start >= range.start && c.range.end <= range.end));
+        self.shift_chips(
+            range.end,
+            -((range.end - range.start) as isize),
+            -((end - start) as isize),
+        );
+        self.cursor = range.start;
+    }
+
+    /// Byte offset of char index `at` (the end of the string when past it).
+    fn byte_at(&self, at: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(at)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
     }
 }
 
@@ -408,6 +592,139 @@ mod tests {
     fn type_reason(app: &mut App, s: &str) {
         assert!(app.modal_reason.is_some(), "not in reason-entry mode");
         type_str(app, s);
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_a_newline_instead_of_sending() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "one");
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            None,
+            "Shift-Enter must not submit"
+        );
+        type_str(&mut app, "two");
+        assert_eq!(app.on_key(ctrl('j')), None, "Ctrl-J must not submit");
+        type_str(&mut app, "three");
+        assert_eq!(app.input, "one\ntwo\nthree");
+        assert_eq!(app.cursor, app.input.chars().count());
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Submit {
+                text: "one\ntwo\nthree".into(),
+                shown: "one\ntwo\nthree".into(),
+            }),
+            "a bare Enter still sends the whole draft"
+        );
+    }
+
+    #[test]
+    fn paste_keeps_newlines_and_never_submits() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "x");
+        app.on_paste("first\r\nsecond\rthird");
+        assert_eq!(app.input, "xfirst\nsecond\nthird");
+        assert_eq!(app.cursor, app.input.chars().count());
+        assert!(app.chips.is_empty(), "3 lines stays inline");
+        // Nothing was submitted: the draft is still there for the user to edit.
+        assert!(!app.in_flight);
+    }
+
+    #[test]
+    fn a_big_paste_folds_to_a_chip_but_sends_in_full() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "look: ");
+        let pasted = "one\ntwo\nthree\nfour";
+        app.on_paste(pasted);
+
+        assert_eq!(
+            app.input,
+            format!("look: {pasted}"),
+            "draft keeps every char"
+        );
+        assert_eq!(app.chips.len(), 1);
+        assert_eq!(app.chips[0].label, "[Pasted: 4 lines]");
+        assert_eq!(app.chips[0].range, 6..6 + pasted.chars().count());
+        assert_eq!(app.cursor, app.input.chars().count());
+
+        let action = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Some(Action::Submit {
+                text: format!("look: {pasted}"),
+                shown: "look: [Pasted: 4 lines]".into(),
+            }),
+            "the agent gets the full text; the transcript shows the chip"
+        );
+        assert!(app.chips.is_empty(), "chips die with the draft");
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_chip() {
+        let mut app = App::new("s".into());
+        app.on_paste("one\ntwo\nthree\nfour");
+        type_str(&mut app, "!");
+        assert_eq!(app.chips.len(), 1);
+
+        // One Backspace takes the typed char, the next takes the entire paste —
+        // never a single character out of text the user cannot see.
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.chips.len(), 1, "still folded");
+        app.on_key(key(KeyCode::Backspace));
+        assert!(
+            app.input.is_empty(),
+            "the paste went whole: {:?}",
+            app.input
+        );
+        assert!(app.chips.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn arrows_step_over_a_chip_instead_of_into_it() {
+        let mut app = App::new("s".into());
+        let pasted = "one\ntwo\nthree\nfour";
+        app.on_paste(pasted);
+        type_str(&mut app, "ab");
+        let end = app.input.chars().count();
+
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, end - 1, "inside plain text, one char at a time");
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, pasted.chars().count(), "now just past the chip");
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, 0, "one step clears the whole chip");
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.cursor, pasted.chars().count(), "and back over it");
+    }
+
+    #[test]
+    fn repasting_the_same_content_expands_the_chip() {
+        let mut app = App::new("s".into());
+        let pasted = "one\ntwo\nthree\nfour";
+        app.on_paste(pasted);
+        assert_eq!(app.chips.len(), 1);
+
+        // grok build's "paste didn't do what I want? paste again" — the second
+        // paste unfolds the block instead of inserting a second copy.
+        app.on_paste(pasted);
+        assert_eq!(app.input, pasted, "content is unchanged, not doubled");
+        assert!(app.chips.is_empty(), "now shown inline");
+        assert_eq!(app.cursor, pasted.chars().count());
+    }
+
+    #[test]
+    fn chip_offsets_survive_editing_in_front_of_it() {
+        let mut app = App::new("s".into());
+        let pasted = "one\ntwo\nthree\nfour";
+        app.on_paste(pasted);
+        app.cursor = 0;
+        // A multibyte char in front of the chip must move both its char range and
+        // its byte range, or the renderer slices the wrong bytes.
+        type_str(&mut app, "中");
+        assert_eq!(app.chips[0].range, 1..1 + pasted.chars().count());
+        assert_eq!(app.chips[0].bytes, 3.."中".len() + pasted.len());
+        assert_eq!(&app.input[app.chips[0].bytes.clone()], pasted);
     }
 
     #[test]
@@ -470,7 +787,10 @@ mod tests {
         type_str(&mut app, "hello");
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
-            Some(Action::Submit("hello".into()))
+            Some(Action::Submit {
+                text: "hello".into(),
+                shown: "hello".into(),
+            })
         );
         assert!(app.input.is_empty());
 
@@ -502,7 +822,10 @@ mod tests {
         type_str(&mut app, "蓝色");
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
-            Some(Action::Answer("蓝色".into()))
+            Some(Action::Answer {
+                text: "蓝色".into(),
+                shown: "蓝色".into(),
+            })
         );
         assert!(app.input.is_empty());
         assert!(!app.awaiting_answer, "one answer per question");

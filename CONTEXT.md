@@ -23,5 +23,11 @@ _Avoid_: checkpoint, snapshot
 _Avoid_: checkpoint, session state
 
 **History Window**:
-每 turn 送入模型的会话历史窗口（条数 + 字节双界）。窗口外的消息仍在库里，只是不进 prompt。
+每 turn 送入模型的会话历史窗口（条数 + 字节双界）。窗口外的消息仍在库里，只是不进 prompt；窗口被裁剪时向模型插入标记告知。
 _Avoid_: context window（那是模型的物理上限，不是 komo 的裁剪策略）
+
+### 执行控制
+
+**Cancel**:
+对进行中 turn 的终止：loop 的每个 await 都与取消信号竞速，被取消的 turn 记为 Failed 且不可恢复。聊天渠道的入口是 `/stop` 命令。
+_Avoid_: interrupt, abort（不要暗示可恢复或可续跑）

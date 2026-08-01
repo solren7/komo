@@ -182,7 +182,11 @@ impl AgentRuntime {
         // Keep a handle on the run to read the tool-step count after the loop (the
         // counter is shared via `Arc`) and to fetch the steps themselves.
         let probe = run.clone();
-        let (reply, usage) = match self.run_agent_loop(&session, run).await {
+        let TurnOutcome {
+            reply,
+            usage,
+            interjections,
+        } = match self.run_agent_loop(&session, run).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 // The turn failed *after* the user message was persisted. Persist
@@ -195,6 +199,25 @@ impl AgentRuntime {
                 //
                 // A user cancel is not a failure, so it gets its own note: the
                 // transcript should read as "I stopped this", not as an error.
+                // A cancel that landed before the turn did anything rewinds
+                // instead of leaving a tombstone: take the user message back
+                // out and the transcript reads as if the turn never happened.
+                // "Did anything" means a tool ran — the only way a cancelled
+                // turn can have effects worth remembering. Without this, a user
+                // who sends a message and immediately stops it is left with a
+                // "(已取消)" pair that every later turn replays. The run ledger
+                // still records the cancelled run: the transcript is the
+                // conversation, the ledger is the audit trail.
+                if is_cancelled(&error) && probe.steps_count() == 0 {
+                    match self.messages.delete_recent(session_id, 1).await {
+                        Ok(_) => return Err(error),
+                        // Rewind failed — fall through and leave the tombstone,
+                        // which at least keeps the transcript alternating.
+                        Err(rewind_err) => {
+                            warn!(%rewind_err, "failed to rewind a pristine cancel (non-fatal)")
+                        }
+                    }
+                }
                 let note = if is_cancelled(&error) {
                     CANCELLED_REPLY.to_string()
                 } else {
@@ -213,6 +236,20 @@ impl AgentRuntime {
                 return Err(error);
             }
         };
+
+        // Anything the user said mid-turn is folded into *this turn's* stored
+        // user message rather than appended as its own. Two consecutive user
+        // messages is exactly what the transcript may not contain (several
+        // providers reject it), and both halves really are one user's input for
+        // one turn — the same merge a follow-up gets when it waits for the next
+        // turn instead. Best-effort: the model already acted on them, so a
+        // failure here costs the *next* turn context, not this one's answer.
+        if !interjections.is_empty() {
+            let extra = interjections.join("\n");
+            if let Err(error) = self.messages.append_to_last_user(session_id, &extra).await {
+                warn!(%error, "failed to record a mid-turn interjection (non-fatal)");
+            }
+        }
 
         // Fold this turn's tool activity into a note on the assistant message, so
         // the *next* turn knows tools ran, what they found, and where an
@@ -291,7 +328,7 @@ impl AgentRuntime {
         &self,
         session: &Session,
         run: RunContext,
-    ) -> anyhow::Result<(String, TokenUsage)> {
+    ) -> anyhow::Result<TurnOutcome> {
         // The executor gets the turn's context explicitly: the run handle this
         // turn opened, and the session established by the dispatcher / api /
         // handle_input (read once here — the one ambient-to-explicit bridge).
@@ -315,6 +352,9 @@ impl AgentRuntime {
         // budget cutoff below can answer in the model's own words instead of a
         // canned line — by then it has usually said what it was doing.
         let mut narration = String::new();
+        // What the user said mid-turn, in order, for the caller to fold into
+        // the transcript once the turn ends.
+        let mut interjections: Vec<String> = Vec::new();
 
         let reply = loop {
             match step {
@@ -357,7 +397,29 @@ impl AgentRuntime {
                         .await?
                     };
 
-                    let next = Self::until_cancelled(cancel, driver.step(results)).await?;
+                    // Anything the user said while that round ran joins this
+                    // step instead of waiting for a whole new turn — a
+                    // correction is only worth anything before the agent
+                    // finishes going the wrong way. Drained here, between
+                    // rounds, so the model sees it at the one point it can
+                    // change course. Kept for the transcript too: the next
+                    // turn has to know what was said.
+                    let said = context
+                        .session
+                        .interject
+                        .as_ref()
+                        .map(|source| source.take())
+                        .unwrap_or_default();
+                    let interjected = if said.is_empty() {
+                        None
+                    } else {
+                        info!(count = said.len(), "user interjected mid-turn");
+                        interjections.extend(said.iter().cloned());
+                        Some(said.join("\n"))
+                    };
+
+                    let next =
+                        Self::until_cancelled(cancel, driver.step(results, interjected)).await?;
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
                     step = if over_budget {
@@ -374,8 +436,22 @@ impl AgentRuntime {
                 }
             }
         };
-        Ok((reply, driver.usage()))
+        Ok(TurnOutcome {
+            reply,
+            usage: driver.usage(),
+            interjections,
+        })
     }
+}
+
+/// What one pass of the agent loop produced.
+struct TurnOutcome {
+    reply: String,
+    usage: TokenUsage,
+    /// User messages that arrived mid-turn and were folded into it. The loop
+    /// already showed them to the model; the caller still has to get them into
+    /// the transcript, or the next turn has no idea they were ever said.
+    interjections: Vec<String>,
 }
 
 /// The reply for a turn the round budget cut short. The model's own words (this
@@ -421,6 +497,8 @@ mod tests {
     struct ScriptedLlm {
         script: Mutex<VecDeque<Step>>,
         received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
+        /// Mid-turn user messages the loop handed to `step()`, in order.
+        interjected: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -434,6 +512,7 @@ mod tests {
             Ok(Box::new(ScriptedDriver {
                 steps,
                 received: self.received.clone(),
+                interjected: self.interjected.clone(),
             }))
         }
     }
@@ -441,6 +520,7 @@ mod tests {
     struct ScriptedDriver {
         steps: VecDeque<Step>,
         received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
+        interjected: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -448,7 +528,14 @@ mod tests {
         async fn first(&mut self) -> anyhow::Result<Step> {
             Ok(self.steps.pop_front().expect("script exhausted at first()"))
         }
-        async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+        async fn step(
+            &mut self,
+            results: Vec<ToolOutcome>,
+            interjected: Option<String>,
+        ) -> anyhow::Result<Step> {
+            if let Some(text) = interjected {
+                self.interjected.lock().unwrap().push(text);
+            }
             self.received.lock().unwrap().push(results);
             Ok(self.steps.pop_front().expect("script exhausted at step()"))
         }
@@ -537,7 +624,25 @@ mod tests {
         tools: Vec<Arc<dyn Tool>>,
         max_turns: usize,
     ) -> (AgentRuntime, Arc<Mutex<Vec<Vec<ToolOutcome>>>>) {
+        let (rt, received, _) = scripted_runtime_seeing_interjections(db, script, tools, max_turns);
+        (rt, received)
+    }
+
+    /// [`scripted_runtime`] plus a handle on the mid-turn user messages the loop
+    /// fed to the driver — what an interjection test asserts on.
+    #[allow(clippy::type_complexity)]
+    fn scripted_runtime_seeing_interjections(
+        db: Arc<Db>,
+        script: Vec<Step>,
+        tools: Vec<Arc<dyn Tool>>,
+        max_turns: usize,
+    ) -> (
+        AgentRuntime,
+        Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let received = Arc::new(Mutex::new(Vec::new()));
+        let interjected = Arc::new(Mutex::new(Vec::new()));
         let mut executor =
             ToolExecutor::new(crate::services::tool_execution::ToolExecutionConfig::default());
         for t in tools {
@@ -547,6 +652,7 @@ mod tests {
             llm: Arc::new(ScriptedLlm {
                 script: Mutex::new(script.into()),
                 received: received.clone(),
+                interjected: interjected.clone(),
             }),
             sessions: db.clone(),
             messages: db.clone(),
@@ -556,7 +662,7 @@ mod tests {
             history_window: 0,
             review: None,
         };
-        (rt, received)
+        (rt, received, interjected)
     }
 
     /// A tool that parks until released, so a turn can be cancelled *while* a
@@ -661,6 +767,103 @@ mod tests {
             .await
             .expect_err("a cancelled turn fails");
         assert!(is_cancelled(&error));
+    }
+
+    /// An [`InterjectSource`] that hands over a fixed message once — the shape
+    /// of a user typing while a round runs.
+    struct SaysOnce(Mutex<Option<String>>);
+    impl crate::domain::gateway::InterjectSource for SaysOnce {
+        fn take(&self) -> Vec<String> {
+            self.0.lock().unwrap().take().into_iter().collect()
+        }
+    }
+
+    /// What the user says mid-turn reaches the model on the very next round —
+    /// the whole point, since a correction is worthless once the agent has
+    /// finished going the wrong way — and lands in the transcript folded into
+    /// this turn's user message (never as a second one, which would leave two
+    /// consecutive user messages for the next turn to replay).
+    #[tokio::test]
+    async fn a_mid_turn_interjection_reaches_the_model_and_the_transcript() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_interject.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _, interjected) = scripted_runtime_seeing_interjections(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("好的，改看 B".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+
+        let ctx = SessionContext::detached("cli:interject").with_interject(Arc::new(SaysOnce(
+            Mutex::new(Some("不对，是 B 不是 A".to_string())),
+        )));
+        let reply = with_session(ctx, rt.handle_input("cli:interject", "看下 A".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(reply, "好的，改看 B");
+
+        // Delivered to the model on the round right after it was said.
+        assert_eq!(
+            interjected.lock().unwrap().clone(),
+            vec!["不对，是 B 不是 A"],
+            "the interjection must reach the driver mid-turn"
+        );
+
+        // One user message for the turn, carrying both halves of what was said.
+        let messages = MessageRepository::list_by_session(&*db, "cli:interject")
+            .await
+            .unwrap();
+        let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::Assistant],
+            "an interjection must not become a second user message"
+        );
+        assert!(
+            messages[0].content.contains("看下 A") && messages[0].content.contains("是 B 不是 A"),
+            "both halves belong to the turn's user message, got {:?}",
+            messages[0].content
+        );
+    }
+
+    /// A cancel that lands before any tool ran leaves nothing behind: the
+    /// turn's own user message is rewound out, so the transcript reads as if it
+    /// never happened and later turns don't replay a "(已取消)" pair forever.
+    /// The ledger still records the cancelled run — that is the audit trail.
+    #[tokio::test]
+    async fn a_pristine_cancel_rewinds_its_user_message() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_cancel_pristine.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
+
+        let (ctx, cancels) = cancellable_ctx("cancel-pristine");
+        cancels.cancel("cancel-pristine");
+        let error = with_session(ctx, rt.handle_input("cancel-pristine", "算了".to_string()))
+            .await
+            .expect_err("a cancelled turn fails");
+        assert!(is_cancelled(&error));
+
+        let messages = MessageRepository::list_by_session(&*db, "cancel-pristine")
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "a pristine cancel leaves no transcript, got {} message(s)",
+            messages.len()
+        );
+
+        let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error, CANCELLED_ERROR);
     }
 
     #[tokio::test]

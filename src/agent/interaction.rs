@@ -33,7 +33,7 @@ use crate::{
     domain::{
         approval::{ApprovalRequest, Approver, Decision, Risk},
         cancel::CancelSignal,
-        gateway::{MessageHandler, ReplySink, WeChatLogin},
+        gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
         home::HomeRepository,
         pairing::{ApproveOutcome, PairingRepository, PairingStatus},
         repository::SessionRepository,
@@ -789,6 +789,12 @@ impl GatewayDispatcher {
             // No cancel affordance in a chat channel — there is no "stop"
             // message, and a turn ends on its own or times out.
             cancel: None,
+            // A chat user can talk mid-turn, so let the loop pick those
+            // messages up between rounds instead of making them wait.
+            interject: Some(Arc::new(QueueInterjector {
+                dispatcher: this.clone(),
+                session: session.clone(),
+            })),
         };
         tokio::spawn(async move {
             // Armed until normal completion below. If the task is cancelled
@@ -843,14 +849,13 @@ impl GatewayDispatcher {
             let Some(queue) = inflight.get_mut(session) else {
                 return;
             };
-            match queue.pop_front() {
-                // Keep the session marked in-flight for the next turn.
-                Some(msg) => Some(msg),
+            if queue.is_empty() {
                 // Queue drained: the session is now idle.
-                None => {
-                    inflight.remove(session);
-                    None
-                }
+                inflight.remove(session);
+                None
+            } else {
+                // Keeps the session marked in-flight for the next turn.
+                Some(merge_queued(queue))
             }
         };
         if let Some(QueuedMessage { input, sink }) = next {
@@ -858,6 +863,61 @@ impl GatewayDispatcher {
         }
     }
 }
+
+/// Take everything queued behind the turn that just finished as **one** input.
+///
+/// Chat users habitually split a single thought across several messages. Run as
+/// separate turns each costs its own model round-trip and tool loop, and each
+/// turn only ever sees a prefix of what the user meant — the first one answers
+/// a half-stated question. The queue holds nothing but consecutive user
+/// messages (chat commands are handled before `spawn_turn` and never reach it),
+/// so joining them is the whole merge.
+///
+/// The reply goes to the **last** message's sink: it is the freshest reply
+/// handle (WeChat's are short-lived, held in memory) and answering the newest
+/// message is what a person would do.
+fn merge_queued(queue: &mut VecDeque<QueuedMessage>) -> QueuedMessage {
+    let mut inputs = Vec::with_capacity(queue.len());
+    let mut last_sink = None;
+    while let Some(QueuedMessage { input, sink }) = queue.pop_front() {
+        inputs.push(input);
+        last_sink = Some(sink);
+    }
+    QueuedMessage {
+        input: inputs.join("\n"),
+        sink: last_sink.expect("callers merge only a non-empty queue"),
+    }
+}
+
+/// Feeds one session's queued messages to the turn currently running on it.
+///
+/// The same queue [`GatewayDispatcher::finish_turn`] drains, so a message goes
+/// to exactly one place: whichever gets to it first. Taking it here is the
+/// better outcome — the running turn can still act on it, while the next turn
+/// can only react after the fact.
+struct QueueInterjector {
+    dispatcher: Arc<GatewayDispatcher>,
+    session: String,
+}
+
+impl InterjectSource for QueueInterjector {
+    fn take(&self) -> Vec<String> {
+        let mut inflight = self.dispatcher.inflight.lock().unwrap();
+        // The reply still goes to the running turn's own sink, so the queued
+        // messages' sinks are dropped here — same conversation either way, and
+        // a turn answers on the handle it started with.
+        match inflight.get_mut(&self.session) {
+            Some(queue) => queue.drain(..).map(|msg| msg.input).collect(),
+            // No entry means the turn already finished; nothing to take.
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Told to a sender whose queued message died with the turn ahead of it (see
+/// [`TurnGuard`]) — the message was never handled, so the user has to know to
+/// resend rather than wait for an answer that isn't coming.
+const QUEUED_MESSAGE_DROPPED: &str = "刚才那条消息没能处理（服务重启或任务中断），请重发。";
 
 /// Releases a session's turn state on the exit paths a normal completion can't
 /// cover — a panic that escapes the catch, or task cancellation. On drop while
@@ -877,24 +937,36 @@ impl Drop for TurnGuard {
             self.dispatcher.approvals.forget_pending(&self.session);
             self.dispatcher.approvals.release_gate(&self.session);
             self.dispatcher.clarify.clear(&self.session);
-            let dropped = self
+            let dropped: Vec<Arc<dyn ReplySink>> = self
                 .dispatcher
                 .inflight
                 .lock()
                 .unwrap()
                 .remove(&self.session)
-                .map(|q| q.len())
-                .unwrap_or(0);
-            // Queued messages can't be dispatched from Drop (no spawning here)
-            // and their senders can't be notified (replies are async). This
-            // path is effectively cancellation-only — gateway shutdown — so the
-            // loss is inherent, but it must at least be visible in the log.
-            if dropped > 0 {
+                .map(|queue| queue.into_iter().map(|msg| msg.sink).collect())
+                .unwrap_or_default();
+            // Queued messages can't be dispatched from Drop (no turn to run
+            // them on), so they are lost. This path is effectively
+            // cancellation-only — gateway shutdown — but the loss must not be
+            // silent: the log is the reliable record, and each sender gets a
+            // best-effort "resend it" notice so a swallowed follow-up doesn't
+            // look like an ignored message.
+            if !dropped.is_empty() {
                 warn!(
                     session = %self.session,
-                    dropped,
+                    dropped = dropped.len(),
                     "turn cancelled; queued messages discarded"
                 );
+                // Drop is sync, so the notice needs a task. During a runtime
+                // teardown there may be no handle, or the task may never get to
+                // run — hence best-effort, with the warn above as the record.
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        for sink in dropped {
+                            let _ = sink.send(QUEUED_MESSAGE_DROPPED).await;
+                        }
+                    });
+                }
             }
         }
     }
@@ -1212,7 +1284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mid_turn_messages_queue_fifo_and_cap() {
+    async fn mid_turn_messages_merge_into_one_turn_and_cap() {
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
         let permits = Arc::new(Semaphore::new(0));
         let handler = Arc::new(GateHandler {
@@ -1232,11 +1304,10 @@ mod tests {
         dispatcher.handle("s1", "m3".into(), sink.clone()).await;
         dispatcher.handle("s1", "m4".into(), sink.clone()).await;
 
-        // Release turns one at a time; the queue drains in FIFO order.
+        // Everything queued behind m1 runs as ONE turn, in order — a user who
+        // splits a thought across messages gets one answer, not one per line.
         permits.add_permits(1);
-        assert_eq!(next_entered(&mut entered_rx).await, "m2");
-        permits.add_permits(1);
-        assert_eq!(next_entered(&mut entered_rx).await, "m3");
+        assert_eq!(next_entered(&mut entered_rx).await, "m2\nm3");
         permits.add_permits(1);
 
         // Let the final reply + rejection settle, then assert the overflow hint
@@ -1248,6 +1319,88 @@ mod tests {
             "m4 should be rejected with the queue-full hint, got {sent:?}"
         );
         assert!(entered_rx.try_recv().is_err(), "m4 must not have run");
+    }
+
+    /// The running turn takes queued messages out of the same queue the next
+    /// turn would drain, so a message is delivered exactly once — and once
+    /// taken, `finish_turn` finds nothing left to dispatch.
+    #[tokio::test]
+    async fn a_running_turn_takes_queued_messages_for_itself() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: permits.clone(),
+        }));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        dispatcher.handle("s7", "m1".into(), sink.clone()).await;
+        assert_eq!(next_entered(&mut entered_rx).await, "m1");
+        dispatcher.handle("s7", "m2".into(), sink.clone()).await;
+        dispatcher.handle("s7", "m3".into(), sink.clone()).await;
+
+        // What the agent loop does between rounds.
+        let interjector = QueueInterjector {
+            dispatcher: dispatcher.clone(),
+            session: "s7".to_string(),
+        };
+        assert_eq!(interjector.take(), vec!["m2".to_string(), "m3".to_string()]);
+        assert!(interjector.take().is_empty(), "taken exactly once");
+
+        // The turn finishes with an empty queue, so no follow-up turn runs.
+        permits.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the messages were already handled inside the first turn"
+        );
+        assert!(
+            !dispatcher.inflight.lock().unwrap().contains_key("s7"),
+            "the session should be idle once the turn ends"
+        );
+    }
+
+    /// A turn killed mid-flight (gateway shutdown) can't run what queued behind
+    /// it, but the sender must not be left waiting for an answer that will
+    /// never come. Drives [`TurnGuard`]'s emergency path directly — the normal
+    /// completion path drains the queue instead.
+    #[tokio::test]
+    async fn a_dropped_turn_tells_queued_senders_to_resend() {
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(0)),
+        }));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+
+        // The state a turn in flight with one queued follow-up leaves behind.
+        dispatcher.inflight.lock().unwrap().insert(
+            "s8".to_string(),
+            VecDeque::from(vec![QueuedMessage {
+                input: "跟进的一条".into(),
+                sink: sink.clone(),
+            }]),
+        );
+
+        drop(TurnGuard {
+            dispatcher: dispatcher.clone(),
+            session: "s8".to_string(),
+            armed: true,
+        });
+
+        // The notice is spawned, so give it a turn of the runtime to land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            sent.lock().unwrap().iter().any(|t| t.contains("请重发")),
+            "the queued sender should be told to resend, got {:?}",
+            sent.lock().unwrap()
+        );
+        assert!(
+            !dispatcher.inflight.lock().unwrap().contains_key("s8"),
+            "the session must not be left wedged"
+        );
     }
 
     #[tokio::test]

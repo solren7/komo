@@ -353,6 +353,16 @@ mod tests {
         async fn save(&self, _session_id: &str, _message: &Message) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn delete_recent(&self, _session_id: &str, _count: usize) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn append_to_last_user(
+            &self,
+            _session_id: &str,
+            _extra: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
     }
 
     struct DenyAll;

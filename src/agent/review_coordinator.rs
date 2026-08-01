@@ -275,6 +275,16 @@ mod tests {
         async fn count_user_turns(&self, _session_id: &str) -> anyhow::Result<usize> {
             Ok(self.user_turns)
         }
+        async fn delete_recent(&self, _session_id: &str, _count: usize) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn append_to_last_user(
+            &self,
+            _session_id: &str,
+            _extra: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
     }
 
     /// Records reviewed session ids; can fail specific ids, block until

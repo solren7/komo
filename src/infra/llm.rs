@@ -505,6 +505,12 @@ where
     }
 }
 
+/// Marks a mid-turn user message inside the tool-results message, so the model
+/// can tell "the human just told me something" from tool output. Without it the
+/// text sits next to a pile of results and reads as more data.
+const INTERJECTION_PREFIX: &str = "The user sent this while you were working — \
+     take it into account before your next step:\n";
+
 /// A [`TurnDriver`] over a per-turn [`TurnModel`]. Holds the growing conversation
 /// history (excluding the not-yet-sent prompt) so each round is a single provider
 /// completion — rig does one round-trip, komo owns the loop.
@@ -575,7 +581,11 @@ where
         self.run(prompt).await
     }
 
-    async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+    async fn step(
+        &mut self,
+        results: Vec<ToolOutcome>,
+        interjected: Option<String>,
+    ) -> anyhow::Result<Step> {
         // One user message carrying every tool result, mirroring rig's own
         // `tool_result_user_content`: key by `call_id` when present (OpenAI),
         // else `id` (Anthropic).
@@ -592,6 +602,14 @@ where
                 }
             })
             .collect();
+        let mut contents = contents;
+        // What the user said while this round ran, appended to the same user
+        // message as a plain text block — after the results, so the model reads
+        // the outcome first and the new instruction last (the position it acts
+        // on). Labelled, or a bare sentence next to tool output reads as data.
+        if let Some(text) = interjected {
+            contents.push(UserContent::text(format!("{INTERJECTION_PREFIX}{text}")));
+        }
         let content = OneOrMany::many(contents)
             .map_err(|_| anyhow::anyhow!("no tool results to send back"))?;
         self.run(RigMessage::User { content }).await

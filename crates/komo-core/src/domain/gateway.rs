@@ -32,6 +32,25 @@ pub trait ReplySink: Send + Sync {
     }
 }
 
+/// Hands a running turn the user messages that arrived while it was working.
+///
+/// A turn takes minutes; the user watching it work will say things mid-flight —
+/// most valuably a correction ("no, B not A"). Queuing those for the *next*
+/// turn means the correction only lands after the agent finished going the
+/// wrong way, which is the one moment it is worthless. The agent loop drains
+/// this between rounds instead and folds what it gets into the round's
+/// messages, so the model sees it before choosing its next move.
+///
+/// Implemented by the gateway dispatcher over the same queue
+/// [`MessageHandler`]-dispatched turns drain from, so a message is delivered
+/// exactly once: whoever takes it first — this turn, or the next one — owns it.
+pub trait InterjectSource: Send + Sync {
+    /// Take everything queued for this turn's session right now, oldest first;
+    /// empty when nothing is waiting. Never blocks — it is polled on the hot
+    /// path between rounds.
+    fn take(&self) -> Vec<String>;
+}
+
 /// Drives an interactive WeChat QR login, delivering the QR to `sink` (as a
 /// photo where the channel supports it). Implemented in infra and invoked by
 /// the gateway dispatcher on `/wechat login`, so the WeChat channel can be

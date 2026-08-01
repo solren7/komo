@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
-use crate::domain::gateway::ReplySink;
+use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::run::RunRepository;
 
 /// The session a tool is executing within: which conversation it belongs to
@@ -54,6 +54,11 @@ pub struct SessionContext {
     /// `None` for turns nobody can interrupt — sweeps, cron, aux sub-agents.
     /// See [`CancelSignal`] for what "cancelled" does and does not stop.
     pub cancel: Option<Arc<dyn CancelSignal>>,
+    /// Optional source of mid-turn user messages. Set by the gateway dispatcher
+    /// (it owns the queue those messages land in); `None` for turns nobody can
+    /// talk to while they run — sweeps, cron, aux sub-agents, the HTTP API.
+    /// See [`InterjectSource`].
+    pub interject: Option<Arc<dyn InterjectSource>>,
 }
 
 impl SessionContext {
@@ -70,6 +75,7 @@ impl SessionContext {
             auto_approve: false,
             event_sink: None,
             cancel: None,
+            interject: None,
         }
     }
 
@@ -88,6 +94,7 @@ impl SessionContext {
             auto_approve: true,
             event_sink: None,
             cancel: None,
+            interject: None,
         }
     }
 
@@ -107,6 +114,7 @@ impl SessionContext {
             auto_approve: false,
             event_sink: None,
             cancel: None,
+            interject: None,
         }
     }
 
@@ -114,6 +122,13 @@ impl SessionContext {
     /// for this turn (the streaming api path uses this to feed the SSE stream).
     pub fn with_event_sink(mut self, sink: Arc<dyn ToolEventSink>) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Attach an [`InterjectSource`], letting the agent loop pick up what the
+    /// user says while the turn is running.
+    pub fn with_interject(mut self, interject: Arc<dyn InterjectSource>) -> Self {
+        self.interject = Some(interject);
         self
     }
 

@@ -105,6 +105,26 @@ pub trait MessageRepository: Send + Sync {
     async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize>;
     /// Append a message to a session.
     async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()>;
+    /// Drop the `count` most recently appended messages, returning how many
+    /// were actually removed.
+    ///
+    /// The one caller is the pristine-cancel rollback: a turn cancelled before
+    /// it produced anything takes its own user message back out, so the
+    /// transcript reads as if the turn never happened. Safe only because a
+    /// session runs one turn at a time — nothing else can be appending.
+    /// Deliberately not a general "edit history" affordance: the run ledger
+    /// stays the audit record either way.
+    async fn delete_recent(&self, session_id: &str, count: usize) -> anyhow::Result<usize>;
+    /// Append `extra` (on its own line) to the session's most recent user
+    /// message, returning whether one was found.
+    ///
+    /// The one caller records a mid-turn interjection: the user spoke while a
+    /// turn was running, and what they said belongs to that turn's user input.
+    /// Storing it as a second user message instead would put two consecutive
+    /// user messages in the transcript, which several providers reject on
+    /// replay. Safe for the same reason as [`delete_recent`](Self::delete_recent)
+    /// — one turn per session, so nothing else is appending.
+    async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool>;
 }
 
 #[async_trait]

@@ -74,7 +74,18 @@ pub trait TurnDriver: Send {
     /// The first model round-trip for this turn.
     async fn first(&mut self) -> anyhow::Result<Step>;
     /// Feed the previous round's tool results back and get the next round-trip.
-    async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step>;
+    ///
+    /// `interjected` carries anything the user said while the round was running
+    /// (see [`InterjectSource`](crate::domain::gateway::InterjectSource)),
+    /// already merged into one message. It rides in the **same** user message as
+    /// the tool results rather than a separate one: a turn's history has to stay
+    /// user/assistant-alternating, and appending bytes to the message that was
+    /// being written anyway costs the provider's prompt cache nothing.
+    async fn step(
+        &mut self,
+        results: Vec<ToolOutcome>,
+        interjected: Option<String>,
+    ) -> anyhow::Result<Step>;
     /// Tokens spent across every round this driver has run so far. Read by the
     /// runtime once the turn ends, for the ledger. Defaults to zero — a backend
     /// whose provider reports no usage simply records nothing.
@@ -117,7 +128,11 @@ impl TurnDriver for OneShotDriver {
     async fn first(&mut self) -> anyhow::Result<Step> {
         Ok(Step::Final(self.0.take().unwrap_or_default()))
     }
-    async fn step(&mut self, _results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+    async fn step(
+        &mut self,
+        _results: Vec<ToolOutcome>,
+        _interjected: Option<String>,
+    ) -> anyhow::Result<Step> {
         Ok(Step::Final(self.0.take().unwrap_or_default()))
     }
 }

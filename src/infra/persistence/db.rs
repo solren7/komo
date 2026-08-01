@@ -718,6 +718,49 @@ impl MessageRepository for Db {
         })
         .await
     }
+
+    async fn delete_recent(&self, session_id: &str, count: usize) -> anyhow::Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            // Newest-first by id, like every other message read here: UUIDv7 is
+            // millisecond-ordered while `timestamp` is whole seconds, so a fast
+            // turn's pair would otherwise be indistinguishable.
+            let rows = toasty::query!(
+                MessageRecord FILTER .session_id == #session_id ORDER BY .id DESC LIMIT #count
+            )
+            .exec(&mut conn)
+            .await?;
+            let removed = rows.len();
+            for row in rows {
+                row.delete().exec(&mut conn).await?;
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
+    async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let role = format!("{:?}", Role::User).to_lowercase();
+            let mut rows = toasty::query!(
+                MessageRecord FILTER .session_id == #session_id AND .role == #role
+                    ORDER BY .id DESC LIMIT 1usize
+            )
+            .exec(&mut conn)
+            .await?;
+            let Some(mut row) = rows.pop() else {
+                return Ok(false);
+            };
+            let merged = format!("{}\n{extra}", row.content);
+            row.update().content(merged).exec(&mut conn).await?;
+            Ok(true)
+        })
+        .await
+    }
 }
 
 // ── ReminderRepository ────────────────────────────────────────────────────────

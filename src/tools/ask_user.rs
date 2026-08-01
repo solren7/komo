@@ -220,6 +220,7 @@ mod tests {
             auto_approve: false,
             event_sink: None,
             cancel: None,
+            interject: None,
         };
         ToolContext::new(session, None, Arc::new(DenyAll))
     }

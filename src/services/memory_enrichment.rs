@@ -501,7 +501,11 @@ mod tests {
                 async fn first(&mut self) -> anyhow::Result<Step> {
                     anyhow::bail!("unused")
                 }
-                async fn step(&mut self, _results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+                async fn step(
+                    &mut self,
+                    _results: Vec<ToolOutcome>,
+                    _interjected: Option<String>,
+                ) -> anyhow::Result<Step> {
                     anyhow::bail!("unused")
                 }
             }

@@ -504,6 +504,7 @@ async fn event_loop(
                             // The TUI has no stop key (yet); Ctrl-C tears
                             // down the whole process instead.
                             cancel: None,
+                            interject: None,
                         }
                     });
                     tokio::spawn(async move {

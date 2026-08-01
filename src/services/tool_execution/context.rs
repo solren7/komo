@@ -16,7 +16,7 @@
 //! ledgered.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub use crate::domain::context::{RunContext, SessionContext, ToolContext};
 
@@ -32,6 +32,83 @@ pub struct ToolTurnContext {
     /// it via an `Arc`, so the total is tracked across the concurrent calls and
     /// across rounds — see [`TurnResultBudget`].
     pub budget: TurnResultBudget,
+    /// Detects a turn that has stopped making progress — see [`SpinDetector`].
+    pub spin: SpinDetector,
+}
+
+/// How many times in a row the same call may be requested before the executor
+/// stops running it. The third one is refused: the first two already returned,
+/// so their answer is in the transcript and a third execution cannot say
+/// anything new.
+const SPIN_REFUSE_AT: usize = 3;
+/// A repeat this far in means the refusal did not land either, so the turn ends
+/// rather than spending the rest of its round budget on the same call.
+const SPIN_STOP_AT: usize = 4;
+
+/// What [`SpinDetector`] says about one requested call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpinVerdict {
+    /// Not a repeat, or not enough of one yet — run it.
+    Run,
+    /// Same call as the two before it: don't run, tell the model why.
+    Refuse,
+    /// It kept asking after being refused; end the turn.
+    Stop,
+}
+
+/// Catches a turn stuck re-issuing one tool call.
+///
+/// The round budget (`max_turns`) is a poor guard against this on its own: it is
+/// deliberately generous (a real editing task runs dozens of rounds), so a model
+/// looping on one failing call burns every round before anything notices, and
+/// the user waits out the whole thing for an answer the second call already
+/// determined. Identity is the call's name plus its exact arguments — same tool
+/// with different arguments is progress, the same arguments twice is not — and
+/// the streak resets the moment anything else is called, so a legitimate poll
+/// interleaved with other work never trips it.
+///
+/// Counted over the turn's calls in dispatch order, across rounds. Shared with
+/// the round's concurrent calls via an `Arc`, but the verdicts are decided
+/// up front in order, so concurrency inside a round can't reorder the streak.
+#[derive(Clone, Default)]
+pub struct SpinDetector {
+    /// `(signature, consecutive count)` — `None` until the first call.
+    state: Arc<std::sync::Mutex<Option<(String, usize)>>>,
+    /// Latched once any call reaches [`SpinVerdict::Stop`], so the agent loop
+    /// can end the turn after the round finishes rather than each call having
+    /// to report back.
+    stopped: Arc<AtomicBool>,
+}
+
+impl SpinDetector {
+    /// Whether a call this turn spun far enough that the turn should end.
+    pub fn should_stop(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Record a requested call and say what to do with it.
+    pub fn observe(&self, name: &str, args: &str) -> SpinVerdict {
+        let signature = format!("{name}\u{0}{args}");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let count = match state.as_mut() {
+            Some((previous, count)) if *previous == signature => {
+                *count += 1;
+                *count
+            }
+            _ => {
+                *state = Some((signature, 1));
+                1
+            }
+        };
+        match count {
+            n if n >= SPIN_STOP_AT => {
+                self.stopped.store(true, Ordering::Relaxed);
+                SpinVerdict::Stop
+            }
+            n if n >= SPIN_REFUSE_AT => SpinVerdict::Refuse,
+            _ => SpinVerdict::Run,
+        }
+    }
 }
 
 /// Per-turn cap on the *cumulative* bytes of tool output fed back to the model.

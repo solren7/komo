@@ -15,7 +15,7 @@ use crate::{
         session::Session,
     },
     services::tool_execution::{
-        RunContext, SessionContext, ToolExecutor, ToolTurnContext, TurnResultBudget,
+        RunContext, SessionContext, SpinDetector, ToolExecutor, ToolTurnContext, TurnResultBudget,
         current_session, with_session,
     },
 };
@@ -338,6 +338,9 @@ impl AgentRuntime {
             // Bound the turn's cumulative tool output (0 = unlimited), so a long
             // tool chain can't quietly overflow the context window.
             budget: TurnResultBudget::new(self.tool_executor.turn_result_cap()),
+            // Fresh per turn: a repeat only means anything within the one
+            // sequence of calls that is trying to accomplish one thing.
+            spin: SpinDetector::default(),
         };
         // Cancellation, if this caller offers a stop. Raced against each await
         // rather than only checked between rounds: the model round-trip is the
@@ -418,17 +421,24 @@ impl AgentRuntime {
                         Some(said.join("\n"))
                     };
 
+                    // The model kept re-issuing one call even after the executor
+                    // refused it (see `SpinDetector`). The refusals went back as
+                    // well-formed results, so it gets this round to answer with
+                    // what it has — but the turn ends either way rather than
+                    // spending the rest of its rounds on the same call.
+                    let spun = context.spin.should_stop();
                     let next =
                         Self::until_cancelled(cancel, driver.step(results, interjected)).await?;
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
-                    step = if over_budget {
+                    step = if over_budget || spun {
+                        let stopped = if spun { SPUN_STOP } else { BUDGET_STOP };
                         break non_empty(match next {
                             Step::Final(text) => text,
                             // It asked for more tools instead of answering. Its
                             // own last narration is a better account of where the
                             // turn got to than a canned apology, so prefer it.
-                            Step::ToolCalls { text, .. } => budget_stop_reply(&text, &narration),
+                            Step::ToolCalls { text, .. } => stop_reply(stopped, &text, &narration),
                         });
                     } else {
                         next
@@ -454,19 +464,28 @@ struct TurnOutcome {
     interjections: Vec<String>,
 }
 
-/// The reply for a turn the round budget cut short. The model's own words (this
-/// round's text, else the last narration it managed) beat a canned line — but the
-/// user still has to be told the turn stopped early rather than finished.
-fn budget_stop_reply(current: &str, narration: &str) -> String {
-    const STOPPED: &str = "(Reached the tool-call limit for this turn; \
-         answering with what I have.)";
+/// Told to the user when the round budget ran out.
+const BUDGET_STOP: &str = "(Reached the tool-call limit for this turn; \
+     answering with what I have.)";
+/// Told to the user when the turn was ended for repeating one call — see
+/// `SpinDetector`. Named rather than folded into [`BUDGET_STOP`] because the
+/// two situations call for different next moves from the user: a budget stop
+/// invites "keep going", a spin stop invites rephrasing.
+const SPUN_STOP: &str = "(I was repeating the same step without progress, so I \
+     stopped there. Answering with what I have — try rephrasing if this misses \
+     what you needed.)";
+
+/// The reply for a turn something cut short. The model's own words (this round's
+/// text, else the last narration it managed) beat a canned line — but the user
+/// still has to be told the turn stopped early rather than finished, and why.
+fn stop_reply(stopped: &str, current: &str, narration: &str) -> String {
     let said = [current, narration]
         .into_iter()
         .map(str::trim)
         .find(|t| !t.is_empty());
     match said {
-        Some(text) => format!("{text}\n\n{STOPPED}"),
-        None => STOPPED.to_string(),
+        Some(text) => format!("{text}\n\n{stopped}"),
+        None => stopped.to_string(),
     }
 }
 
@@ -1224,16 +1243,53 @@ mod tests {
     fn the_budget_cutoff_prefers_the_models_own_words() {
         // This round's text wins; the last narration is the fallback; a silent
         // model gets the canned line. Either way the user is told it stopped early.
-        let reply = budget_stop_reply("Still digging through the logs.", "earlier note");
+        let reply = stop_reply(
+            BUDGET_STOP,
+            "Still digging through the logs.",
+            "earlier note",
+        );
         assert!(reply.starts_with("Still digging through the logs."));
         assert!(reply.contains("tool-call limit"));
 
-        let fallback = budget_stop_reply("  ", "earlier note");
+        let fallback = stop_reply(BUDGET_STOP, "  ", "earlier note");
         assert!(fallback.starts_with("earlier note"));
 
-        let silent = budget_stop_reply("", "");
+        let silent = stop_reply(BUDGET_STOP, "", "");
         assert!(silent.contains("tool-call limit"));
         assert!(!silent.contains("\n\n"));
+    }
+
+    /// A model that will not stop re-issuing one call ends the turn well short
+    /// of the round budget: the executor refuses the repeats, and when it keeps
+    /// asking anyway the loop stops rather than spending 120 rounds on it.
+    #[tokio::test]
+    async fn a_turn_repeating_one_call_stops_long_before_the_round_budget() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_spin.db")).await.unwrap());
+        // The driver would happily keep asking for the same call forever.
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            (0..8)
+                .map(|_| tool_calls(vec![call("time", "{}")]))
+                .collect(),
+            vec![Arc::new(TimeTool)],
+            120,
+        );
+
+        let reply = rt
+            .handle_input("cli:spin", "什么时候".into())
+            .await
+            .unwrap();
+        assert!(
+            reply.contains("repeating the same step"),
+            "the user is told why it stopped: {reply}"
+        );
+
+        // Two real executions, then refusals — not 120 rounds of them.
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        let steps = RunRepository::steps(&*db, &runs[0].id).await.unwrap();
+        assert_eq!(steps.len(), 2, "only the first two calls reached the tool");
+        let rounds = received.lock().unwrap().len();
+        assert!(rounds <= 4, "the turn ended after {rounds} rounds");
     }
 
     #[tokio::test]

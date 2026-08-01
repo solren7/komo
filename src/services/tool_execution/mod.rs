@@ -28,8 +28,8 @@ use std::time::Duration;
 use tracing::{Instrument, info, info_span, warn};
 
 pub use context::{
-    RunContext, SessionContext, ToolContext, ToolTurnContext, TurnResultBudget, current_session,
-    with_session,
+    RunContext, SessionContext, SpinDetector, SpinVerdict, ToolContext, ToolTurnContext,
+    TurnResultBudget, current_session, with_session,
 };
 
 use crate::domain::approval::{ApprovalRequest, Approver, Decision};
@@ -288,31 +288,64 @@ impl ToolExecutor {
                 "tool round exceeded the per-round call ceiling; extra calls skipped"
             );
         }
-        let futures = calls.iter().enumerate().map(|(i, call)| async move {
-            let content = if i >= MAX_CALLS_PER_ROUND {
-                format!(
-                    "error: too many tool calls in one round (limit {MAX_CALLS_PER_ROUND}); \
-                     this call was skipped. Request fewer tools per round."
-                )
-            } else {
-                match self.core.tools.get(&call.name) {
-                    Some(tool) => match self
-                        .core
-                        .execute(tool.clone(), call.args.clone(), context)
-                        .await
-                    {
-                        Ok(out) => out,
-                        Err(error) => format!("tool `{}` failed: {error:#}", call.name),
-                    },
-                    None => format!("error: unknown tool `{}`", call.name),
+        // Decide the spin verdicts here, in dispatch order, before anything is
+        // spawned: the calls themselves run concurrently, so asking mid-flight
+        // would make "three in a row" depend on which future happened to get
+        // there first. See `SpinDetector`.
+        let verdicts: Vec<SpinVerdict> = calls
+            .iter()
+            .map(|call| context.spin.observe(&call.name, &call.args))
+            .collect();
+
+        let futures = calls.iter().zip(&verdicts).enumerate().map(
+            |(i, (call, verdict))| async move {
+                let content = if i >= MAX_CALLS_PER_ROUND {
+                    format!(
+                        "error: too many tool calls in one round (limit {MAX_CALLS_PER_ROUND}); \
+                         this call was skipped. Request fewer tools per round."
+                    )
+                } else if matches!(verdict, SpinVerdict::Refuse | SpinVerdict::Stop) {
+                    warn!(
+                        tool = %call.name,
+                        "identical tool call repeated; refusing to run it again"
+                    );
+                    format!(
+                        "error: `{}` was already called twice with these exact arguments and \
+                         returned the same result; running it again cannot change anything. \
+                         Use what those calls returned, try a different approach, or answer \
+                         the user with what you have.",
+                        call.name
+                    )
+                } else if call.args.trim().is_empty() {
+                    // Empty arguments mean the model's output was cut off
+                    // mid-call — a tool that genuinely takes none still gets
+                    // `{}`. Running it would act on whatever the defaults are
+                    // rather than on what was asked.
+                    format!(
+                        "error: the arguments for `{}` arrived empty, which usually means the \
+                         response was truncated. Re-issue the call with its arguments.",
+                        call.name
+                    )
+                } else {
+                    match self.core.tools.get(&call.name) {
+                        Some(tool) => match self
+                            .core
+                            .execute(tool.clone(), call.args.clone(), context)
+                            .await
+                        {
+                            Ok(out) => out,
+                            Err(error) => format!("tool `{}` failed: {error:#}", call.name),
+                        },
+                        None => format!("error: unknown tool `{}`", call.name),
+                    }
+                };
+                ToolOutcome {
+                    id: call.id.clone(),
+                    call_id: call.call_id.clone(),
+                    content,
                 }
-            };
-            ToolOutcome {
-                id: call.id.clone(),
-                call_id: call.call_id.clone(),
-                content,
-            }
-        });
+            },
+        );
         futures_util::future::join_all(futures).await
     }
 }
@@ -937,6 +970,7 @@ mod tests {
             session: SessionContext::detached("cli:test"),
             run: Some(RunContext::new("run-1".into(), repo)),
             budget: TurnResultBudget::unlimited(),
+            spin: SpinDetector::default(),
         }
     }
 
@@ -945,6 +979,7 @@ mod tests {
             session: SessionContext::detached("cli:test"),
             run: None,
             budget: TurnResultBudget::unlimited(),
+            spin: SpinDetector::default(),
         }
     }
 
@@ -974,6 +1009,109 @@ mod tests {
         );
         let names: Vec<&str> = executor.definitions().iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    /// A model that keeps re-issuing one call gets refused rather than served:
+    /// the first two answers are already in the transcript, so a third run
+    /// cannot say anything new — it would only burn rounds.
+    #[tokio::test]
+    async fn an_identical_call_repeated_is_refused_instead_of_run() {
+        let (tool, calls) = flaky(0, "unused", false);
+        let executor = executor(vec![tool], ToolExecutionConfig::default());
+        let context = unledgered();
+
+        for _ in 0..2 {
+            let out = one(&executor, call("flaky", "{}"), &context).await;
+            assert!(!out.content.starts_with("error:"), "{}", out.content);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let refused = one(&executor, call("flaky", "{}"), &context).await;
+        assert!(
+            refused.content.contains("already called twice"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the refused call must not reach the tool"
+        );
+        assert!(!context.spin.should_stop(), "one refusal is not a stop yet");
+
+        // Asking again after the refusal ends the turn; the loop reads this.
+        let _ = one(&executor, call("flaky", "{}"), &context).await;
+        assert!(context.spin.should_stop());
+    }
+
+    /// Same tool, different arguments is progress — and anything else in
+    /// between resets the streak, so a poll interleaved with real work never
+    /// trips the detector.
+    #[tokio::test]
+    async fn differing_arguments_and_interleaved_calls_never_trip_the_detector() {
+        let executor = executor(
+            vec![Arc::new(EchoTool), Arc::new(NamedTool("other"))],
+            ToolExecutionConfig::default(),
+        );
+        let context = unledgered();
+
+        for i in 0..5 {
+            let out = one(&executor, call("echo", &format!("{{\"n\":{i}}}")), &context).await;
+            assert!(!out.content.contains("already called twice"));
+        }
+        // Alternating: each repeat is broken by the other tool.
+        for _ in 0..5 {
+            let echoed = one(&executor, call("echo", "{}"), &context).await;
+            assert!(!echoed.content.contains("already called twice"));
+            let _ = one(&executor, call("other", "{}"), &context).await;
+        }
+        assert!(!context.spin.should_stop());
+    }
+
+    /// Empty arguments mean the model's output was cut off mid-call. Running it
+    /// would act on defaults rather than on what was asked — but a tool that
+    /// genuinely takes none still sends `{}`, which must go through.
+    #[tokio::test]
+    async fn empty_arguments_are_refused_but_an_empty_object_is_not() {
+        let (tool, calls) = flaky(0, "unused", false);
+        let executor = executor(vec![tool], ToolExecutionConfig::default());
+        let context = unledgered();
+
+        let truncated = one(&executor, call("flaky", "   "), &context).await;
+        assert!(
+            truncated.content.contains("arrived empty"),
+            "{}",
+            truncated.content
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "nothing should have run");
+
+        let no_args = one(&executor, call("flaky", "{}"), &context).await;
+        assert!(
+            !no_args.content.starts_with("error:"),
+            "{}",
+            no_args.content
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A truncated call must not take the rest of its round down with it: the
+    /// calls streamed before it are complete.
+    #[tokio::test]
+    async fn a_truncated_call_does_not_block_the_rest_of_its_round() {
+        let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
+        let outcomes = executor
+            .execute_round(
+                &[
+                    call("echo", "{\"a\":1}"),
+                    call("echo", ""),
+                    call("echo", "{\"b\":2}"),
+                ],
+                &unledgered(),
+            )
+            .await;
+        assert!(!outcomes[0].content.contains("arrived empty"));
+        assert!(outcomes[1].content.contains("arrived empty"));
+        assert!(!outcomes[2].content.contains("arrived empty"));
     }
 
     #[tokio::test]
@@ -1132,12 +1270,19 @@ mod tests {
             },
         );
         let context = ledgered(repo.clone());
-        for _ in 0..5 {
-            let out = one(&executor, call("flaky", "{}"), &context).await;
+        // Distinct arguments per call: this exercises the *budget*, and calls
+        // that are byte-identical would be stopped earlier by the spin detector.
+        for i in 0..5 {
+            let out = one(
+                &executor,
+                call("flaky", &format!("{{\"i\":{i}}}")),
+                &context,
+            )
+            .await;
             assert_eq!(out.content, "ok");
         }
         // The next call is refused without ever reaching the tool.
-        let out = one(&executor, call("flaky", "{}"), &context).await;
+        let out = one(&executor, call("flaky", "{\"i\":9}"), &context).await;
         assert!(out.content.contains("budget"), "got: {}", out.content);
         assert_eq!(calls.load(Ordering::Relaxed), 5);
 
@@ -1248,6 +1393,7 @@ mod tests {
             session: SessionContext::detached("cli:test").with_cancel(Arc::new(AlreadyCancelled)),
             run: Some(RunContext::new("run-1".into(), repo.clone())),
             budget: TurnResultBudget::unlimited(),
+            spin: SpinDetector::default(),
         };
 
         let out = one(&executor, call("claiming", "{}"), &context).await;
@@ -1526,6 +1672,7 @@ mod tests {
             session: SessionContext::detached("cli:test"),
             run: None,
             budget: TurnResultBudget::new(cap),
+            spin: SpinDetector::default(),
         }
     }
 
@@ -1550,8 +1697,10 @@ mod tests {
     async fn unlimited_turn_budget_never_omits() {
         let executor = executor(vec![Arc::new(BigTool)], ToolExecutionConfig::default());
         let ctx = budgeted(0); // 0 = unlimited
-        for _ in 0..5 {
-            let out = one(&executor, call("big", "{}"), &ctx).await;
+        // Distinct arguments per call, as above: the budget is what is under
+        // test here, not the spin detector.
+        for i in 0..5 {
+            let out = one(&executor, call("big", &format!("{{\"i\":{i}}}")), &ctx).await;
             assert_eq!(out.content.len(), 10_000);
         }
     }

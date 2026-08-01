@@ -161,7 +161,7 @@ pub async fn build(
     let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
-    let aux_llm = build_llm(&aux_config, None, aux_preamble, None)?;
+    let aux_llm = build_llm(&aux_config, None, aux_preamble, None, Some("aux"))?;
 
     // The governed skill store: `~/.komo/skills` is the komo-owned home for
     // durable skills (files, not db — roadmap §9). Reviewer proposals land in
@@ -293,7 +293,13 @@ pub async fn build(
             .workspace_root(Some(root.clone())),
     );
     let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
-    let subagent_llm = build_llm(model_config, Some(&subagent_tools), subagent_preamble, None)?;
+    let subagent_llm = build_llm(
+        model_config,
+        Some(&subagent_tools),
+        subagent_preamble,
+        None,
+        Some("delegate"),
+    )?;
     let subagent_runtime = Arc::new(AgentRuntime {
         llm: subagent_llm,
         sessions: db.clone(),
@@ -347,7 +353,7 @@ pub async fn build(
         memory_repo.clone(),
         Some(aux_llm.clone()),
     ));
-    let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher))?;
+    let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher), None)?;
     let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
         aux_llm.clone(),
@@ -416,7 +422,13 @@ pub async fn build(
             .workspace_root(Some(root.clone())),
     );
     let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
-    let cron_llm = build_llm(model_config, Some(&cron_tools), cron_preamble, None)?;
+    let cron_llm = build_llm(
+        model_config,
+        Some(&cron_tools),
+        cron_preamble,
+        None,
+        Some("cron"),
+    )?;
     let cron_runtime = Arc::new(AgentRuntime {
         llm: cron_llm,
         sessions: db.clone(),
@@ -474,7 +486,13 @@ pub async fn build(
     );
     let briefing_preamble: PreambleFn = Arc::new(move || briefing_builder.build());
     // No memory enricher: sweeps must not be fed the user's memory library.
-    let briefing_llm = build_llm(&aux_config, Some(&briefing_tools), briefing_preamble, None)?;
+    let briefing_llm = build_llm(
+        &aux_config,
+        Some(&briefing_tools),
+        briefing_preamble,
+        None,
+        Some("briefing"),
+    )?;
     let briefing_runtime = Arc::new(AgentRuntime {
         llm: briefing_llm,
         sessions: db.clone(),

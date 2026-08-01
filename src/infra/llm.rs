@@ -83,6 +83,12 @@ pub struct RigLlm<M: CompletionModel> {
     /// Which provider this is, for mapping a session's reasoning-effort level
     /// onto request params (see [`reasoning_params`]).
     provider: Provider,
+    /// Prompt-cache family this backend's turns belong to, when it is not the
+    /// session (see [`RigLlm::model_for`]). `None` — the main agent — keys the
+    /// cache by session id; a backend whose sessions are one-shot but whose
+    /// prompt prefix is always the same names its family here so those turns
+    /// share one warm prefix instead of each cold-starting.
+    cache_family: Option<String>,
     /// Rebuilds the system prompt each turn (see [`PreambleFn`]).
     preamble: PreambleFn,
     /// Max prior messages replayed as history per turn (config
@@ -116,11 +122,20 @@ pub struct RigLlm<M: CompletionModel> {
 /// Total attempts for one model round-trip whose failure classifies as transient
 /// (1 initial + retries). A constant rather than config, for the same reason the
 /// tool executor's is: transient retry is an internal robustness backstop.
-const LLM_RETRY_MAX_ATTEMPTS: usize = 3;
-/// Backoff before each retry, indexed by retry number (last entry reused). Longer
-/// than the tool executor's: the usual transient completion failure is provider
-/// rate-limiting, which does not clear in a quarter second.
-const LLM_RETRY_BACKOFF_MS: [u64; 2] = [500, 2_000];
+const LLM_RETRY_MAX_ATTEMPTS: usize = 4;
+/// Backoff before each retry, indexed by retry number (last entry reused).
+///
+/// Sized for what actually fails here: the usual transient completion failure is
+/// provider rate limiting, which takes seconds to tens of seconds to clear, so
+/// the old quarter-second-then-two-seconds table ran out its attempts while the
+/// limit was still in force and the turn died anyway. Reading the response's
+/// `Retry-After` would be better still, but rig hands the caller an `anyhow`
+/// chain over `CompletionError`, so honoring the header means downcasting and
+/// digging per provider — a wide enough budget covers the same ground.
+///
+/// Total backoff (21s) stays well inside the round's `llm_timeout_secs` budget,
+/// which bounds all attempts together (see [`with_retry`]).
+const LLM_RETRY_BACKOFF_MS: [u64; 3] = [1_000, 5_000, 15_000];
 
 /// Re-run `attempt` while its failure looks transient, bounded by
 /// [`LLM_RETRY_MAX_ATTEMPTS`].
@@ -399,14 +414,29 @@ where
 
         // OpenAI's Responses API (which Codex speaks too) caches by prefix
         // automatically, but shard routing is best-effort; `prompt_cache_key`
-        // pins every request from one session to the same cache shard — the
-        // Codex CLI itself sends its session id here for the same reason.
+        // pins related requests to the same cache shard — the Codex CLI itself
+        // sends its session id here for the same reason.
+        //
+        // What the key must identify is the *prefix family*, not the
+        // conversation: two requests share a cache only if their
+        // system-prompt + tool-definition bytes match. For the main agent the
+        // two coincide (one conversation = one prefix), so the session id is
+        // right. For a backend whose sessions are one-shot — delegate
+        // (`delegate:<uuid>`), cron (`cron:<name>:<ts>`), briefing — the
+        // session id is a *different* key every time even though every one of
+        // those turns opens with identical bytes, so each would cold-start.
+        // Those backends declare a family at wiring instead. Anchoring them on
+        // the *parent's* key would be the other mistake: a frequent side query
+        // would evict the conversation's own prefix.
+        //
         // Only these two providers: the key is a Responses API parameter, and
         // Anthropic/DeepSeek reject or ignore unknown request fields.
         if matches!(self.provider, Provider::OpenAi | Provider::Codex) {
             turn.additional_params = Some(merge_params(
                 turn.additional_params.take(),
-                json!({ "prompt_cache_key": format!("komo:{}", session.id) }),
+                json!({
+                    "prompt_cache_key": cache_key(self.cache_family.as_deref(), &session.id)
+                }),
             ));
         }
 
@@ -501,6 +531,7 @@ where
             stream: self.stream,
             timeout: self.timeout,
             usage: TokenUsage::default(),
+            degraded: false,
         }))
     }
 }
@@ -528,6 +559,41 @@ struct RigTurnDriver<M: CompletionModel> {
     /// Tokens spent so far this turn, summed over rounds; read by the runtime for
     /// the ledger once the turn ends.
     usage: TokenUsage,
+    /// Whether this turn already spent its one context-overflow degrade (see
+    /// [`RigTurnDriver::degrade_for_overflow`]). Once used, a second overflow
+    /// fails the turn: the first degrade is a real reclaim, so if the request
+    /// is *still* too large the shortfall is structural and retrying only burns
+    /// another round-trip on a request that cannot fit.
+    degraded: bool,
+}
+
+/// Bytes of a tool result kept when a turn is degraded for overflow — the head
+/// and tail of that size each, on the reasoning that a result's beginning
+/// (what it is) and end (how it concluded) carry most of the signal. The full
+/// text is already on disk in the tool-output store when it mattered, so this
+/// discards a copy, not the only copy.
+const OVERFLOW_TOOL_RESULT_KEEP: usize = 4 * 1024;
+
+/// Whether `error` reads as "the request did not fit in the model's context".
+///
+/// String matching, because rig collapses provider errors into
+/// `CompletionError::ProviderError(String)` / a raw response body — there is no
+/// typed overflow variant to match on, and komo sits behind rig rather than
+/// owning the HTTP client. Deliberately broad: a false positive costs one
+/// degraded retry, a false negative costs the whole turn.
+fn is_context_overflow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    [
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "reduce the length of the messages",
+        "input length and `max_tokens` exceed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 impl<M> RigTurnDriver<M>
@@ -545,12 +611,44 @@ where
     /// every retry attempt reading one source of truth for the round's transcript.
     async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
         self.history.push(prompt);
+
+        let (choice, message_id, usage) = match self.complete_round().await {
+            Ok(outcome) => outcome,
+            // Overflowing the context window is not transient — `with_retry`
+            // correctly refuses to re-send the same oversized request — but it
+            // is recoverable, because most of what fills a long turn is tool
+            // output the model has already read once. Reclaim that and try the
+            // round again rather than losing every round of work before it.
+            Err(error) if is_context_overflow(&error) && self.degrade_for_overflow() => {
+                tracing::warn!(
+                    "context window exceeded; retrying this round on a degraded history"
+                );
+                self.complete_round().await?
+            }
+            Err(error) => return Err(error),
+        };
+
+        self.usage.add(usage);
+        self.history.push(RigMessage::Assistant {
+            id: message_id,
+            content: choice.clone(),
+        });
+        Ok(choice_to_step(&choice))
+    }
+
+    /// One provider round-trip over the history as it currently stands (the
+    /// round's prompt is the last entry). Split out of [`run`] so an overflow
+    /// can re-issue the identical call against a reclaimed history.
+    ///
+    /// [`run`]: Self::run
+    async fn complete_round(
+        &self,
+    ) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>, TokenUsage)> {
         let stream = self.stream;
         let turn = &self.turn;
         let tools = &self.tools;
         let history = &self.history;
-
-        let (choice, message_id, usage) = with_timeout(
+        with_timeout(
             self.timeout,
             with_retry(|| async move {
                 let mut messages = history.clone();
@@ -560,15 +658,137 @@ where
                 complete_once(turn, tools, prompt, messages, stream).await
             }),
         )
-        .await?;
-
-        self.usage.add(usage);
-        self.history.push(RigMessage::Assistant {
-            id: message_id,
-            content: choice.clone(),
-        });
-        Ok(choice_to_step(&choice))
+        .await
     }
+
+    /// Reclaim context after an overflow, in place, on this turn's in-memory
+    /// history only — the stored transcript is never touched, so a degrade
+    /// costs the model's working set for the rest of this turn and nothing
+    /// afterwards.
+    ///
+    /// Two steps, cheapest first: shrink the tool results this turn accumulated
+    /// (the usual cause — a turn that read several large files), and only if
+    /// that reclaims nothing, drop the oldest half of the replayed history (the
+    /// case where the turn was already too big before it made a single call).
+    /// Returns whether anything was actually reclaimed; `false` means there is
+    /// nothing left to give and the caller must surface the failure.
+    ///
+    /// At most once per turn — see [`RigTurnDriver::degraded`].
+    fn degrade_for_overflow(&mut self) -> bool {
+        if self.degraded {
+            return false;
+        }
+        self.degraded = reclaim_context(&mut self.history);
+        self.degraded
+    }
+}
+
+/// Shrink `history` in place, returning whether anything was reclaimed. Free
+/// function rather than a method so the policy can be tested without standing
+/// up a provider model — see [`RigTurnDriver::degrade_for_overflow`] for what
+/// it is for.
+fn reclaim_context(history: &mut Vec<RigMessage>) -> bool {
+    {
+        let mut reclaimed = false;
+        for message in history.iter_mut() {
+            let RigMessage::User { content } = message else {
+                continue;
+            };
+            let shrunk: Vec<UserContent> = content
+                .iter()
+                .cloned()
+                .map(|item| match item {
+                    UserContent::ToolResult(mut result) => {
+                        let chunks: Vec<ToolResultContent> = result
+                            .content
+                            .iter()
+                            .cloned()
+                            .map(|chunk| match chunk {
+                                ToolResultContent::Text(text)
+                                    if text.text.len() > OVERFLOW_TOOL_RESULT_KEEP * 2 =>
+                                {
+                                    reclaimed = true;
+                                    ToolResultContent::text(head_tail(
+                                        &text.text,
+                                        OVERFLOW_TOOL_RESULT_KEEP,
+                                    ))
+                                }
+                                other => other,
+                            })
+                            .collect();
+                        if let Ok(chunks) = OneOrMany::many(chunks) {
+                            result.content = chunks;
+                        }
+                        UserContent::ToolResult(result)
+                    }
+                    other => other,
+                })
+                .collect();
+            if let Ok(shrunk) = OneOrMany::many(shrunk) {
+                *content = shrunk;
+            }
+        }
+        if reclaimed {
+            return true;
+        }
+    }
+    // Nothing bulky to shrink: the weight is in the replayed conversation
+    // itself. Drop the older half, keeping the window opening on a user
+    // message (a leading assistant message is rejected outright by some
+    // providers).
+    let cut = history.len() / 2;
+    if cut == 0 {
+        return false;
+    }
+    let mut rest = history.split_off(cut);
+    while rest
+        .first()
+        .is_some_and(|m| matches!(m, RigMessage::Assistant { .. }))
+    {
+        rest.remove(0);
+    }
+    if rest.is_empty() {
+        // Dropping would leave nothing to send; let the turn fail honestly
+        // instead of sending an empty request.
+        return false;
+    }
+    *history = rest;
+    true
+}
+
+/// The provider cache key for a turn: the backend's declared prefix family when
+/// it has one, else the session. See [`RigLlm::model_for`] for why the two
+/// differ.
+fn cache_key(family: Option<&str>, session_id: &str) -> String {
+    format!("komo:{}", family.unwrap_or(session_id))
+}
+
+/// `s` shortened to its first and last `keep` bytes with a marker between,
+/// cut on char boundaries. Used only for the overflow degrade.
+fn head_tail(s: &str, keep: usize) -> String {
+    let head_end = floor_char_boundary(s, keep);
+    let tail_start = ceil_char_boundary(s, s.len() - keep);
+    format!(
+        "{}\n\n…[{} bytes elided to fit the context window; the full result was \
+         already delivered earlier this turn]…\n\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
+fn floor_char_boundary(s: &str, mut at: usize) -> usize {
+    while at > 0 && !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
+    while at < s.len() && !s.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 #[async_trait]
@@ -729,12 +949,13 @@ pub fn build_llm(
     tools: Option<&crate::services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
     enricher: Option<Arc<MemoryEnricher>>,
+    cache_family: Option<&str>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
     let providers = config.menu_providers();
     // The common case: everything on the menu runs on one provider, so there is
     // nothing to route between.
     if providers.len() < 2 {
-        return build_provider_llm(config, tools, preamble, enricher);
+        return build_provider_llm(config, tools, preamble, enricher, cache_family);
     }
 
     let mut by_provider = Vec::with_capacity(providers.len());
@@ -751,7 +972,13 @@ pub fn build_llm(
         let scoped = config.for_provider(provider, default_model);
         by_provider.push((
             provider,
-            build_provider_llm(&scoped, tools, preamble.clone(), enricher.clone())?,
+            build_provider_llm(
+                &scoped,
+                tools,
+                preamble.clone(),
+                enricher.clone(),
+                cache_family,
+            )?,
         ));
     }
     Ok(Arc::new(RoutingLlm {
@@ -766,7 +993,9 @@ fn build_provider_llm(
     tools: Option<&crate::services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
     enricher: Option<Arc<MemoryEnricher>>,
+    cache_family: Option<&str>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
+    let cache_family = cache_family.map(str::to_string);
     // A missing API key degrades instead of failing construction: a fresh
     // install (first Docker boot, pre-`komo init`) must still bring the
     // gateway up — channels serve, pairing works — while every LLM call
@@ -839,6 +1068,7 @@ fn build_provider_llm(
                 tools: tool_defs,
                 default_model: model,
                 provider: config.provider,
+                cache_family,
                 preamble,
                 max_history_messages,
                 max_history_bytes,
@@ -1186,6 +1416,146 @@ mod tests {
             Message::user(user),
             Message::assistant(assistant).with_tool_note(note),
         ]
+    }
+
+    /// A rate limit takes seconds to clear, so the budget has to outlast one:
+    /// four attempts spanning 21s, versus the three-in-2.5s that used to run out
+    /// while the limit was still in force.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_budget_outlasts_a_rate_limit() {
+        assert_eq!(LLM_RETRY_MAX_ATTEMPTS, LLM_RETRY_BACKOFF_MS.len() + 1);
+        assert!(
+            LLM_RETRY_BACKOFF_MS.iter().sum::<u64>() >= 20_000,
+            "the table has to cover a rate limit that lasts tens of seconds"
+        );
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_retry(|| async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 {
+                anyhow::bail!("HTTP 429 Too Many Requests");
+            }
+            Ok("answered")
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "answered");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            LLM_RETRY_MAX_ATTEMPTS,
+            "a fourth attempt has to exist for the last backoff to be worth having"
+        );
+    }
+
+    /// The provider phrasings that mean "your request did not fit", and the ones
+    /// that must not be mistaken for it — a false positive here throws away
+    /// context the turn still needed.
+    #[test]
+    fn context_overflow_is_recognised_across_provider_phrasings() {
+        for message in [
+            "This model's maximum context length is 128000 tokens",
+            "error code: context_length_exceeded",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "Please reduce the length of the messages",
+        ] {
+            assert!(
+                is_context_overflow(&anyhow::anyhow!("{message}")),
+                "should read as overflow: {message}"
+            );
+        }
+        for message in ["invalid api key", "HTTP 429 Too Many Requests", "timeout"] {
+            assert!(
+                !is_context_overflow(&anyhow::anyhow!("{message}")),
+                "should not read as overflow: {message}"
+            );
+        }
+    }
+
+    /// A backend whose sessions are one-shot but whose prompt prefix never
+    /// changes has to key the cache by that prefix, or every delegation and
+    /// every cron firing pays a cold start. The main agent keeps keying by
+    /// session, where one conversation really is one prefix.
+    #[test]
+    fn a_declared_family_keys_the_cache_instead_of_the_one_shot_session() {
+        let first = cache_key(Some("delegate"), "delegate:0198-aaaa");
+        let second = cache_key(Some("delegate"), "delegate:0198-bbbb");
+        assert_eq!(first, second, "two delegations share one warm prefix");
+
+        let a = cache_key(None, "telegram:644");
+        let b = cache_key(None, "telegram:900");
+        assert_ne!(a, b, "separate conversations must not share a key");
+        assert_eq!(a, "komo:telegram:644");
+    }
+
+    fn tool_result_message(text: &str) -> RigMessage {
+        RigMessage::User {
+            content: OneOrMany::one(UserContent::tool_result(
+                "call-1",
+                OneOrMany::one(ToolResultContent::text(text)),
+            )),
+        }
+    }
+
+    /// The usual overflow is one turn that read several large things. Shrinking
+    /// those reclaims the context without touching the conversation, and the
+    /// full text is still on disk in the tool-output store.
+    #[test]
+    fn reclaiming_shrinks_bulky_tool_results_and_keeps_the_conversation() {
+        let mut history = vec![
+            RigMessage::user("find the bug"),
+            tool_result_message(&"x".repeat(200_000)),
+            RigMessage::assistant("reading further"),
+        ];
+        let before = history.len();
+
+        assert!(reclaim_context(&mut history));
+        assert_eq!(history.len(), before, "no message is dropped");
+        let rendered = format!("{history:?}");
+        assert!(rendered.contains("elided"), "the big result was shrunk");
+        assert!(rendered.contains("find the bug"), "the ask is still there");
+    }
+
+    /// When there is nothing bulky to shrink the weight is the conversation
+    /// itself, so the oldest half goes — and what is left still opens on a user
+    /// message, which several providers require.
+    #[test]
+    fn reclaiming_falls_back_to_dropping_the_oldest_half() {
+        let mut history: Vec<RigMessage> = (0..8)
+            .flat_map(|i| {
+                [
+                    RigMessage::user(format!("q{i}")),
+                    RigMessage::assistant(format!("a{i}")),
+                ]
+            })
+            .collect();
+
+        assert!(reclaim_context(&mut history));
+        assert!(history.len() <= 8);
+        assert!(
+            matches!(history.first(), Some(RigMessage::User { .. })),
+            "history must still open on a user message"
+        );
+        let rendered = format!("{history:?}");
+        assert!(!rendered.contains("q0"), "the oldest exchange is gone");
+        assert!(rendered.contains("q7"), "the newest is kept");
+    }
+
+    /// Nothing left to give: the caller has to surface the failure rather than
+    /// re-send an empty request.
+    #[test]
+    fn reclaiming_reports_failure_when_there_is_nothing_to_reclaim() {
+        let mut history = vec![RigMessage::user("hi")];
+        assert!(!reclaim_context(&mut history));
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends_and_cuts_on_char_boundaries() {
+        let text = "前".repeat(4_000); // 12 KB of 3-byte chars
+        let cut = head_tail(&text, 1_024);
+        assert!(cut.len() < text.len() / 4);
+        assert!(cut.starts_with('前') && cut.ends_with('前'));
+        assert!(cut.contains("elided"));
     }
 
     #[test]

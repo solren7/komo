@@ -9,14 +9,16 @@
 //! and the TUI (in `agent/` / `tui/`) resolve an inbound message into it.
 //!
 //! Design contract (see `.scratch/clarify-step/PRD.md`):
-//! - at most one pending question per session (a second `register` supersedes
-//!   the first; the superseded waiter reads the dropped sender as "no answer");
+//! - at most one pending question per session — concurrent askers queue on the
+//!   session's gate rather than superseding each other; a `register` that does
+//!   supersede (a stale question left by a previous turn) drops the old
+//!   waiter's sender, which it reads as "no answer";
 //! - a per-turn budget caps how many times a single turn may ask
 //!   ([`CLARIFY_BUDGET_PER_TURN`]) so the agent can't interrogate;
 //! - `/new` and turn completion clear everything for the session.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -26,6 +28,12 @@ use tokio::sync::oneshot;
 /// approval timeout (5 min): answering may require the user to look something
 /// up, and an unanswered clarify degrades gracefully rather than denying.
 pub const CLARIFY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Per-call ceiling `ask_user` must advertise so the tool executor's default
+/// timeout doesn't abort the question before [`CLARIFY_TIMEOUT`] expires — the
+/// same reason approval-gated tools carry `APPROVAL_BOUND`. The headroom covers
+/// delivering the prompt and resolving the answer around the wait itself.
+pub const CLARIFY_BOUND: Duration = Duration::from_secs(CLARIFY_TIMEOUT.as_secs() + 120);
 
 /// How many times one turn may ask the user (anti-interrogation cap).
 pub const CLARIFY_BUDGET_PER_TURN: u32 = 2;
@@ -38,6 +46,14 @@ pub struct ClarifyState {
     pending: Mutex<HashMap<String, (oneshot::Sender<String>, String)>>,
     /// Questions asked in the session's current turn (reset at turn start).
     asked: Mutex<HashMap<String, u32>>,
+    /// Per-session serialization gate, mirroring `ApprovalState`'s. A round's
+    /// tool calls run concurrently (`ToolExecutor::execute_round`) and the
+    /// per-turn budget allows two questions, so two `ask_user` calls can land
+    /// at once; without this the second [`register`](Self::register) drops the
+    /// first waiter's sender — that question becomes unanswerable while the
+    /// user only ever sees the second one. Per session, so a pending question
+    /// in one chat never blocks another chat.
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub timeout: Duration,
 }
 
@@ -46,8 +62,21 @@ impl ClarifyState {
         Self {
             pending: Mutex::new(HashMap::new()),
             asked: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
             timeout: CLARIFY_TIMEOUT,
         }
+    }
+
+    /// The clarify gate for `session`, created on first use. Held by `ask_user`
+    /// across register → deliver → await, so concurrent questions in the same
+    /// session queue instead of racing the single `pending` slot.
+    pub fn gate(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Claim one unit of the turn's clarify budget. `false` = exhausted (the
@@ -114,9 +143,15 @@ impl ClarifyState {
     }
 
     /// The turn ended (or `/new`): drop pending question and budget state.
+    ///
+    /// The gate is reclaimed too (recreated on demand by [`gate`](Self::gate)),
+    /// so the map doesn't accumulate one entry per session for the gateway's
+    /// lifetime. A gate still held by an in-flight asker keeps working — the
+    /// waiters share the `Arc`, not the map entry.
     pub fn clear(&self, session: &str) {
         self.forget_pending(session);
         self.asked.lock().unwrap().remove(session);
+        self.gates.lock().unwrap().remove(session);
     }
 }
 

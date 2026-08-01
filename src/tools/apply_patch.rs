@@ -188,12 +188,7 @@ impl ApplyPatchTool {
                 }))
             }
             patch::Hunk::Delete { .. } => {
-                if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                    anyhow::bail!("{} does not exist, so it cannot be deleted", path.display());
-                }
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to delete {}: {e}", path.display()))?;
+                file_mutation::delete_existing(path).await?;
                 Ok(json!({ "type": "delete", "path": path.display().to_string() }))
             }
             patch::Hunk::Update { chunks, .. } => {

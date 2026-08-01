@@ -11,8 +11,57 @@
 //!
 //! Scope is deliberately narrow: this closes the *approval window*, not a
 //! cross-turn one. There is no "the model must have read the file first" rule.
+//!
+//! The second guarantee is **per-path serialization** of the mutations
+//! themselves — see [`WRITE_LOCKS`].
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+/// Per-path write locks.
+///
+/// The snapshot-compare above is only atomic if nothing can slip between the
+/// compare and the write. A round's tool calls run **concurrently**
+/// (`ToolExecutor::execute_round` spawns them and joins), so two calls mutating
+/// the same file each snapshot the same bytes, each find them unchanged, and
+/// each write: the first mutation is lost silently and *both* report success to
+/// the model. Holding this lock across compare+write turns that into "one wins,
+/// the other gets [`StaleContent`]" — a visible error the model can act on.
+///
+/// Per path, not global: writes to different files stay parallel, and reads
+/// never take it at all. Keys are the lexically-normalized absolute paths every
+/// mutating tool already resolves to (`Workspace::resolve_contained`), so
+/// `a.rs`, `./a.rs` and `sub/../a.rs` share one lock. Aliases the resolver
+/// cannot see through (symlinks, case-insensitive filesystems) are out of
+/// scope — the snapshot compare is still the backstop there.
+///
+/// Values are `Weak`, so a path's entry disappears once its last writer is
+/// done; the map does not grow with the number of files ever touched.
+static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Acquire `path`'s write lock, holding it until the returned guard drops.
+async fn lock_path(path: &Path) -> OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = WRITE_LOCKS.lock().unwrap();
+        // Reclaim entries whose writers are all gone. Safe to do before the
+        // lookup: a live acquisition always holds an `Arc` (the local below, or
+        // the guard), so it can never drop the entry someone is waiting on.
+        locks.retain(|_, waiters| waiters.strong_count() > 0);
+        match locks.get(path).and_then(Weak::upgrade) {
+            Some(existing) => existing,
+            None => {
+                let fresh = Arc::new(AsyncMutex::new(()));
+                locks.insert(path.to_path_buf(), Arc::downgrade(&fresh));
+                fresh
+            }
+        }
+    };
+    lock.lock_owned().await
+}
 
 /// The file's state at snapshot time — `None` when it did not exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +129,9 @@ pub async fn write_if_unchanged(
     expected: &Snapshot,
     content: &str,
 ) -> anyhow::Result<()> {
+    // Held across compare+write: without it two concurrent callers can both
+    // pass the compare and both write (see [`WRITE_LOCKS`]).
+    let _guard = lock_path(path).await;
     let current = snapshot(path).await?;
     if &current != expected {
         return Err(StaleContent {
@@ -107,6 +159,20 @@ pub async fn write_if_unchanged(
     Ok(())
 }
 
+/// Delete `path`, erroring if it is already gone (the caller named a specific
+/// file). Takes the same per-path lock a write does, so a delete can never land
+/// between a concurrent write's compare and its write — otherwise that write
+/// would recreate the file the model just asked to remove.
+pub async fn delete_existing(path: &Path) -> anyhow::Result<()> {
+    let _guard = lock_path(path).await;
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        anyhow::bail!("{} does not exist, so it cannot be deleted", path.display());
+    }
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to delete {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +190,68 @@ mod tests {
         let snap = snapshot(&p).await.unwrap();
         write_if_unchanged(&p, &snap, "new").await.unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
+    }
+
+    /// The concurrency guarantee: two calls in one round mutating the same
+    /// file both snapshot the same bytes and race to write. Exactly one may
+    /// land — the loser must be told its snapshot went stale, not silently
+    /// overwrite the winner while reporting success.
+    #[tokio::test]
+    async fn concurrent_writes_to_one_path_never_both_land() {
+        let p = temp("concurrent_same");
+        std::fs::write(&p, "original").unwrap();
+        let snap = snapshot(&p).await.unwrap();
+
+        let first = {
+            let (p, snap) = (p.clone(), snap.clone());
+            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from A").await })
+        };
+        let second = {
+            let (p, snap) = (p.clone(), snap.clone());
+            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from B").await })
+        };
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .iter()
+                .filter(|ok| **ok)
+                .count(),
+            1,
+            "exactly one of the two writes may land"
+        );
+        let landed = std::fs::read_to_string(&p).unwrap();
+        assert!(landed == "from A" || landed == "from B", "got {landed:?}");
+
+        let loser = if first.is_err() { first } else { second };
+        assert!(
+            loser.unwrap_err().downcast_ref::<StaleContent>().is_some(),
+            "the loser must report staleness, not a generic failure"
+        );
+    }
+
+    /// The lock is per path, not global: unrelated files still write in
+    /// parallel, which is the whole point of running a round concurrently.
+    #[tokio::test]
+    async fn concurrent_writes_to_different_paths_both_land() {
+        let (a, b) = (temp("concurrent_a"), temp("concurrent_b"));
+        let empty = snapshot(&a).await.unwrap();
+
+        let (ra, rb) = tokio::join!(
+            write_if_unchanged(&a, &empty, "a"),
+            write_if_unchanged(&b, &empty, "b"),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_file_is_an_error() {
+        let p = temp("delete_missing");
+        let err = delete_existing(&p).await.unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[tokio::test]

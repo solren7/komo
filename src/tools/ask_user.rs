@@ -113,20 +113,34 @@ impl Tool for AskUserTool {
             prompt.push_str("\n（回复编号或直接输入答案）");
         }
 
-        // Register BEFORE sending, so an instant reply can't race the window
-        // between the prompt landing and the waiter existing. The prompt text is
-        // stored too, so a non-sink surface (the GUI's interactions poll) can
-        // render the question.
-        let rx = self.clarify.register(&sc.session_id, &prompt);
-        if let Err(error) = sc.sink.send(&prompt).await {
-            self.clarify.forget_pending(&sc.session_id);
-            return Ok(ToolOutput::text(format!(
-                "Could not deliver the question ({error}). {NO_ANSWER}"
-            )));
-        }
+        // One question at a time per session, and the whole thing under one
+        // deadline. The gate wait is *inside* the timeout on purpose: a second
+        // question queued behind a slow first one must still be bounded by
+        // `CLARIFY_TIMEOUT` rather than stacking another full wait on top of it
+        // (which would outlive the tool's advertised `max_duration`).
+        let asked = tokio::time::timeout(self.clarify.timeout, async {
+            let gate = self.clarify.gate(&sc.session_id);
+            let _guard = gate.lock().await;
 
-        match tokio::time::timeout(self.clarify.timeout, rx).await {
-            Ok(Ok(answer)) => {
+            // Register BEFORE sending, so an instant reply can't race the window
+            // between the prompt landing and the waiter existing. The prompt text
+            // is stored too, so a non-sink surface (the GUI's interactions poll)
+            // can render the question.
+            let rx = self.clarify.register(&sc.session_id, &prompt);
+            if let Err(error) = sc.sink.send(&prompt).await {
+                self.clarify.forget_pending(&sc.session_id);
+                return Asked::Undeliverable(error.to_string());
+            }
+            match rx.await {
+                Ok(answer) => Asked::Answered(answer),
+                // Superseded or cleared (e.g. `/new`).
+                Err(_) => Asked::NoAnswer,
+            }
+        })
+        .await;
+
+        match asked {
+            Ok(Asked::Answered(answer)) => {
                 // Echo numbered-option picks back as their text so the model
                 // never has to re-map "2" to the option list.
                 let answer = args
@@ -138,14 +152,34 @@ impl Tool for AskUserTool {
                     .unwrap_or(answer);
                 Ok(ToolOutput::text(format!("User answered: {answer}")))
             }
-            // Superseded or cleared (e.g. `/new`): treat as no answer.
-            Ok(Err(_)) => Ok(ToolOutput::text(NO_ANSWER)),
+            Ok(Asked::Undeliverable(error)) => Ok(ToolOutput::text(format!(
+                "Could not deliver the question ({error}). {NO_ANSWER}"
+            ))),
+            Ok(Asked::NoAnswer) => Ok(ToolOutput::text(NO_ANSWER)),
+            // Deadline hit — either waiting on the user, or on the gate ahead
+            // of us. Same degrade either way.
             Err(_) => {
                 self.clarify.forget_pending(&sc.session_id);
                 Ok(ToolOutput::text(NO_ANSWER))
             }
         }
     }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        // Must outlast `CLARIFY_TIMEOUT`, or the executor's default per-call
+        // timeout (120s) aborts the question long before the user's 10 minutes
+        // are up — the same contract approval-gated tools have via
+        // `APPROVAL_BOUND`.
+        Some(crate::services::clarify::CLARIFY_BOUND)
+    }
+}
+
+/// How an `ask_user` wait ended, so the outcome text is chosen after the
+/// deadline wrapper rather than inside it.
+enum Asked {
+    Answered(String),
+    Undeliverable(String),
+    NoAnswer,
 }
 
 #[cfg(test)]
@@ -259,6 +293,60 @@ mod tests {
         assert_eq!(out.text, "User answered: banana");
         let prompt = &sent.lock().unwrap()[0];
         assert!(prompt.contains("1. apple") && prompt.contains("2. banana"));
+    }
+
+    /// Two `ask_user` calls in one round — the executor runs a round's calls
+    /// concurrently, and the per-turn budget allows two. They must queue on the
+    /// session gate and both get answered; before the gate the second
+    /// `register` dropped the first waiter's sender, so question one could
+    /// never be answered and the user only ever saw question two.
+    #[tokio::test]
+    async fn concurrent_questions_queue_instead_of_clobbering_each_other() {
+        let clarify = Arc::new(ClarifyState::new());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(AskUserTool::new(clarify.clone()));
+
+        let spawn_ask = |question: &'static str| {
+            let (tool, sent) = (tool.clone(), sent.clone());
+            tokio::spawn(async move {
+                let ctx = interactive_ctx("s5", sent);
+                tool.call(v(&format!(r#"{{"question":"{question}"}}"#)), &ctx)
+                    .await
+                    .unwrap()
+                    .text
+            })
+        };
+        let (first, second) = (spawn_ask("Q1"), spawn_ask("Q2"));
+
+        // Answer whatever is pending, one at a time: the second asker only gets
+        // its question registered once the first releases the gate.
+        let answerer = {
+            let clarify = clarify.clone();
+            tokio::spawn(async move {
+                let mut served = 0;
+                for _ in 0..600 {
+                    if let Some(question) = clarify.pending_question("s5") {
+                        let answer = if question.contains("Q1") { "A1" } else { "A2" };
+                        assert!(clarify.resolve("s5", answer));
+                        served += 1;
+                        if served == 2 {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                panic!("only {served} of 2 questions were ever pending");
+            })
+        };
+
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        answerer.await.unwrap();
+
+        // Each asker got *its own* answer — neither was silently superseded.
+        assert_eq!(first, "User answered: A1");
+        assert_eq!(second, "User answered: A2");
+        let asked = sent.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2, "both questions reached the user: {asked:?}");
     }
 
     #[tokio::test]

@@ -314,6 +314,24 @@ where
     /// preamble, recall in front of the prompt (see below for why they split).
     /// Run once per turn — never per tool-loop round (recall is keyed on the
     /// user message, and re-running it each round would churn the prompt).
+    ///
+    /// # Invariant: a stored message renders the same bytes forever
+    ///
+    /// komo does not store provider-shaped history (that is what lets a session
+    /// switch models, even across providers, mid-conversation) — it re-renders
+    /// the transcript every turn. The price of that freedom is this rule:
+    /// **rendering a message must be a pure function of that message's stored
+    /// fields.** Nothing may depend on how far it sits from the end of the
+    /// window, or on anything else that moves as the conversation grows.
+    ///
+    /// Break it and the provider prefix cache dies quietly: a message whose
+    /// bytes change is a divergence point, and everything after it is recomputed
+    /// on every request for the rest of the turn (see [`to_rig_message`], which
+    /// used to break exactly this way). The two places that legitimately vary
+    /// per turn — where the window *starts*, and the memory blocks — are handled
+    /// so that they don't rewrite anything: the cut snaps to a content-derived
+    /// anchor ([`window_history`]), and recall is appended at the tail rather
+    /// than folded into the prefix (below).
     async fn assemble(
         &self,
         session: &Session,
@@ -339,14 +357,7 @@ where
             self.max_history_messages,
             self.max_history_bytes,
         );
-        // Tool notes only ride along for the most recent turns (see
-        // [`TOOL_NOTE_TURNS`]): find where that tail starts.
-        let notes_from = tool_note_cutoff(window);
-        let history: Vec<RigMessage> = window
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, m)| to_rig_message(m, idx >= notes_from))
-            .collect();
+        let history: Vec<RigMessage> = window.iter().filter_map(to_rig_message).collect();
 
         // Rebuild the system prompt for this turn. It rides on the per-turn
         // request rather than on shared state, so concurrent sessions in the
@@ -1248,43 +1259,30 @@ fn is_window_anchor(m: &Message) -> bool {
     h % WINDOW_ANCHOR_SPACING == 0
 }
 
-/// How many of the most recent assistant turns carry their tool-activity note
-/// (`Message::tool_note`) into the model's history. Older notes are dropped:
-/// "which file did I just read" decays in usefulness far faster than it decays in
-/// context cost, and the run ledger keeps the full record either way.
-const TOOL_NOTE_TURNS: usize = 3;
-
-/// Index in `window` from which assistant messages may carry their tool note —
-/// the start of the last [`TOOL_NOTE_TURNS`] note-bearing turns (`window.len()`
-/// when there are none, i.e. attach nothing).
-fn tool_note_cutoff(window: &[Message]) -> usize {
-    let mut cutoff = window.len();
-    let mut found = 0;
-    for (idx, msg) in window.iter().enumerate().rev() {
-        if msg.role == Role::Assistant && !msg.tool_note.is_empty() {
-            cutoff = idx;
-            found += 1;
-            if found == TOOL_NOTE_TURNS {
-                break;
-            }
-        }
-    }
-    cutoff
-}
-
 /// Map a komo message into a rig chat-history message. The system prompt is
 /// supplied via the preamble, and tool outputs are folded into the following
 /// assistant reply, so both `System` and `Tool` roles are skipped here.
 ///
-/// `with_note` appends the turn's tool-activity digest to an assistant message,
-/// which is what lets the *next* turn know tools ran at all — the user-visible
-/// `content` stays exactly what every client renders.
-fn to_rig_message(msg: &Message, with_note: bool) -> Option<RigMessage> {
+/// The turn's tool-activity digest rides along on an assistant message, which is
+/// what lets the *next* turn know tools ran at all — the user-visible `content`
+/// stays exactly what every client renders.
+///
+/// **The rendering is a pure function of the message.** Nothing here may depend
+/// on where the message sits in the window (see [`assemble`]). This used to
+/// carry the note only for the last three note-bearing turns, which meant every
+/// tool turn silently rewrote an older message's bytes and cost the provider
+/// prefix cache everything from ~3 turns back, every turn. Always attaching is
+/// both simpler and cheaper: the digest is already capped when it is written
+/// (`domain::run::tool_digest`), and [`window_history`]'s byte budget has always
+/// counted `tool_note` for every message in the window regardless of whether it
+/// was rendered — so the accounting now matches what is actually sent.
+fn to_rig_message(msg: &Message) -> Option<RigMessage> {
     match msg.role {
         Role::User => Some(RigMessage::user(msg.content.clone())),
-        Role::Assistant if with_note && !msg.tool_note.is_empty() => Some(RigMessage::assistant(
-            format!("{}\n\n{}", msg.content, msg.tool_note),
-        )),
+        Role::Assistant if !msg.tool_note.is_empty() => Some(RigMessage::assistant(format!(
+            "{}\n\n{}",
+            msg.content, msg.tool_note
+        ))),
         Role::Assistant => Some(RigMessage::assistant(msg.content.clone())),
         Role::System | Role::Tool => None,
     }
@@ -1646,9 +1644,13 @@ mod tests {
         );
     }
 
+    /// The prefix-cache invariant `assemble` documents: a stored message renders
+    /// the same bytes no matter where it sits, so growing the conversation never
+    /// rewrites an earlier message. This used to fail — only the last three
+    /// note-bearing turns carried their note, so every tool turn silently
+    /// changed an older message and cost the cache everything after it.
     #[test]
-    fn only_the_most_recent_tool_notes_ride_along() {
-        // Five note-bearing turns; the model should see the last TOOL_NOTE_TURNS.
+    fn a_message_renders_the_same_bytes_wherever_it_sits() {
         let mut prior = Vec::new();
         for i in 0..5 {
             prior.extend(turn(
@@ -1657,33 +1659,46 @@ mod tests {
                 &format!("note{i}"),
             ));
         }
-        let cutoff = tool_note_cutoff(&prior);
-        let rendered: Vec<String> = prior
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, m)| to_rig_message(m, idx >= cutoff))
-            .map(|m| format!("{m:?}"))
-            .collect();
-        let carried = |note: &str| rendered.iter().any(|m| m.contains(note));
+        let render = |msgs: &[Message]| -> Vec<String> {
+            msgs.iter()
+                .filter_map(to_rig_message)
+                .map(|m| format!("{m:?}"))
+                .collect()
+        };
 
-        for recent in ["note2", "note3", "note4"] {
-            assert!(carried(recent), "{recent} should still be carried");
+        // Every note is carried, oldest included — nothing ages out.
+        let early = render(&prior);
+        for i in 0..5 {
+            let note = format!("note{i}");
+            assert!(
+                early.iter().any(|m| m.contains(&note)),
+                "{note} must ride along"
+            );
         }
-        for stale in ["note0", "note1"] {
-            assert!(!carried(stale), "{stale} should have aged out");
-        }
+
+        // Two more turns arrive. The messages that were already there must
+        // render byte-identically; only the new ones are added.
+        prior.extend(turn("q5", "a5", "note5"));
+        prior.extend(turn("q6", "a6", "note6"));
+        let later = render(&prior);
+        assert_eq!(
+            early,
+            later[..early.len()],
+            "appending a turn must not rewrite an earlier message"
+        );
     }
 
     #[test]
     fn a_tool_note_never_touches_the_user_visible_content() {
         let msg = Message::assistant("the answer").with_tool_note("[tools used] read foo.rs");
-        // Carried: the model sees both. Not carried: exactly the reply.
-        let with = format!("{:?}", to_rig_message(&msg, true).unwrap());
-        assert!(with.contains("the answer") && with.contains("read foo.rs"));
-        let without = format!("{:?}", to_rig_message(&msg, false).unwrap());
-        assert!(without.contains("the answer") && !without.contains("read foo.rs"));
+        // The model sees the note; `content` stays exactly the reply.
+        let rendered = format!("{:?}", to_rig_message(&msg).unwrap());
+        assert!(rendered.contains("the answer") && rendered.contains("read foo.rs"));
         // And the stored message itself is untouched — every client renders this.
         assert_eq!(msg.content, "the answer");
+        let plain = Message::assistant("just talk");
+        let rendered = format!("{:?}", to_rig_message(&plain).unwrap());
+        assert!(rendered.contains("just talk"));
     }
 
     /// The point of #1: one 429 on a late round must not throw the turn away.

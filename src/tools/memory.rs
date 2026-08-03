@@ -45,6 +45,28 @@ struct MemoryArgs {
     expiry_days: Option<i64>,
 }
 
+impl MemoryArgs {
+    /// Some models fill every optional schema field with a placeholder instead
+    /// of omitting it (`"id": ""`, `"status": ""`). An empty string is never a
+    /// meaningful value for any of these, so normalize it to absent — otherwise
+    /// `parse_memory_status("")` silently becomes an `active` filter and a
+    /// `list` over an all-candidate store returns nothing.
+    fn normalized(mut self) -> Self {
+        for field in [
+            &mut self.text,
+            &mut self.kind,
+            &mut self.query,
+            &mut self.id,
+            &mut self.status,
+        ] {
+            if field.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                *field = None;
+            }
+        }
+        self
+    }
+}
+
 /// Long-term, cross-session memory with governance. The model `save`s facts,
 /// `search`es them (scoped to the current chat/session), and curates the
 /// library: `promote` a candidate to active, `reject`/`archive` it, or `update`
@@ -139,7 +161,7 @@ impl Tool for MemoryTool {
     }
 
     async fn call(&self, input: Value, tool_ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let args: MemoryArgs = parse_args(&input)?;
+        let args: MemoryArgs = parse_args::<MemoryArgs>(&input)?.normalized();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         // Scope comes from the *explicit* per-call context (tool trait v2), not
         // the ambient task-local: `memory` was the last tool reading that seam.
@@ -173,10 +195,22 @@ impl Tool for MemoryTool {
             }
             "list" => {
                 let mut memories = self.memories.list().await?;
+                let total = memories.len();
+                let breakdown = status_breakdown(&memories);
                 if let Some(status) = args.status.as_deref().map(parse_memory_status) {
                     memories.retain(|m| m.status == status);
                 }
-                let mut out = render(&memories);
+                let mut out = if memories.is_empty() && total > 0 {
+                    // A status filter that matched nothing must not read as "the
+                    // store is empty" — say where the memories actually are so
+                    // the model can re-list instead of concluding there are none.
+                    format!(
+                        "No memories with that status, but {total} exist: {breakdown}. \
+                         Call list without `status` to see them."
+                    )
+                } else {
+                    render(&memories)
+                };
                 if let Some(usage) = self.pinned_usage_line(&scope).await {
                     out.push_str("\n\n");
                     out.push_str(&usage);
@@ -265,6 +299,23 @@ async fn set_status(
     )))
 }
 
+/// Count memories per status, e.g. `candidate=24, archived=2`.
+fn status_breakdown(memories: &[Memory]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for m in memories {
+        let name = m.status.as_str();
+        match counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(n, c)| format!("{n}={c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render(memories: &[Memory]) -> String {
     if memories.is_empty() {
         return "(no memories)".to_string();
@@ -349,6 +400,49 @@ mod tests {
             .text;
         assert!(hit.contains("Rust"));
         assert!(!hit.contains("蓝色"));
+    }
+
+    /// The exact call shape observed from a model that fills every optional
+    /// field with a placeholder (run-019fc562): `status: "active"` over an
+    /// all-candidate store must not read as "the store is empty".
+    #[tokio::test]
+    async fn list_filtered_to_nothing_reports_where_memories_are() {
+        let tool = temp_tool("komo_mem_tool_filler");
+        let mut cand = Memory::new(MemoryKind::Fact, "user prefers rebase before push");
+        cand.status = MemoryStatus::Candidate;
+        tool.memories.save(&cand).await.unwrap();
+
+        let out = tool
+            .call(
+                json!({
+                    "action": "list", "status": "active", "kind": "fact",
+                    "id": "", "query": "", "text": "",
+                    "importance": 0, "pinned": false, "expiry_days": 0
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(!out.contains("(no memories)"));
+        assert!(out.contains("candidate=1"));
+    }
+
+    /// An empty-string `status` is a placeholder, not an `active` filter
+    /// (`parse_memory_status("")` would otherwise default to Active).
+    #[tokio::test]
+    async fn empty_string_args_are_treated_as_absent() {
+        let tool = temp_tool("komo_mem_tool_empty_args");
+        let mut cand = Memory::new(MemoryKind::Fact, "protoc lives in /opt/homebrew/bin");
+        cand.status = MemoryStatus::Candidate;
+        tool.memories.save(&cand).await.unwrap();
+
+        let out = tool
+            .call(json!({ "action": "list", "status": "", "id": "" }), &ctx())
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("protoc"));
     }
 
     #[tokio::test]

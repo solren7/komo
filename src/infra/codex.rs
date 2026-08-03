@@ -11,9 +11,10 @@
 //!
 //! Because the access token lives only a few hours and the gateway is a
 //! long-running process, refresh can't happen once at startup. [`CodexAuth`]
-//! resolves a fresh token on demand and [`CodexHttpClient`] — a `rig`
-//! [`HttpClientExt`] backend — re-stamps the `Authorization` header on **every**
-//! outgoing request, so a turn an hour into the process still authenticates.
+//! resolves a fresh token on demand, and the provider layer's
+//! [`TokenSource`](crate::infra::provider::TokenSource) hook calls it to stamp a
+//! bearer on **every** outgoing request, so a turn an hour into the process
+//! still authenticates.
 //! Refreshed tokens are written back to `auth.json` so the Codex CLI and komo
 //! stay in sync.
 
@@ -23,12 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
-use bytes::Bytes;
-use http::header::{AUTHORIZATION, HeaderValue};
-use rig::http_client::{self, HttpClientExt, LazyBody, MultipartForm, Request, Response};
-use rig::wasm_compat::WasmCompatSend;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+
+use crate::infra::provider::TokenSource;
 
 /// Codex CLI's OAuth client id (matches `codex-rs`), used for token refresh.
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -390,40 +389,28 @@ fn write_back(path: &Path, tokens: &CodexTokens) -> anyhow::Result<()> {
 }
 
 /// Resolves and refreshes Codex OAuth credentials from `~/.codex/auth.json`.
-/// Cheap to clone behind an `Arc`; shared by [`CodexHttpClient`].
+/// Held behind an `Arc` and shared by every request the Codex backend makes.
 pub struct CodexAuth {
     path: PathBuf,
     http: reqwest::Client,
     /// Stable account id, snapshotted at construction for the static
     /// `ChatGPT-Account-ID` header.
     account_id: Option<String>,
-    /// Access token at construction, used to seed the rig client's api-key
-    /// type-state (overwritten per request by [`CodexHttpClient`]).
-    initial_access_token: String,
     /// Live token set; the lock serializes concurrent refreshes so the
     /// single-use refresh token is never spent twice in parallel.
     state: Mutex<CodexTokens>,
 }
 
-impl CodexAuth {
-    /// An auth handle with no credentials, used only to satisfy the `Default`
-    /// bound rig requires on the HTTP backend type. It is never the auth of a
-    /// real client (those go through [`CodexAuth::load`]); if [`Self::resolve`]
-    /// were ever called on it, it surfaces a clear error rather than a panic.
-    fn placeholder() -> Arc<Self> {
-        Arc::new(Self {
-            path: PathBuf::new(),
-            http: reqwest::Client::new(),
-            account_id: None,
-            initial_access_token: String::new(),
-            state: Mutex::new(CodexTokens {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                account_id: None,
-            }),
-        })
+/// The provider layer asks for a token per request; that is what keeps a
+/// long-running gateway authenticated as the hourly access token rotates.
+#[async_trait::async_trait]
+impl TokenSource for CodexAuth {
+    async fn token(&self) -> anyhow::Result<String> {
+        self.resolve().await
     }
+}
 
+impl CodexAuth {
     /// Load credentials from `$CODEX_HOME/auth.json` (default `~/.codex`).
     /// Errors if the file is absent or malformed — surfaced at startup so the
     /// user is told to run `codex` rather than hitting a 401 mid-turn.
@@ -432,7 +419,6 @@ impl CodexAuth {
         let tokens = read_tokens(&path)?;
         Ok(Arc::new(Self {
             account_id: tokens.account_id.clone(),
-            initial_access_token: tokens.access_token.clone(),
             http: reqwest::Client::new(),
             path,
             state: Mutex::new(tokens),
@@ -442,11 +428,6 @@ impl CodexAuth {
     /// The ChatGPT account id for the `ChatGPT-Account-ID` request header.
     pub fn account_id(&self) -> Option<&str> {
         self.account_id.as_deref()
-    }
-
-    /// The access token captured at construction (seeds the rig client builder).
-    pub fn initial_access_token(&self) -> &str {
-        &self.initial_access_token
     }
 
     /// Return a non-expiring access token, refreshing in place if the current
@@ -537,211 +518,17 @@ impl CodexAuth {
 }
 
 /// Static headers (besides the per-request bearer) the Codex backend needs to
-/// pass its Cloudflare layer. Applied once to the rig client's default headers.
-pub fn codex_static_headers(account_id: Option<&str>) -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
-    headers.insert(
-        http::header::USER_AGENT,
-        HeaderValue::from_static(CODEX_USER_AGENT),
-    );
-    if let Some(acc) = account_id
-        && let Ok(v) = HeaderValue::from_str(acc)
-    {
-        headers.insert("chatgpt-account-id", v);
+/// pass its Cloudflare layer: it serves a 403 challenge to requests that don't
+/// look like the Codex CLI.
+pub fn codex_static_headers(account_id: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
+        ("user-agent".to_string(), CODEX_USER_AGENT.to_string()),
+    ];
+    if let Some(account) = account_id {
+        headers.push(("chatgpt-account-id".to_string(), account.to_string()));
     }
     headers
-}
-
-/// A `rig` HTTP backend that stamps a freshly-resolved Codex bearer token onto
-/// every request before delegating to `reqwest`. This is what lets a
-/// long-running process keep authenticating as the hourly access token rotates.
-#[derive(Clone)]
-pub struct CodexHttpClient {
-    inner: reqwest::Client,
-    auth: Arc<CodexAuth>,
-}
-
-impl CodexHttpClient {
-    pub fn new(auth: Arc<CodexAuth>) -> Self {
-        Self {
-            inner: reqwest::Client::new(),
-            auth,
-        }
-    }
-}
-
-// rig's `CompletionModel for ResponsesCompletionModel<H>` impl bounds `H: Default
-// + Debug` (over-broad — neither is exercised on the completion path). We satisfy
-// them without exposing the auth handle: `Default` yields a credential-less
-// client that is never the backend of a real request.
-impl Default for CodexHttpClient {
-    fn default() -> Self {
-        Self {
-            inner: reqwest::Client::new(),
-            auth: CodexAuth::placeholder(),
-        }
-    }
-}
-
-impl std::fmt::Debug for CodexHttpClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodexHttpClient").finish_non_exhaustive()
-    }
-}
-
-/// Reshape a rig Responses request body for the ChatGPT Codex backend.
-///
-/// rig hardcodes `instructions: null` and carries the system prompt as a
-/// `role:"system"` item inside `input` (it targets vanilla OpenAI, which accepts
-/// either). The Codex backend instead *requires* a top-level `instructions`
-/// field, like the Codex CLI sends. So we lift the first system message out of
-/// `input` into `instructions`. Non-JSON or non-`/responses` bodies (no `input`
-/// key) pass through untouched.
-fn adapt_codex_body(body: Bytes) -> Bytes {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return body;
-    };
-    if !obj.contains_key("input") {
-        return body;
-    }
-    // The Codex backend refuses server-side response storage; rig never sends
-    // `store`, so the backend's `true` default trips a 400. Pin it off.
-    obj.insert("store".into(), serde_json::Value::Bool(false));
-    let has_instructions = obj.get("instructions").is_some_and(|i| !i.is_null());
-    if !has_instructions {
-        let lifted = obj
-            .get_mut("input")
-            .and_then(|i| i.as_array_mut())
-            .and_then(|input| {
-                let pos = input
-                    .iter()
-                    .position(|it| it.get("role").and_then(|r| r.as_str()) == Some("system"))?;
-                Some(system_item_text(&input.remove(pos)))
-            })
-            .filter(|t| !t.is_empty())
-            // The backend rejects a missing/empty `instructions` outright; fall
-            // back to a neutral line if the request somehow carried no preamble.
-            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
-        obj.insert("instructions".into(), serde_json::Value::String(lifted));
-    }
-    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
-}
-
-/// Concatenate the `input_text` chunks of a Responses `role:"system"` input item.
-fn system_item_text(item: &serde_json::Value) -> String {
-    item.get("content")
-        .and_then(|c| c.as_array())
-        .map(|chunks| {
-            chunks
-                .iter()
-                .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
-}
-
-/// Overwrite the `Authorization` header with `Bearer <token>`, marked sensitive.
-fn set_bearer(headers: &mut http::HeaderMap, token: &str) -> http_client::Result<()> {
-    let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-        .map_err(http_client::Error::InvalidHeaderValue)?;
-    value.set_sensitive(true);
-    headers.insert(AUTHORIZATION, value);
-    Ok(())
-}
-
-fn auth_error(e: anyhow::Error) -> http_client::Error {
-    http_client::Error::Instance(format!("{e:#}").into())
-}
-
-impl HttpClientExt for CodexHttpClient {
-    fn send<T, U>(
-        &self,
-        req: Request<T>,
-    ) -> impl std::future::Future<Output = http_client::Result<Response<LazyBody<U>>>>
-    + WasmCompatSend
-    + 'static
-    where
-        T: Into<Bytes> + WasmCompatSend,
-        U: From<Bytes> + WasmCompatSend + 'static,
-    {
-        let inner = self.inner.clone();
-        let auth = self.auth.clone();
-        // Collapse the generic body to `Bytes` *before* the async block: the
-        // returned future is `'static`, so it must not carry the unbounded `T`.
-        let (parts, body) = req.into_parts();
-        let body = adapt_codex_body(body.into());
-        async move {
-            let token = auth.resolve().await.map_err(auth_error)?;
-            let mut parts = parts;
-            set_bearer(&mut parts.headers, &token)?;
-            inner
-                .send::<Bytes, U>(Request::from_parts(parts, body))
-                .await
-        }
-    }
-
-    fn send_multipart<U>(
-        &self,
-        req: Request<MultipartForm>,
-    ) -> impl std::future::Future<Output = http_client::Result<Response<LazyBody<U>>>>
-    + WasmCompatSend
-    + 'static
-    where
-        U: From<Bytes> + WasmCompatSend + 'static,
-    {
-        let inner = self.inner.clone();
-        let auth = self.auth.clone();
-        // `MultipartForm` is a concrete `'static` type, so capturing it in the
-        // `'static` future is fine (unlike the generic `T` in `send`).
-        let (parts, body) = req.into_parts();
-        async move {
-            let token = auth.resolve().await.map_err(auth_error)?;
-            let mut parts = parts;
-            set_bearer(&mut parts.headers, &token)?;
-            inner
-                .send_multipart::<U>(Request::from_parts(parts, body))
-                .await
-        }
-    }
-
-    fn send_streaming<T>(
-        &self,
-        req: Request<T>,
-    ) -> impl std::future::Future<Output = http_client::Result<http_client::StreamingResponse>>
-    + WasmCompatSend
-    where
-        T: Into<Bytes> + WasmCompatSend,
-    {
-        let inner = self.inner.clone();
-        let auth = self.auth.clone();
-        // Same `instructions` reshaping as `send` — collapse to `Bytes` so we can
-        // rewrite the JSON, then hand a `Request<Bytes>` to the inner backend.
-        let (parts, body) = req.into_parts();
-        let body = adapt_codex_body(body.into());
-        async move {
-            let token = auth.resolve().await.map_err(auth_error)?;
-            let mut parts = parts;
-            set_bearer(&mut parts.headers, &token)?;
-            let mut resp = inner
-                .send_streaming::<Bytes>(Request::from_parts(parts, body))
-                .await?;
-            // The Codex backend streams a valid SSE body but omits the
-            // `Content-Type` header, which rig's SSE reader requires. Stamp the
-            // known-correct type so the stream is accepted.
-            if !resp.headers().contains_key(http::header::CONTENT_TYPE) {
-                resp.headers_mut().insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/event-stream"),
-                );
-            }
-            Ok(resp)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -814,63 +601,6 @@ mod tests {
         assert_eq!(t.access_token, "at");
         assert_eq!(t.refresh_token, "rt");
         assert_eq!(t.account_id.as_deref(), Some("acc"));
-    }
-
-    #[test]
-    fn adapt_lifts_system_message_into_instructions() {
-        let body = serde_json::json!({
-            "model": "gpt-5.5",
-            "input": [
-                { "role": "system", "type": "message",
-                  "content": [{ "type": "input_text", "text": "Be terse." }] },
-                { "role": "user", "type": "message",
-                  "content": [{ "type": "input_text", "text": "hi" }] }
-            ]
-        });
-        let out = adapt_codex_body(Bytes::from(serde_json::to_vec(&body).unwrap()));
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["instructions"], "Be terse.");
-        let input = v["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1, "system message lifted out of input");
-        assert_eq!(input[0]["role"], "user");
-    }
-
-    #[test]
-    fn adapt_synthesizes_instructions_when_no_system_message() {
-        let body = serde_json::json!({
-            "model": "gpt-5.5",
-            "input": [
-                { "role": "user", "type": "message",
-                  "content": [{ "type": "input_text", "text": "hi" }] }
-            ]
-        });
-        let out = adapt_codex_body(Bytes::from(serde_json::to_vec(&body).unwrap()));
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert!(
-            v["instructions"].as_str().is_some_and(|s| !s.is_empty()),
-            "a non-empty instructions field is always present"
-        );
-    }
-
-    #[test]
-    fn adapt_leaves_non_responses_body_untouched() {
-        let raw = Bytes::from_static(b"{\"grant_type\":\"refresh_token\"}");
-        assert_eq!(adapt_codex_body(raw.clone()), raw);
-        let not_json = Bytes::from_static(b"not json");
-        assert_eq!(adapt_codex_body(not_json.clone()), not_json);
-    }
-
-    #[test]
-    fn adapt_preserves_existing_instructions() {
-        let body = serde_json::json!({
-            "instructions": "keep me",
-            "input": [{ "role": "system", "type": "message",
-                        "content": [{ "type": "input_text", "text": "nope" }] }]
-        });
-        let out = adapt_codex_body(Bytes::from(serde_json::to_vec(&body).unwrap()));
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["instructions"], "keep me");
-        assert_eq!(v["input"].as_array().unwrap().len(), 1, "input untouched");
     }
 
     #[test]

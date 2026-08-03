@@ -4,28 +4,23 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use rig::{
-    OneOrMany,
-    client::{ClientBuilder, CompletionClient},
-    completion::{
-        AssistantContent, CompletionModel, CompletionRequestBuilder, GetTokenUsage,
-        Message as RigMessage, ToolDefinition, Usage,
-        message::{ToolResultContent, UserContent},
-    },
-    providers::{anthropic, deepseek, openai, openrouter},
-};
 use serde_json::{Value, json};
 
 use crate::{
     config::{ModelConfig, Provider, split_model_id},
     domain::{
-        llm::{LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
+        llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
         message::{Message, Role},
         session::Session,
     },
-    infra::codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
-    services::{memory_enrichment::MemoryEnricher, tool_execution::retry::should_retry},
+    infra::{
+        codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers},
+        provider::{
+            AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind,
+            ProviderClient, ToolSchema, Turn, UserBlock, Wire,
+        },
+    },
+    services::memory_enrichment::MemoryEnricher,
 };
 
 /// Produces the system prompt (preamble) on demand. Called once per user turn
@@ -51,41 +46,28 @@ impl LlmClient for UnconfiguredLlm {
     }
 }
 
-/// Generic [`LlmClient`] over any `rig` completion model. The concrete provider
-/// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
+/// A [`LlmClient`] over one provider, via komo's own provider layer
+/// (`infra::provider`).
 ///
-/// komo talks to the provider's [`CompletionModel`] directly rather than through
-/// rig's `Agent`: since 0.41 a configured `Agent` runs exclusively through rig's
-/// own `AgentRunner` loop, and komo owns the tool loop (`run_agent_loop`), so the
-/// raw per-request API is the matching seam. Everything an `Agent` used to carry
-/// for us — model handle, preamble, tool schemas — lives here instead.
-pub struct RigLlm<M: CompletionModel> {
-    /// Handle for the configured model, minted once at startup — the one a
-    /// session with no `model` override runs on.
-    model: M,
-    /// The provider client the `model` was minted from, kept so a turn whose
-    /// session names a different model can mint a handle for it (via `mint`).
-    /// Only the handle is swapped — tools and preamble stay the ones assembled
-    /// at startup.
-    client: Arc<M::Client>,
-    /// Mints a model handle for a session's model override. Providers whose
-    /// handles carry per-handle switches install a closure that re-applies
-    /// them — Anthropic's prompt-caching flag would otherwise be silently
-    /// dropped the moment a session switched models (`M::make` builds a bare
-    /// handle). Everyone else uses `M::make` verbatim.
-    mint: Arc<dyn Fn(&M::Client, &str) -> M + Send + Sync>,
-    /// Tool schemas advertised to the provider (name + description + parameters).
-    /// Only the *declaration* goes over the wire: komo dispatches every requested
-    /// call itself in `ToolExecutor::execute_round`, so rig never runs a tool.
-    tools: Vec<ToolDefinition>,
+/// komo owns the tool loop (`run_agent_loop`), so what this needs from a
+/// provider is exactly one completion per call. Everything a client library used
+/// to hold for us — the model handle, the preamble, the tool schemas — is a plain
+/// field here, and switching model within a provider is a `String` swap rather
+/// than minting a new typed handle.
+pub struct ProviderLlm {
+    client: Arc<ProviderClient>,
+    /// Tool schemas advertised to the provider. Only the *declaration* goes over
+    /// the wire: komo dispatches every requested call itself in
+    /// `ToolExecutor::execute_round`.
+    tools: Vec<ToolSchema>,
     /// The configured model: what a session with no override runs on.
     default_model: String,
     /// Which provider this is, for mapping a session's reasoning-effort level
     /// onto request params (see [`reasoning_params`]).
     provider: Provider,
     /// Prompt-cache family this backend's turns belong to, when it is not the
-    /// session (see [`RigLlm::model_for`]). `None` — the main agent — keys the
-    /// cache by session id; a backend whose sessions are one-shot but whose
+    /// session (see [`ProviderLlm::model_for`]). `None` — the main agent — keys
+    /// the cache by session id; a backend whose sessions are one-shot but whose
     /// prompt prefix is always the same names its family here so those turns
     /// share one warm prefix instead of each cold-starting.
     cache_family: Option<String>,
@@ -94,7 +76,7 @@ pub struct RigLlm<M: CompletionModel> {
     /// Max prior messages replayed as history per turn (config
     /// `max_history_messages`; `0` = unlimited). The backstop against a
     /// long-lived chat session sending its entire transcript every turn — see
-    /// [`RigLlm::assemble`].
+    /// [`ProviderLlm::assemble`].
     max_history_messages: usize,
     /// Byte budget for the replayed history (`0` = unlimited). The message-count
     /// window alone can't bound context: a handful of pasted logs or diffs blows
@@ -106,16 +88,8 @@ pub struct RigLlm<M: CompletionModel> {
     /// enricher owns the whole memory policy (selection, screening, rendering,
     /// usage tracking); this adapter only appends the finished prefix.
     enricher: Option<Arc<MemoryEnricher>>,
-    /// Drive each round over the streaming API instead of one-shot `send()`.
-    /// Required by the ChatGPT Codex backend (it rejects non-streamed requests);
-    /// `false` for every other provider, which keeps the simpler non-streaming
-    /// path. The streamed chunks are aggregated back into one assistant turn, so
-    /// the rest of the loop is identical either way.
-    stream: bool,
-    /// Per-completion timeout. rig's default reqwest client sets no request
-    /// timeout, so a hung provider request would await forever and wedge the
-    /// turn in `running`; this caps each completion so a stall fails the turn
-    /// cleanly instead. `None` = no timeout (config `llm_timeout_secs = 0`).
+    /// Per-completion timeout, bounding all attempts of one round together.
+    /// `None` = no timeout (config `llm_timeout_secs = 0`).
     timeout: Option<Duration>,
 }
 
@@ -123,40 +97,35 @@ pub struct RigLlm<M: CompletionModel> {
 /// (1 initial + retries). A constant rather than config, for the same reason the
 /// tool executor's is: transient retry is an internal robustness backstop.
 const LLM_RETRY_MAX_ATTEMPTS: usize = 4;
-/// Backoff before each retry, indexed by retry number (last entry reused).
+/// Local backoff before each retry, indexed by retry number (last entry reused).
 ///
-/// Sized for what actually fails here: the usual transient completion failure is
-/// provider rate limiting, which takes seconds to tens of seconds to clear, so
-/// the old quarter-second-then-two-seconds table ran out its attempts while the
-/// limit was still in force and the turn died anyway. Reading the response's
-/// `Retry-After` would be better still, but rig hands the caller an `anyhow`
-/// chain over `CompletionError`, so honoring the header means downcasting and
-/// digging per provider — a wide enough budget covers the same ground.
+/// A *fallback*: when the provider tells us how long to wait
+/// ([`LlmError::retry_after`]) that always wins, because a server reporting when
+/// its limit clears is more accurate than any table. This covers the failures
+/// that carry no such hint — connection resets, 5xx, a stalled stream — and is
+/// sized for the one that does not: a rate limit with no `Retry-After` takes
+/// seconds to tens of seconds to clear, so a quarter-second-then-two-seconds
+/// table would run out its attempts while the limit was still in force.
 ///
 /// Total backoff (21s) stays well inside the round's `llm_timeout_secs` budget,
 /// which bounds all attempts together (see [`with_retry`]).
 const LLM_RETRY_BACKOFF_MS: [u64; 3] = [1_000, 5_000, 15_000];
 
-/// Re-run `attempt` while its failure looks transient, bounded by
+/// Re-run `attempt` while its failure is retryable, bounded by
 /// [`LLM_RETRY_MAX_ATTEMPTS`].
 ///
-/// Without this, the single most failure-prone call in a turn was the only one
-/// with no retry: tool calls have classified retry (`tool_execution::retry`),
-/// while one 429 or connection reset on round 11 of a long tool chain threw away
-/// all ten rounds of work and handed the user a failure placeholder. A completion
-/// has no side effect that could double-apply, so it is idempotent by
-/// construction — both connection-level and ambiguous failures are safe to
-/// re-send, and the classifier is shared with the tool path so the two can't
-/// drift on what "transient" means.
+/// Retryability is the error's own answer ([`LlmError::is_retryable`]) rather
+/// than a guess from its text, and the delay is the server's when it gave one.
+/// A completion has no side effect that could double-apply, so re-sending is
+/// safe by construction.
 ///
 /// Deliberately nested *inside* [`with_timeout`] by every caller: the configured
 /// timeout is then a budget for the whole round (attempts included), so retrying
-/// can't multiply a turn's worst-case latency, and our own timeout error — whose
-/// text would otherwise classify as ambiguous — is never itself retried.
-async fn with_retry<F, Fut, T>(mut attempt: F) -> anyhow::Result<T>
+/// can't multiply a turn's worst-case latency.
+async fn with_retry<F, Fut, T>(mut attempt: F) -> Result<T, LlmError>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = Result<T, LlmError>>,
 {
     let mut retries = 0usize;
     loop {
@@ -164,51 +133,57 @@ where
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        if retries + 1 >= LLM_RETRY_MAX_ATTEMPTS || !should_retry(&error, true) {
+        if retries + 1 >= LLM_RETRY_MAX_ATTEMPTS || !error.is_retryable() {
             return Err(error);
         }
-        let delay = LLM_RETRY_BACKOFF_MS[retries.min(LLM_RETRY_BACKOFF_MS.len() - 1)];
+        // The provider's own answer beats the table. This is the whole point of
+        // carrying `retry_after` on the error: under a real rate limit the
+        // server knows when it clears and we do not.
+        let delay = error.retry_after.unwrap_or_else(|| {
+            Duration::from_millis(LLM_RETRY_BACKOFF_MS[retries.min(LLM_RETRY_BACKOFF_MS.len() - 1)])
+        });
         tracing::warn!(
             attempt = retries + 1,
-            delay_ms = delay,
-            error = %format!("{error:#}"),
-            "transient LLM failure; retrying the completion"
+            delay_ms = delay.as_millis(),
+            kind = ?error.kind,
+            server_paced = error.retry_after.is_some(),
+            error = %error,
+            "retryable LLM failure; retrying the completion"
         );
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        tokio::time::sleep(delay).await;
         retries += 1;
     }
 }
 
 /// Run `fut` under `timeout` (if set), turning a stall into a clean error rather
-/// than an indefinite await. Shared by the tool-less `complete` path and every
-/// tool-loop round. Wraps [`with_retry`], so the budget covers every attempt of
-/// one round rather than each attempt separately.
-async fn with_timeout<F, T>(timeout: Option<Duration>, fut: F) -> anyhow::Result<T>
+/// than an indefinite await. Wraps [`with_retry`], so the budget covers every
+/// attempt of one round rather than each attempt separately.
+async fn with_timeout<F, T>(timeout: Option<Duration>, fut: F) -> Result<T, LlmError>
 where
-    F: Future<Output = anyhow::Result<T>>,
+    F: Future<Output = Result<T, LlmError>>,
 {
     match timeout {
         Some(d) => match tokio::time::timeout(d, fut).await {
             Ok(result) => result,
-            Err(_) => anyhow::bail!(
-                "LLM completion timed out after {}s (provider unresponsive; \
-                 failing the turn instead of leaving it running — raise \
-                 `llm_timeout_secs` / `KOMO_LLM_TIMEOUT_SECS` if this is too tight)",
-                d.as_secs()
-            ),
+            Err(_) => Err(LlmError::new(
+                LlmErrorKind::Timeout,
+                format!(
+                    "LLM completion timed out after {}s (provider unresponsive; \
+                     failing the turn instead of leaving it running — raise \
+                     `llm_timeout_secs` / `KOMO_LLM_TIMEOUT_SECS` if this is too tight)",
+                    d.as_secs()
+                ),
+            )),
         },
         None => fut.await,
     }
 }
 
-/// Cross-provider dispatcher: one type-erased backend per provider, selected by
-/// the session's model id.
+/// Cross-provider dispatcher: one backend per provider, selected by the
+/// session's model id.
 ///
-/// This layer exists because [`RigLlm`] is generic over a *single* provider's
-/// model type (`deepseek::CompletionModel` and `openai::CompletionModel` are
-/// unrelated types), so within-provider switching can happen inside one `RigLlm`
-/// but crossing providers cannot. A qualified id (`deepseek:deepseek-chat`) picks
-/// the backend here; the bare remainder picks the model inside it.
+/// A qualified id (`deepseek:deepseek-chat`) picks the backend here; the bare
+/// remainder picks the model inside it.
 ///
 /// An unqualified id — or one naming a provider this gateway has no client for —
 /// falls through to the default backend rather than failing the turn: the api
@@ -245,8 +220,12 @@ impl LlmClient for RoutingLlm {
         self.route(session).complete(session).await
     }
 
-    async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
-        self.route(session).begin_turn(session).await
+    async fn begin_turn(
+        &self,
+        session: &Session,
+        deltas: Option<Arc<dyn DeltaSink>>,
+    ) -> anyhow::Result<Box<dyn TurnDriver>> {
+        self.route(session).begin_turn(session, deltas).await
     }
 }
 
@@ -258,23 +237,20 @@ const THINKING_ANSWER_HEADROOM: u64 = 8_192;
 /// when this provider/level pair has no effect.
 ///
 /// Which levels a provider offers is [`Provider::efforts`]; this is the other
-/// half — how a level is actually spelled on the wire. Both paths merge the
-/// result into the agent's `additional_params`, which every provider flattens
-/// into the request body.
+/// half — how a level is actually spelled on the wire.
 fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
     let level = match effort.trim() {
         level @ ("low" | "medium" | "high") => level,
         _ => return None,
     };
     match provider {
-        // The OpenAI Responses API (which Codex speaks too) and OpenRouter both
-        // take `reasoning.effort` verbatim.
+        // Every Responses-API provider takes `reasoning.effort` verbatim.
         Provider::OpenAi | Provider::OpenRouter | Provider::Codex => {
             Some(json!({ "reasoning": { "effort": level } }))
         }
         // Anthropic has no effort scale — it budgets thinking in tokens, so the
         // levels map onto budgets. The caller must also raise `max_tokens` above
-        // the budget (thinking is charged against it): see `agent_for`.
+        // the budget (thinking is charged against it): see `model_for`.
         Provider::Anthropic => {
             let budget = match level {
                 "low" => 4_096,
@@ -288,9 +264,7 @@ fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
     }
 }
 
-/// Shallow-merge `extra`'s top-level keys into `base` (extra wins). Anything
-/// non-object on either side is replaced outright, which is all the agent's
-/// `additional_params` ever holds.
+/// Shallow-merge `extra`'s top-level keys into `base` (extra wins).
 fn merge_params(base: Option<Value>, extra: Value) -> Value {
     match (base, extra) {
         (Some(Value::Object(mut base)), Value::Object(extra)) => {
@@ -301,13 +275,7 @@ fn merge_params(base: Option<Value>, extra: Value) -> Value {
     }
 }
 
-impl<M> RigLlm<M>
-where
-    M: CompletionModel + 'static,
-    // The retained provider client crosses the gateway's per-turn tasks, so it
-    // has to be shareable — every rig provider client is.
-    M::Client: Send + Sync + 'static,
-{
+impl ProviderLlm {
     /// Assemble this turn's `(preamble, prompt, history)`: split the session
     /// into the latest user prompt + prior history, rebuild the system prompt,
     /// and inject the memory blocks (main agent only) — pinned into the
@@ -326,16 +294,13 @@ where
     ///
     /// Break it and the provider prefix cache dies quietly: a message whose
     /// bytes change is a divergence point, and everything after it is recomputed
-    /// on every request for the rest of the turn (see [`to_rig_message`], which
-    /// used to break exactly this way). The two places that legitimately vary
-    /// per turn — where the window *starts*, and the memory blocks — are handled
-    /// so that they don't rewrite anything: the cut snaps to a content-derived
-    /// anchor ([`window_history`]), and recall is appended at the tail rather
-    /// than folded into the prefix (below).
-    async fn assemble(
-        &self,
-        session: &Session,
-    ) -> anyhow::Result<(String, String, Vec<RigMessage>)> {
+    /// on every request for the rest of the turn (see [`to_turn`], which used to
+    /// break exactly this way). The two places that legitimately vary per turn —
+    /// where the window *starts*, and the memory blocks — are handled so that
+    /// they don't rewrite anything: the cut snaps to a content-derived anchor
+    /// ([`window_history`]), and recall is appended at the tail rather than
+    /// folded into the prefix (below).
+    async fn assemble(&self, session: &Session) -> anyhow::Result<(String, String, Vec<Turn>)> {
         // The current prompt is the most recent user message; everything before
         // it forms the conversation history sent to the model.
         let last_user_idx = session
@@ -357,7 +322,7 @@ where
             self.max_history_messages,
             self.max_history_bytes,
         );
-        let history: Vec<RigMessage> = window.iter().filter_map(to_rig_message).collect();
+        let history: Vec<Turn> = window.iter().filter_map(to_turn).collect();
 
         // Rebuild the system prompt for this turn. It rides on the per-turn
         // request rather than on shared state, so concurrent sessions in the
@@ -394,39 +359,28 @@ where
     /// Resolve this turn's model settings: the assembled preamble, then the
     /// session's own model / reasoning-effort choices.
     ///
-    /// A model handle is cheap to clone (`Arc`-backed provider client + a model
-    /// id), so per-session settings land on a private [`TurnModel`] — concurrent
-    /// sessions in the gateway never see each other's.
-    ///
     /// Only the *main* agent is ever handed a stored session: every aux path
     /// (reviewer, delegate, recall screening, sweeps) builds a synthetic
     /// `Session`, whose overrides are empty. That is what keeps a conversation's
     /// model choice from leaking onto the aux model.
-    fn model_for(&self, preamble: String, session: &Session) -> TurnModel<M> {
-        let mut turn = TurnModel {
-            model: self.model.clone(),
-            preamble,
-            max_tokens: None,
-            additional_params: None,
-        };
-
+    fn model_for(&self, preamble: String, session: &Session) -> TurnModel {
         // A session's model may be provider-qualified (`deepseek:deepseek-chat`).
         // Routing on the prefix is `RoutingLlm`'s job — by the time we get here
-        // the provider is already decided, so only the bare id matters. Stripping
-        // it here (rather than rewriting the session upstream) avoids cloning the
-        // whole transcript just to change one field.
-        if let Some(name) = session
+        // the provider is already decided, so only the bare id matters.
+        let model = session
             .model_override()
-            .map(|id| split_model_id(id).1)
-            .filter(|name| *name != self.default_model)
-        {
-            turn.model = (self.mint)(&self.client, name);
-        }
+            .map(|id| split_model_id(id).1.to_string())
+            .unwrap_or_else(|| self.default_model.clone());
+        let mut turn = TurnModel {
+            model,
+            preamble,
+            extra: None,
+        };
 
-        // OpenAI's Responses API (which Codex speaks too) caches by prefix
-        // automatically, but shard routing is best-effort; `prompt_cache_key`
-        // pins related requests to the same cache shard — the Codex CLI itself
-        // sends its session id here for the same reason.
+        // The Responses API caches by prefix automatically, but shard routing is
+        // best-effort; `prompt_cache_key` pins related requests to the same
+        // cache shard — the Codex CLI itself sends its session id here for the
+        // same reason.
         //
         // What the key must identify is the *prefix family*, not the
         // conversation: two requests share a cache only if their
@@ -440,11 +394,12 @@ where
         // the *parent's* key would be the other mistake: a frequent side query
         // would evict the conversation's own prefix.
         //
-        // Only these two providers: the key is a Responses API parameter, and
-        // Anthropic/DeepSeek reject or ignore unknown request fields.
-        if matches!(self.provider, Provider::OpenAi | Provider::Codex) {
-            turn.additional_params = Some(merge_params(
-                turn.additional_params.take(),
+        // Anthropic has no such parameter (it caches from explicit
+        // `cache_control` breakpoints, which `provider::messages` marks) and
+        // rejects unknown request fields, so it is excluded.
+        if self.client.wire == Wire::Responses {
+            turn.extra = Some(merge_params(
+                turn.extra.take(),
                 json!({
                     "prompt_cache_key": cache_key(self.cache_family.as_deref(), &session.id)
                 }),
@@ -462,53 +417,32 @@ where
                 .and_then(|thinking| thinking.get("budget_tokens"))
                 .and_then(Value::as_u64)
             {
-                let needed = budget + THINKING_ANSWER_HEADROOM;
-                turn.max_tokens = Some(turn.max_tokens.unwrap_or(0).max(needed));
+                turn.extra = Some(merge_params(
+                    turn.extra.take(),
+                    json!({ "max_tokens": budget + THINKING_ANSWER_HEADROOM }),
+                ));
             }
-            turn.additional_params = Some(merge_params(turn.additional_params.take(), params));
+            turn.extra = Some(merge_params(turn.extra.take(), params));
         }
         turn
     }
 }
 
-/// One turn's model settings: which handle runs it, the system prompt assembled
+/// One turn's model settings: which model runs it, the system prompt assembled
 /// for it, and the request knobs the session's reasoning-effort choice implies.
 ///
-/// This is the per-turn state rig's `Agent` used to hold for us. Requests are
-/// built off it round by round, so a round is exactly one provider completion and
-/// komo's loop stays in charge of what happens between rounds.
-struct TurnModel<M: CompletionModel> {
-    model: M,
+/// Requests are built off this round by round, so a round is exactly one
+/// provider completion and komo's loop stays in charge of what happens between
+/// rounds.
+struct TurnModel {
+    model: String,
     preamble: String,
-    max_tokens: Option<u64>,
-    additional_params: Option<Value>,
-}
-
-impl<M: CompletionModel> TurnModel<M> {
-    /// Build one round's request: `history + prompt` under this turn's preamble,
-    /// with `tools` advertised as declarations only (komo dispatches the calls).
-    fn request(
-        &self,
-        prompt: RigMessage,
-        history: Vec<RigMessage>,
-        tools: &[ToolDefinition],
-    ) -> CompletionRequestBuilder<M> {
-        self.model
-            .completion_request(prompt)
-            .preamble(self.preamble.clone())
-            .messages(history)
-            .tools(tools.to_vec())
-            .max_tokens_opt(self.max_tokens)
-            .additional_params_opt(self.additional_params.clone())
-    }
+    /// Extra top-level request fields, merged over the codec's defaults.
+    extra: Option<Value>,
 }
 
 #[async_trait]
-impl<M> LlmClient for RigLlm<M>
-where
-    M: CompletionModel + 'static,
-    M::Client: Send + Sync + 'static,
-{
+impl LlmClient for ProviderLlm {
     async fn complete(&self, session: &Session) -> anyhow::Result<String> {
         // Tool-less by contract: this is the single-shot path for aux callers
         // (reviewer / recall screening / briefing fallback), and it advertises no
@@ -516,33 +450,44 @@ where
         // must not be able to ask for one. One completion is the whole answer.
         let (preamble, prompt, history) = self.assemble(session).await?;
         let turn = self.model_for(preamble, session);
-        let (choice, _, _) = with_timeout(
+        let mut history = history;
+        history.push(Turn::user(prompt));
+        let completion = with_timeout(
             self.timeout,
             with_retry(|| {
-                complete_once(
-                    &turn,
+                self.client.complete(
+                    &turn.model,
+                    &turn.preamble,
+                    &history,
                     &[],
-                    RigMessage::user(prompt.clone()),
-                    history.clone(),
-                    self.stream,
+                    turn.extra.as_ref(),
+                    // An aux completion has no watcher by construction — it is a
+                    // side query on a synthetic session, not the conversation.
+                    None,
                 )
             }),
         )
         .await?;
-        Ok(choice_text(&choice))
+        Ok(completion.text())
     }
 
-    async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+    async fn begin_turn(
+        &self,
+        session: &Session,
+        deltas: Option<Arc<dyn DeltaSink>>,
+    ) -> anyhow::Result<Box<dyn TurnDriver>> {
         let (preamble, prompt, history) = self.assemble(session).await?;
-        Ok(Box::new(RigTurnDriver {
+        Ok(Box::new(TurnLoop {
+            client: self.client.clone(),
             turn: self.model_for(preamble, session),
             tools: self.tools.clone(),
             history,
-            pending: Some(RigMessage::user(prompt)),
-            stream: self.stream,
+            pending: Some(Turn::user(prompt)),
             timeout: self.timeout,
             usage: TokenUsage::default(),
             degraded: false,
+            deltas,
+            rounds: 0,
         }))
     }
 }
@@ -554,28 +499,33 @@ const INTERJECTION_PREFIX: &str = "The user sent this while you were working —
      take it into account before your next step:\n";
 
 /// A [`TurnDriver`] over a per-turn [`TurnModel`]. Holds the growing conversation
-/// history (excluding the not-yet-sent prompt) so each round is a single provider
-/// completion — rig does one round-trip, komo owns the loop.
-struct RigTurnDriver<M: CompletionModel> {
-    turn: TurnModel<M>,
-    /// Tool schemas re-sent every round (see [`RigLlm::tools`]).
-    tools: Vec<ToolDefinition>,
-    history: Vec<RigMessage>,
+/// history so each round is a single provider completion — one round-trip per
+/// round, komo owns the loop.
+struct TurnLoop {
+    client: Arc<ProviderClient>,
+    turn: TurnModel,
+    /// Tool schemas re-sent every round (see [`ProviderLlm::tools`]).
+    tools: Vec<ToolSchema>,
+    history: Vec<Turn>,
     /// The opening prompt; consumed by `first()`, then `None`.
-    pending: Option<RigMessage>,
-    /// Stream each round instead of one-shot `send()` (see [`RigLlm::stream`]).
-    stream: bool,
-    /// Per-round completion timeout (see [`RigLlm::timeout`]).
+    pending: Option<Turn>,
+    /// Per-round completion timeout (see [`ProviderLlm::timeout`]).
     timeout: Option<Duration>,
     /// Tokens spent so far this turn, summed over rounds; read by the runtime for
     /// the ledger once the turn ends.
     usage: TokenUsage,
     /// Whether this turn already spent its one context-overflow degrade (see
-    /// [`RigTurnDriver::degrade_for_overflow`]). Once used, a second overflow
+    /// [`TurnLoop::degrade_for_overflow`]). Once used, a second overflow
     /// fails the turn: the first degrade is a real reclaim, so if the request
     /// is *still* too large the shortfall is structural and retrying only burns
     /// another round-trip on a request that cannot fit.
     degraded: bool,
+    /// Where to stream this turn's output as it is produced. `None` when nothing
+    /// is watching, which is most turns — and then no per-chunk work happens at
+    /// all.
+    deltas: Option<Arc<dyn DeltaSink>>,
+    /// Model round-trips this turn has made, for the per-round token log.
+    rounds: usize,
 }
 
 /// Bytes of a tool result kept when a turn is degraded for overflow — the head
@@ -585,88 +535,93 @@ struct RigTurnDriver<M: CompletionModel> {
 /// discards a copy, not the only copy.
 const OVERFLOW_TOOL_RESULT_KEEP: usize = 4 * 1024;
 
-/// Whether `error` reads as "the request did not fit in the model's context".
-///
-/// String matching, because rig collapses provider errors into
-/// `CompletionError::ProviderError(String)` / a raw response body — there is no
-/// typed overflow variant to match on, and komo sits behind rig rather than
-/// owning the HTTP client. Deliberately broad: a false positive costs one
-/// degraded retry, a false negative costs the whole turn.
-fn is_context_overflow(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_lowercase();
-    [
-        "context length",
-        "context_length_exceeded",
-        "maximum context",
-        "prompt is too long",
-        "too many tokens",
-        "reduce the length of the messages",
-        "input length and `max_tokens` exceed",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
-
-impl<M> RigTurnDriver<M>
-where
-    M: CompletionModel + 'static,
-{
-    /// Send one round-trip: complete over `history + prompt`, then commit the
-    /// assistant turn (verbatim — text + tool calls + reasoning together) to
-    /// history so the next round sees a provider-correct transcript.
+impl TurnLoop {
+    /// Send one round-trip: complete over `history`, then commit the assistant
+    /// turn (verbatim — text + tool calls + reasoning together) to history so the
+    /// next round sees a provider-correct transcript.
     ///
-    /// The prompt is pushed onto `history` up front and split back off a single
-    /// clone per attempt. A request builder takes prompt and history by value, so
-    /// one clone of the round's messages is unavoidable; what this avoids is
-    /// cloning the prompt *separately* from the history it will join, and it keeps
-    /// every retry attempt reading one source of truth for the round's transcript.
-    async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
+    /// Committing reasoning verbatim is what carries a reasoning model's chain of
+    /// thought across the tool loop: the provider hands back an opaque blob, and
+    /// echoing it into the next request is the only way the model picks up where
+    /// it left off instead of re-deriving its plan every round.
+    async fn run(&mut self, prompt: Turn) -> anyhow::Result<Step> {
         self.history.push(prompt);
 
-        let (choice, message_id, usage) = match self.complete_round().await {
-            Ok(outcome) => outcome,
+        let completion = match self.complete_round().await {
+            Ok(completion) => completion,
             // Overflowing the context window is not transient — `with_retry`
             // correctly refuses to re-send the same oversized request — but it
             // is recoverable, because most of what fills a long turn is tool
             // output the model has already read once. Reclaim that and try the
             // round again rather than losing every round of work before it.
-            Err(error) if is_context_overflow(&error) && self.degrade_for_overflow() => {
+            Err(error) if error.is_context_overflow() && self.degrade_for_overflow() => {
                 tracing::warn!(
                     "context window exceeded; retrying this round on a degraded history"
                 );
                 self.complete_round().await?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
 
-        self.usage.add(usage);
-        self.history.push(RigMessage::Assistant {
-            id: message_id,
-            content: choice.clone(),
+        self.usage.add(TokenUsage {
+            input: completion.usage.input,
+            output: completion.usage.output,
         });
-        Ok(choice_to_step(&choice))
+        self.rounds += 1;
+        // Per-round token accounting, which is the only honest way to tune the
+        // context knobs: `max_history_bytes` and `max_turn_result_bytes` are
+        // *byte* budgets, and bytes are a poor proxy for tokens (CJK spends ~3
+        // bytes per token, code closer to 3.5), so the caps can only be set from
+        // data. `cached` is the payoff of the prefix-cache work in `assemble` —
+        // a round where it stays near zero across a tool loop means the prefix is
+        // being invalidated and something upstream broke the render invariant.
+        tracing::debug!(
+            round = self.rounds,
+            input = completion.usage.input,
+            output = completion.usage.output,
+            cached = completion.usage.cached_input,
+            turn_input = self.usage.input,
+            turn_output = self.usage.output,
+            "model round completed"
+        );
+        let step = blocks_to_step(&completion.blocks);
+        self.history.push(Turn::Assistant {
+            id: completion.id,
+            blocks: completion.blocks,
+        });
+        Ok(step)
     }
 
-    /// One provider round-trip over the history as it currently stands (the
-    /// round's prompt is the last entry). Split out of [`run`] so an overflow
-    /// can re-issue the identical call against a reclaimed history.
+    /// One provider round-trip over the history as it currently stands. Split out
+    /// of [`run`] so an overflow can re-issue the identical call against a
+    /// reclaimed history.
     ///
     /// [`run`]: Self::run
-    async fn complete_round(
-        &self,
-    ) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>, TokenUsage)> {
-        let stream = self.stream;
-        let turn = &self.turn;
-        let tools = &self.tools;
-        let history = &self.history;
+    async fn complete_round(&self) -> Result<Completion, LlmError> {
+        // Bridge the domain sink onto the provider layer's callback. Built per
+        // round rather than held, so a retry re-streams into the same watcher
+        // without the provider layer ever learning what a session is.
+        let forward = self.deltas.as_ref().map(|sink| {
+            let sink = sink.clone();
+            move |delta: Delta<'_>| match delta {
+                Delta::Text(text) => sink.text(text),
+                Delta::Reasoning(text) => sink.reasoning(text),
+            }
+        });
+        let forward = forward
+            .as_ref()
+            .map(|f| f as &(dyn Fn(Delta<'_>) + Send + Sync));
         with_timeout(
             self.timeout,
-            with_retry(|| async move {
-                let mut messages = history.clone();
-                let prompt = messages
-                    .pop()
-                    .expect("history holds the prompt pushed just above");
-                complete_once(turn, tools, prompt, messages, stream).await
+            with_retry(|| {
+                self.client.complete(
+                    &self.turn.model,
+                    &self.turn.preamble,
+                    &self.history,
+                    &self.tools,
+                    self.turn.extra.as_ref(),
+                    forward,
+                )
             }),
         )
         .await
@@ -684,7 +639,7 @@ where
     /// Returns whether anything was actually reclaimed; `false` means there is
     /// nothing left to give and the caller must surface the failure.
     ///
-    /// At most once per turn — see [`RigTurnDriver::degraded`].
+    /// At most once per turn — see [`TurnLoop::degraded`].
     fn degrade_for_overflow(&mut self) -> bool {
         if self.degraded {
             return false;
@@ -696,52 +651,25 @@ where
 
 /// Shrink `history` in place, returning whether anything was reclaimed. Free
 /// function rather than a method so the policy can be tested without standing
-/// up a provider model — see [`RigTurnDriver::degrade_for_overflow`] for what
-/// it is for.
-fn reclaim_context(history: &mut Vec<RigMessage>) -> bool {
-    {
-        let mut reclaimed = false;
-        for message in history.iter_mut() {
-            let RigMessage::User { content } = message else {
-                continue;
-            };
-            let shrunk: Vec<UserContent> = content
-                .iter()
-                .cloned()
-                .map(|item| match item {
-                    UserContent::ToolResult(mut result) => {
-                        let chunks: Vec<ToolResultContent> = result
-                            .content
-                            .iter()
-                            .cloned()
-                            .map(|chunk| match chunk {
-                                ToolResultContent::Text(text)
-                                    if text.text.len() > OVERFLOW_TOOL_RESULT_KEEP * 2 =>
-                                {
-                                    reclaimed = true;
-                                    ToolResultContent::text(head_tail(
-                                        &text.text,
-                                        OVERFLOW_TOOL_RESULT_KEEP,
-                                    ))
-                                }
-                                other => other,
-                            })
-                            .collect();
-                        if let Ok(chunks) = OneOrMany::many(chunks) {
-                            result.content = chunks;
-                        }
-                        UserContent::ToolResult(result)
-                    }
-                    other => other,
-                })
-                .collect();
-            if let Ok(shrunk) = OneOrMany::many(shrunk) {
-                *content = shrunk;
+/// up a provider client — see [`TurnLoop::degrade_for_overflow`] for what it is
+/// for.
+fn reclaim_context(history: &mut Vec<Turn>) -> bool {
+    let mut reclaimed = false;
+    for turn in history.iter_mut() {
+        let Turn::User(blocks) = turn else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if let UserBlock::ToolResult { text, .. } = block
+                && text.len() > OVERFLOW_TOOL_RESULT_KEEP * 2
+            {
+                *text = head_tail(text, OVERFLOW_TOOL_RESULT_KEEP);
+                reclaimed = true;
             }
         }
-        if reclaimed {
-            return true;
-        }
+    }
+    if reclaimed {
+        return true;
     }
     // Nothing bulky to shrink: the weight is in the replayed conversation
     // itself. Drop the older half, keeping the window opening on a user
@@ -752,10 +680,7 @@ fn reclaim_context(history: &mut Vec<RigMessage>) -> bool {
         return false;
     }
     let mut rest = history.split_off(cut);
-    while rest
-        .first()
-        .is_some_and(|m| matches!(m, RigMessage::Assistant { .. }))
-    {
+    while rest.first().is_some_and(Turn::is_assistant) {
         rest.remove(0);
     }
     if rest.is_empty() {
@@ -768,7 +693,7 @@ fn reclaim_context(history: &mut Vec<RigMessage>) -> bool {
 }
 
 /// The provider cache key for a turn: the backend's declared prefix family when
-/// it has one, else the session. See [`RigLlm::model_for`] for why the two
+/// it has one, else the session. See [`ProviderLlm::model_for`] for why the two
 /// differ.
 fn cache_key(family: Option<&str>, session_id: &str) -> String {
     format!("komo:{}", family.unwrap_or(session_id))
@@ -803,10 +728,7 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
 }
 
 #[async_trait]
-impl<M> TurnDriver for RigTurnDriver<M>
-where
-    M: CompletionModel + 'static,
-{
+impl TurnDriver for TurnLoop {
     async fn first(&mut self) -> anyhow::Result<Step> {
         let prompt = self.pending.take().context("turn driver already started")?;
         self.run(prompt).await
@@ -817,33 +739,29 @@ where
         results: Vec<ToolOutcome>,
         interjected: Option<String>,
     ) -> anyhow::Result<Step> {
-        // One user message carrying every tool result, mirroring rig's own
-        // `tool_result_user_content`: key by `call_id` when present (OpenAI),
-        // else `id` (Anthropic).
-        let contents: Vec<UserContent> = results
+        // One user message carrying every tool result. A komo tool's model-facing
+        // result is plain text by contract (`domain::tool::ToolOutput::text`), so
+        // each goes over as one text payload — no sniffing for an image or
+        // multipart envelope.
+        let mut blocks: Vec<UserBlock> = results
             .into_iter()
-            .map(|r| {
-                // A komo tool's model-facing result is plain text by contract
-                // (`domain::tool::ToolOutput::text`), so it goes over as one text
-                // block — no sniffing the payload for an image/multipart envelope.
-                let content = OneOrMany::one(ToolResultContent::text(r.content));
-                match r.call_id {
-                    Some(call_id) => UserContent::tool_result_with_call_id(r.id, call_id, content),
-                    None => UserContent::tool_result(r.id, content),
-                }
+            .map(|r| UserBlock::ToolResult {
+                id: r.id,
+                call_id: r.call_id,
+                text: r.content,
             })
             .collect();
-        let mut contents = contents;
         // What the user said while this round ran, appended to the same user
         // message as a plain text block — after the results, so the model reads
         // the outcome first and the new instruction last (the position it acts
         // on). Labelled, or a bare sentence next to tool output reads as data.
         if let Some(text) = interjected {
-            contents.push(UserContent::text(format!("{INTERJECTION_PREFIX}{text}")));
+            blocks.push(UserBlock::Text(format!("{INTERJECTION_PREFIX}{text}")));
         }
-        let content = OneOrMany::many(contents)
-            .map_err(|_| anyhow::anyhow!("no tool results to send back"))?;
-        self.run(RigMessage::User { content }).await
+        if blocks.is_empty() {
+            anyhow::bail!("no tool results to send back");
+        }
+        self.run(Turn::User(blocks)).await
     }
 
     fn usage(&self) -> TokenUsage {
@@ -851,87 +769,33 @@ where
     }
 }
 
-/// rig's per-response usage in komo's ledger units. A provider that reports
-/// nothing yields zeros, which the ledger already reads as *unknown*.
-fn token_usage(usage: &Usage) -> TokenUsage {
-    TokenUsage {
-        input: usage.input_tokens as i64,
-        output: usage.output_tokens as i64,
-    }
-}
-
-/// One provider round-trip, returning the assistant turn as
-/// `(choice, message_id, usage)`.
-///
-/// `stream` picks the transport, not the semantics: backends that require
-/// streaming (Codex) get their deltas aggregated back into the same triple the
-/// one-shot `send()` yields, so every caller downstream is identical either way.
-async fn complete_once<M>(
-    turn: &TurnModel<M>,
-    tools: &[ToolDefinition],
-    prompt: RigMessage,
-    history: Vec<RigMessage>,
-    stream: bool,
-) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>, TokenUsage)>
-where
-    M: CompletionModel + 'static,
-{
-    let request = turn.request(prompt, history, tools);
-    if !stream {
-        let resp = request.send().await.context("LLM completion failed")?;
-        return Ok((resp.choice, resp.message_id, token_usage(&resp.usage)));
-    }
-    // rig accumulates the streamed deltas into `choice`/`message_id` as the inner
-    // stream drains, so we consume every chunk (surfacing any provider error) and
-    // then read the final aggregate.
-    let mut stream = request.stream().await.context("LLM completion failed")?;
-    while let Some(item) = stream.next().await {
-        item.context("LLM completion failed")?;
-    }
-    // Usage rides on the provider's final response frame, which not every
-    // provider sends — absent means unknown, same as zeros.
-    let usage = stream
-        .response
-        .as_ref()
-        .map(|r| token_usage(&r.token_usage()))
-        .unwrap_or_default();
-    Ok((stream.choice.clone(), stream.message_id.clone(), usage))
-}
-
-/// Concatenate the text blocks of an assistant turn (ignoring tool calls /
-/// reasoning) — the final answer for a tool-less completion.
-fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
-    let mut text = String::new();
-    for content in choice.iter() {
-        if let AssistantContent::Text(t) = content {
-            text.push_str(&t.text);
-        }
-    }
-    text
-}
-
 /// Split a model's assistant turn into komo's [`Step`]: any tool call makes it
 /// a [`Step::ToolCalls`]; otherwise the concatenated text is the final answer.
-/// Reasoning/image blocks are ignored for control flow (the driver still echoes
-/// them back into history verbatim).
+/// Reasoning blocks are ignored for control flow (the driver still echoes them
+/// back into history verbatim).
 ///
 /// Text found *alongside* tool calls travels with them rather than being dropped:
 /// it is the model narrating what it is about to do, which is the only account of
-/// its reasoning a watcher gets (komo has no token streaming) and the honest thing
-/// to fall back on if the round budget ends the turn early.
-fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
+/// its reasoning a watcher gets and the honest thing to fall back on if the round
+/// budget ends the turn early.
+fn blocks_to_step(blocks: &[AssistantBlock]) -> Step {
     let mut calls = Vec::new();
     let mut text = String::new();
-    for content in choice.iter() {
-        match content {
-            AssistantContent::ToolCall(tc) => calls.push(ToolCallReq {
-                id: tc.id.clone(),
-                call_id: tc.call_id.clone(),
-                name: tc.function.name.clone(),
-                args: tc.function.arguments.to_string(),
+    for block in blocks {
+        match block {
+            AssistantBlock::ToolCall {
+                id,
+                call_id,
+                name,
+                args,
+            } => calls.push(ToolCallReq {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                args: args.clone(),
             }),
-            AssistantContent::Text(t) => text.push_str(&t.text),
-            _ => {}
+            AssistantBlock::Text(t) => text.push_str(t),
+            AssistantBlock::Reasoning(_) => {}
         }
     }
     if calls.is_empty() {
@@ -998,7 +862,7 @@ pub fn build_llm(
     }))
 }
 
-/// Build the backend for exactly one provider (the erased `RigLlm`).
+/// Build the backend for exactly one provider.
 fn build_provider_llm(
     config: &ModelConfig,
     tools: Option<&crate::services::tool_execution::ToolExecutor>,
@@ -1006,7 +870,6 @@ fn build_provider_llm(
     enricher: Option<Arc<MemoryEnricher>>,
     cache_family: Option<&str>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
-    let cache_family = cache_family.map(str::to_string);
     // A missing API key degrades instead of failing construction: a fresh
     // install (first Docker boot, pre-`komo init`) must still bring the
     // gateway up — channels serve, pairing works — while every LLM call
@@ -1022,15 +885,16 @@ fn build_provider_llm(
             ),
         }));
     }
+
     // Only the schemas cross to the provider: the executor stays the single
     // dispatcher, so there is exactly one execution semantics (retry/ledger/cap)
-    // for every tool call, and rig is never in a position to run one.
-    let tool_defs: Vec<ToolDefinition> = tools
+    // for every tool call.
+    let tool_defs: Vec<ToolSchema> = tools
         .map(|executor| {
             executor
                 .definitions()
                 .into_iter()
-                .map(|t| ToolDefinition {
+                .map(|t| ToolSchema {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
                     parameters: t.parameters_schema(),
@@ -1038,140 +902,99 @@ fn build_provider_llm(
                 .collect()
         })
         .unwrap_or_default();
-    let model = config.model.clone();
-    let key = config.api_key.clone();
-    let base = config.base_url.as_deref();
-    let max_history_messages = config.max_history_messages;
-    let max_history_bytes = config.max_history_bytes;
-    // The ChatGPT Codex backend only accepts streamed requests; everyone else
-    // uses the simpler one-shot path. Declared before `rig_llm!` so the macro's
-    // (hygienic) body can capture it alongside `preamble`/`enricher`.
-    let stream = matches!(config.provider, Provider::Codex);
-    // Cap each completion so a hung provider request fails the turn instead of
-    // wedging it in `running` (rig's client sets no request timeout). `0` = off.
-    let timeout =
-        (config.llm_timeout_secs > 0).then(|| Duration::from_secs(config.llm_timeout_secs));
 
-    // Each provider's client/model type differs (erased to `Arc<dyn LlmClient>`
-    // at the end), so the five arms can't share a value — but minting the model
-    // handle and wrapping it in `RigLlm` are identical. This macro factors that
-    // tail out; only one arm runs, so moving `tool_defs`/`preamble`/`enricher`
-    // per arm is fine. `client` is the only thing that varies; `$tune`
-    // (optional) applies per-handle switches — it runs on the startup handle
-    // *and* inside `mint`, so a session's model override keeps the same
-    // switches (Anthropic's prompt-caching flag lives here).
-    macro_rules! rig_llm {
-        ($client:expr) => {
-            rig_llm!($client, |handle| handle)
-        };
-        ($client:expr, $tune:expr) => {{
-            // Retained alongside the handle so a per-session model override can
-            // mint a fresh one for the turn (`RigLlm::model_for`).
-            let client = Arc::new($client);
-            let tune = $tune;
-            let handle = tune(client.completion_model(model.clone()));
-            Arc::new(RigLlm {
-                model: handle,
-                mint: Arc::new(move |client: &_, name: &str| {
-                    tune(CompletionModel::make(client, name))
-                }),
-                client,
-                tools: tool_defs,
-                default_model: model,
-                provider: config.provider,
-                cache_family,
-                preamble,
-                max_history_messages,
-                max_history_bytes,
-                enricher,
-                stream,
-                timeout,
-            }) as Arc<dyn LlmClient>
-        }};
-    }
-
-    let llm: Arc<dyn LlmClient> = match config.provider {
-        Provider::DeepSeek => {
-            let client = with_base_url(deepseek::Client::builder().api_key(key), base)
-                .build()
-                .context("failed to build DeepSeek client")?;
-            rig_llm!(client)
-        }
-        Provider::OpenAi => {
-            let client = with_base_url(openai::Client::builder().api_key(key), base)
-                .build()
-                .context("failed to build OpenAI client")?;
-            rig_llm!(client)
-        }
-        Provider::Anthropic => {
-            let client = with_base_url(anthropic::Client::builder().api_key(key), base)
-                .build()
-                .context("failed to build Anthropic client")?;
-            // Anthropic caches nothing without explicit `cache_control`
-            // breakpoints (unlike OpenAI/DeepSeek's automatic prefix caches),
-            // and rig only writes them when the handle opts in. This marks the
-            // system prompt, the last tool definition, and the last message —
-            // the moving message breakpoint is what lets each tool-loop round
-            // reuse the previous round's prefix.
-            rig_llm!(client, |handle: anthropic::completion::CompletionModel| {
-                handle.with_prompt_caching()
-            })
-        }
-        Provider::OpenRouter => {
-            let client = with_base_url(openrouter::Client::builder().api_key(key), base)
-                .build()
-                .context("failed to build OpenRouter client")?;
-            rig_llm!(client)
-        }
-        Provider::Codex => {
-            // Codex speaks the OpenAI Responses API (rig's default `openai`
-            // client) but at the ChatGPT backend, authenticated with the Codex
-            // CLI's OAuth tokens. `CodexHttpClient` re-stamps a fresh bearer on
-            // every request; the static Cloudflare-dodging headers are baked in
-            // here. `base` (config base_url) overrides the endpoint if set.
-            //
-            // Missing/broken credentials degrade like a missing API key: the
-            // gateway must boot (a fresh box, or a container without
-            // ~/.codex mounted) instead of crash-looping, with every LLM call
-            // reporting the fix as the turn's reply.
-            let auth = match CodexAuth::load() {
-                Ok(auth) => auth,
-                Err(error) => {
-                    tracing::warn!(%error, "Codex credentials unavailable; LLM degraded");
-                    return Ok(Arc::new(UnconfiguredLlm {
-                        message: format!(
-                            "Codex credentials unavailable: {error:#}. Run `codex` to log \
-                             in (it writes ~/.codex/auth.json; $CODEX_HOME honored), then \
-                             restart the gateway."
-                        ),
-                    }));
-                }
-            };
-            let client = openai::Client::builder()
-                .api_key(auth.initial_access_token())
-                .base_url(base.unwrap_or(CODEX_BASE_URL))
-                .http_headers(codex_static_headers(auth.account_id()))
-                .http_client(CodexHttpClient::new(auth))
-                .build()
-                .context("failed to build Codex client")?;
-            rig_llm!(client)
-        }
+    let wire = wire_for(config.provider);
+    // Auth and the static headers are resolved together because Codex's headers
+    // depend on its credentials (the account id rides in one of them).
+    let (auth, headers) = match config.provider {
+        // Codex authenticates from the Codex CLI's OAuth file, and the token
+        // rotates hourly — so it is resolved per request rather than captured
+        // here. Missing/broken credentials degrade like a missing API key: the
+        // gateway must boot (a fresh box, or a container without ~/.codex
+        // mounted) instead of crash-looping, with every LLM call reporting the
+        // fix as the turn's reply.
+        Provider::Codex => match CodexAuth::load() {
+            Ok(auth) => {
+                let headers = codex_static_headers(auth.account_id());
+                (Auth::Dynamic(auth), headers)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex credentials unavailable; LLM degraded");
+                return Ok(Arc::new(UnconfiguredLlm {
+                    message: format!(
+                        "Codex credentials unavailable: {error:#}. Run `codex` to log \
+                         in (it writes ~/.codex/auth.json; $CODEX_HOME honored), then \
+                         restart the gateway."
+                    ),
+                }));
+            }
+        },
+        // Anthropic versions its API by header, not by URL.
+        Provider::Anthropic => (
+            Auth::ApiKey(config.api_key.clone()),
+            vec![(
+                "anthropic-version".to_string(),
+                crate::infra::provider::messages::ANTHROPIC_VERSION.to_string(),
+            )],
+        ),
+        _ => (Auth::Bearer(config.api_key.clone()), Vec::new()),
     };
-    Ok(llm)
+
+    let endpoint = Endpoint {
+        url: endpoint_url(config.provider, config.base_url.as_deref()),
+        auth,
+        headers,
+        client: reqwest::Client::new(),
+    };
+
+    Ok(Arc::new(ProviderLlm {
+        client: Arc::new(ProviderClient { endpoint, wire }),
+        tools: tool_defs,
+        default_model: config.model.clone(),
+        provider: config.provider,
+        cache_family: cache_family.map(str::to_string),
+        preamble,
+        max_history_messages: config.max_history_messages,
+        max_history_bytes: config.max_history_bytes,
+        enricher,
+        // Cap each completion so a hung provider request fails the turn instead
+        // of wedging it in `running`. `0` = off.
+        timeout: (config.llm_timeout_secs > 0)
+            .then(|| Duration::from_secs(config.llm_timeout_secs)),
+    }))
 }
 
-/// Apply an optional base-URL override to any provider's client builder.
-fn with_base_url<Ext, A, H>(
-    builder: ClientBuilder<Ext, A, H>,
-    base_url: Option<&str>,
-) -> ClientBuilder<Ext, A, H>
-where
-    Ext: Clone,
-{
-    match base_url {
-        Some(url) => builder.base_url(url),
-        None => builder,
+/// Which wire protocol a provider speaks.
+///
+/// Four of the five are Responses; Anthropic serves no such endpoint, which is
+/// the only reason komo carries a second codec at all.
+fn wire_for(provider: Provider) -> Wire {
+    match provider {
+        Provider::Anthropic => Wire::Messages,
+        Provider::DeepSeek | Provider::OpenAi | Provider::OpenRouter | Provider::Codex => {
+            Wire::Responses
+        }
     }
+}
+
+/// The completion endpoint for a provider.
+///
+/// `base_url` overrides the API root (config `base_url` — an OpenAI-compatible
+/// proxy, a self-hosted gateway); the wire's path is appended to it, so callers
+/// configure a root and never a full endpoint.
+fn endpoint_url(provider: Provider, base_url: Option<&str>) -> String {
+    let root = base_url.unwrap_or(match provider {
+        Provider::DeepSeek => "https://api.deepseek.com/v1",
+        Provider::OpenAi => "https://api.openai.com/v1",
+        Provider::Anthropic => "https://api.anthropic.com/v1",
+        Provider::OpenRouter => "https://openrouter.ai/api/v1",
+        Provider::Codex => CODEX_BASE_URL,
+    });
+    let path = match wire_for(provider) {
+        Wire::Responses => "responses",
+        Wire::Messages => "messages",
+    };
+    format!("{}/{path}", root.trim_end_matches('/'))
 }
 
 /// Trim `prior` (the transcript before this turn's prompt) to the slice replayed
@@ -1259,7 +1082,7 @@ fn is_window_anchor(m: &Message) -> bool {
     h % WINDOW_ANCHOR_SPACING == 0
 }
 
-/// Map a komo message into a rig chat-history message. The system prompt is
+/// Map a komo message into a provider chat-history turn. The system prompt is
 /// supplied via the preamble, and tool outputs are folded into the following
 /// assistant reply, so both `System` and `Tool` roles are skipped here.
 ///
@@ -1268,22 +1091,22 @@ fn is_window_anchor(m: &Message) -> bool {
 /// stays exactly what every client renders.
 ///
 /// **The rendering is a pure function of the message.** Nothing here may depend
-/// on where the message sits in the window (see [`assemble`]). This used to
-/// carry the note only for the last three note-bearing turns, which meant every
-/// tool turn silently rewrote an older message's bytes and cost the provider
+/// on where the message sits in the window (see [`ProviderLlm::assemble`]). This
+/// used to carry the note only for the last three note-bearing turns, which meant
+/// every tool turn silently rewrote an older message's bytes and cost the provider
 /// prefix cache everything from ~3 turns back, every turn. Always attaching is
 /// both simpler and cheaper: the digest is already capped when it is written
 /// (`domain::run::tool_digest`), and [`window_history`]'s byte budget has always
 /// counted `tool_note` for every message in the window regardless of whether it
 /// was rendered — so the accounting now matches what is actually sent.
-fn to_rig_message(msg: &Message) -> Option<RigMessage> {
+fn to_turn(msg: &Message) -> Option<Turn> {
     match msg.role {
-        Role::User => Some(RigMessage::user(msg.content.clone())),
-        Role::Assistant if !msg.tool_note.is_empty() => Some(RigMessage::assistant(format!(
+        Role::User => Some(Turn::user(msg.content.clone())),
+        Role::Assistant if !msg.tool_note.is_empty() => Some(Turn::assistant(format!(
             "{}\n\n{}",
             msg.content, msg.tool_note
         ))),
-        Role::Assistant => Some(RigMessage::assistant(msg.content.clone())),
+        Role::Assistant => Some(Turn::assistant(msg.content.clone())),
         Role::System | Role::Tool => None,
     }
 }
@@ -1337,6 +1160,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Four providers on one codec is the reason this layer is small; Anthropic
+    /// is the one exception, because it serves no Responses endpoint.
+    #[test]
+    fn every_provider_but_anthropic_speaks_responses() {
+        for provider in Provider::ALL {
+            let expected = if provider == Provider::Anthropic {
+                Wire::Messages
+            } else {
+                Wire::Responses
+            };
+            assert_eq!(wire_for(provider), expected, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_append_the_wires_path_to_the_root() {
+        assert_eq!(
+            endpoint_url(Provider::DeepSeek, None),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            endpoint_url(Provider::Anthropic, None),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            endpoint_url(Provider::Codex, None),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        // A configured root points the same wire at a proxy, trailing slash or
+        // not.
+        assert_eq!(
+            endpoint_url(Provider::OpenAi, Some("http://localhost:8080/v1/")),
+            "http://localhost:8080/v1/responses"
+        );
     }
 
     /// A backend that reports which provider it was routed to.
@@ -1416,9 +1275,13 @@ mod tests {
         ]
     }
 
-    /// A rate limit takes seconds to clear, so the budget has to outlast one:
-    /// four attempts spanning 21s, versus the three-in-2.5s that used to run out
-    /// while the limit was still in force.
+    fn retryable(message: &str) -> LlmError {
+        LlmError::new(LlmErrorKind::Overloaded, message)
+    }
+
+    /// A rate limit takes seconds to clear, so the local fallback table has to
+    /// outlast one: four attempts spanning 21s, versus the three-in-2.5s that
+    /// used to run out while the limit was still in force.
     #[tokio::test(start_paused = true)]
     async fn the_retry_budget_outlasts_a_rate_limit() {
         assert_eq!(LLM_RETRY_MAX_ATTEMPTS, LLM_RETRY_BACKOFF_MS.len() + 1);
@@ -1431,7 +1294,7 @@ mod tests {
         let result = with_retry(|| async {
             let n = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
-                anyhow::bail!("HTTP 429 Too Many Requests");
+                return Err(retryable("429 Too Many Requests"));
             }
             Ok("answered")
         })
@@ -1445,28 +1308,165 @@ mod tests {
         );
     }
 
-    /// The provider phrasings that mean "your request did not fit", and the ones
-    /// that must not be mistaken for it — a false positive here throws away
-    /// context the turn still needed.
+    /// The payoff of carrying `retry_after` on the error: when the server says
+    /// when its limit clears, we wait exactly that long instead of guessing.
+    #[tokio::test(start_paused = true)]
+    async fn a_servers_own_delay_beats_the_local_table() {
+        let started = tokio::time::Instant::now();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_retry(|| async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                return Err(LlmError::new(LlmErrorKind::RateLimited, "slow down")
+                    .with_retry_after(Some(Duration::from_millis(200))));
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok());
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(900),
+            "waited {waited:?} — the server said 200ms, the table's first entry is 1s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_failure_is_not_retried() {
+        // An auth or schema error will fail identically forever; retrying it just
+        // delays the message the user needs to see.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err::<(), _>(LlmError::new(LlmErrorKind::Auth, "invalid api key"))
+        })
+        .await
+        .expect_err("terminal errors surface");
+        assert!(error.message.contains("invalid api key"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// An overflow is recoverable, but not by re-sending: the driver has to
+    /// shrink the history first, so the retry layer must pass it straight
+    /// through to the degrade path.
+    #[tokio::test(start_paused = true)]
+    async fn an_overflow_is_not_retried_but_reaches_the_driver() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err::<(), _>(LlmError::new(LlmErrorKind::ContextOverflow, "too long"))
+        })
+        .await
+        .expect_err("an overflow surfaces");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(error.is_context_overflow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_retries_are_bounded() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let _ = with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err::<(), _>(LlmError::transport("connection refused"))
+        })
+        .await
+        .expect_err("a permanently down provider still fails");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            LLM_RETRY_MAX_ATTEMPTS
+        );
+    }
+
+    /// The retry budget lives *inside* the timeout, so a flapping provider can't
+    /// multiply a turn's worst-case latency by the attempt count.
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_bounds_every_retry_together() {
+        let started = tokio::time::Instant::now();
+        let error = with_timeout(
+            Some(Duration::from_secs(1)),
+            with_retry(|| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Err::<(), _>(LlmError::transport("connection refused"))
+            }),
+        )
+        .await
+        .expect_err("the round times out");
+        assert_eq!(error.kind, LlmErrorKind::Timeout);
+        assert!(
+            !error.is_retryable(),
+            "the budget it exceeded covers every attempt, so there is nothing left to retry"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    fn tool_result_turn(text: &str) -> Turn {
+        Turn::User(vec![UserBlock::ToolResult {
+            id: "call-1".into(),
+            call_id: Some("call-1".into()),
+            text: text.into(),
+        }])
+    }
+
+    /// The usual overflow is one turn that read several large things. Shrinking
+    /// those reclaims the context without touching the conversation, and the
+    /// full text is still on disk in the tool-output store.
     #[test]
-    fn context_overflow_is_recognised_across_provider_phrasings() {
-        for message in [
-            "This model's maximum context length is 128000 tokens",
-            "error code: context_length_exceeded",
-            "prompt is too long: 210000 tokens > 200000 maximum",
-            "Please reduce the length of the messages",
-        ] {
-            assert!(
-                is_context_overflow(&anyhow::anyhow!("{message}")),
-                "should read as overflow: {message}"
-            );
-        }
-        for message in ["invalid api key", "HTTP 429 Too Many Requests", "timeout"] {
-            assert!(
-                !is_context_overflow(&anyhow::anyhow!("{message}")),
-                "should not read as overflow: {message}"
-            );
-        }
+    fn reclaiming_shrinks_bulky_tool_results_and_keeps_the_conversation() {
+        let mut history = vec![
+            Turn::user("find the bug"),
+            tool_result_turn(&"x".repeat(200_000)),
+            Turn::assistant("reading further"),
+        ];
+        let before = history.len();
+
+        assert!(reclaim_context(&mut history));
+        assert_eq!(history.len(), before, "no message is dropped");
+        let rendered = format!("{history:?}");
+        assert!(rendered.contains("elided"), "the big result was shrunk");
+        assert!(rendered.contains("find the bug"), "the ask is still there");
+    }
+
+    /// When there is nothing bulky to shrink the weight is the conversation
+    /// itself, so the oldest half goes — and what is left still opens on a user
+    /// message, which several providers require.
+    #[test]
+    fn reclaiming_falls_back_to_dropping_the_oldest_half() {
+        let mut history: Vec<Turn> = (0..8)
+            .flat_map(|i| {
+                [
+                    Turn::user(format!("q{i}")),
+                    Turn::assistant(format!("a{i}")),
+                ]
+            })
+            .collect();
+
+        assert!(reclaim_context(&mut history));
+        assert!(history.len() <= 8);
+        assert!(
+            !history.first().is_some_and(Turn::is_assistant),
+            "history must still open on a user message"
+        );
+        let rendered = format!("{history:?}");
+        assert!(!rendered.contains("q0"), "the oldest exchange is gone");
+        assert!(rendered.contains("q7"), "the newest is kept");
+    }
+
+    /// Nothing left to give: the caller has to surface the failure rather than
+    /// re-send an empty request.
+    #[test]
+    fn reclaiming_reports_failure_when_there_is_nothing_to_reclaim() {
+        let mut history = vec![Turn::user("hi")];
+        assert!(!reclaim_context(&mut history));
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends_and_cuts_on_char_boundaries() {
+        let text = "前".repeat(4_000); // 12 KB of 3-byte chars
+        let cut = head_tail(&text, 1_024);
+        assert!(cut.len() < text.len() / 4);
+        assert!(cut.starts_with('前') && cut.ends_with('前'));
+        assert!(cut.contains("elided"));
     }
 
     /// A backend whose sessions are one-shot but whose prompt prefix never
@@ -1483,77 +1483,6 @@ mod tests {
         let b = cache_key(None, "telegram:900");
         assert_ne!(a, b, "separate conversations must not share a key");
         assert_eq!(a, "komo:telegram:644");
-    }
-
-    fn tool_result_message(text: &str) -> RigMessage {
-        RigMessage::User {
-            content: OneOrMany::one(UserContent::tool_result(
-                "call-1",
-                OneOrMany::one(ToolResultContent::text(text)),
-            )),
-        }
-    }
-
-    /// The usual overflow is one turn that read several large things. Shrinking
-    /// those reclaims the context without touching the conversation, and the
-    /// full text is still on disk in the tool-output store.
-    #[test]
-    fn reclaiming_shrinks_bulky_tool_results_and_keeps_the_conversation() {
-        let mut history = vec![
-            RigMessage::user("find the bug"),
-            tool_result_message(&"x".repeat(200_000)),
-            RigMessage::assistant("reading further"),
-        ];
-        let before = history.len();
-
-        assert!(reclaim_context(&mut history));
-        assert_eq!(history.len(), before, "no message is dropped");
-        let rendered = format!("{history:?}");
-        assert!(rendered.contains("elided"), "the big result was shrunk");
-        assert!(rendered.contains("find the bug"), "the ask is still there");
-    }
-
-    /// When there is nothing bulky to shrink the weight is the conversation
-    /// itself, so the oldest half goes — and what is left still opens on a user
-    /// message, which several providers require.
-    #[test]
-    fn reclaiming_falls_back_to_dropping_the_oldest_half() {
-        let mut history: Vec<RigMessage> = (0..8)
-            .flat_map(|i| {
-                [
-                    RigMessage::user(format!("q{i}")),
-                    RigMessage::assistant(format!("a{i}")),
-                ]
-            })
-            .collect();
-
-        assert!(reclaim_context(&mut history));
-        assert!(history.len() <= 8);
-        assert!(
-            matches!(history.first(), Some(RigMessage::User { .. })),
-            "history must still open on a user message"
-        );
-        let rendered = format!("{history:?}");
-        assert!(!rendered.contains("q0"), "the oldest exchange is gone");
-        assert!(rendered.contains("q7"), "the newest is kept");
-    }
-
-    /// Nothing left to give: the caller has to surface the failure rather than
-    /// re-send an empty request.
-    #[test]
-    fn reclaiming_reports_failure_when_there_is_nothing_to_reclaim() {
-        let mut history = vec![RigMessage::user("hi")];
-        assert!(!reclaim_context(&mut history));
-        assert_eq!(history.len(), 1);
-    }
-
-    #[test]
-    fn head_tail_keeps_both_ends_and_cuts_on_char_boundaries() {
-        let text = "前".repeat(4_000); // 12 KB of 3-byte chars
-        let cut = head_tail(&text, 1_024);
-        assert!(cut.len() < text.len() / 4);
-        assert!(cut.starts_with('前') && cut.ends_with('前'));
-        assert!(cut.contains("elided"));
     }
 
     #[test]
@@ -1661,7 +1590,7 @@ mod tests {
         }
         let render = |msgs: &[Message]| -> Vec<String> {
             msgs.iter()
-                .filter_map(to_rig_message)
+                .filter_map(to_turn)
                 .map(|m| format!("{m:?}"))
                 .collect()
         };
@@ -1692,101 +1621,51 @@ mod tests {
     fn a_tool_note_never_touches_the_user_visible_content() {
         let msg = Message::assistant("the answer").with_tool_note("[tools used] read foo.rs");
         // The model sees the note; `content` stays exactly the reply.
-        let rendered = format!("{:?}", to_rig_message(&msg).unwrap());
+        let rendered = format!("{:?}", to_turn(&msg).unwrap());
         assert!(rendered.contains("the answer") && rendered.contains("read foo.rs"));
         // And the stored message itself is untouched — every client renders this.
         assert_eq!(msg.content, "the answer");
         let plain = Message::assistant("just talk");
-        let rendered = format!("{:?}", to_rig_message(&plain).unwrap());
+        let rendered = format!("{:?}", to_turn(&plain).unwrap());
         assert!(rendered.contains("just talk"));
-    }
-
-    /// The point of #1: one 429 on a late round must not throw the turn away.
-    #[tokio::test(start_paused = true)]
-    async fn a_transient_completion_failure_is_retried() {
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let result = with_retry(|| async {
-            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 2 {
-                anyhow::bail!("HTTP 429 Too Many Requests");
-            }
-            Ok("answered")
-        })
-        .await
-        .unwrap();
-        assert_eq!(result, "answered");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_terminal_completion_failure_is_not_retried() {
-        // An auth or schema error will fail identically forever; retrying it just
-        // delays the message the user needs to see.
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let error = with_retry(|| async {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            anyhow::bail!("invalid api key") as anyhow::Result<()>
-        })
-        .await
-        .expect_err("terminal errors surface");
-        assert!(format!("{error:#}").contains("invalid api key"));
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn completion_retries_are_bounded() {
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let _ = with_retry(|| async {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            anyhow::bail!("connection refused") as anyhow::Result<()>
-        })
-        .await
-        .expect_err("a permanently down provider still fails");
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::Relaxed),
-            LLM_RETRY_MAX_ATTEMPTS
-        );
-    }
-
-    /// The retry budget lives *inside* the timeout, so a flapping provider can't
-    /// multiply a turn's worst-case latency by the attempt count.
-    #[tokio::test(start_paused = true)]
-    async fn the_timeout_bounds_every_retry_together() {
-        let started = tokio::time::Instant::now();
-        let error = with_timeout(
-            Some(Duration::from_secs(1)),
-            with_retry(|| async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                anyhow::bail!("connection refused") as anyhow::Result<()>
-            }),
-        )
-        .await
-        .expect_err("the round times out");
-        assert!(format!("{error:#}").contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
     fn text_alongside_tool_calls_survives_the_step_split() {
-        use rig::completion::message::{ToolCall, ToolFunction};
-        let choice = OneOrMany::many(vec![
-            AssistantContent::text("Let me check the config first."),
-            AssistantContent::ToolCall(ToolCall::new(
-                "call-1".into(),
-                ToolFunction {
-                    name: "read".into(),
-                    arguments: json!({ "path": "config.toml" }),
-                },
-            )),
-        ])
-        .unwrap();
+        let blocks = vec![
+            AssistantBlock::Text("Let me check the config first.".into()),
+            AssistantBlock::ToolCall {
+                id: "call-1".into(),
+                call_id: Some("call-1".into()),
+                name: "read".into(),
+                args: r#"{"path":"config.toml"}"#.into(),
+            },
+        ];
 
-        match choice_to_step(&choice) {
+        match blocks_to_step(&blocks) {
             Step::ToolCalls { calls, text } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(text, "Let me check the config first.");
             }
             Step::Final(_) => panic!("a tool call must not read as a final answer"),
+        }
+    }
+
+    /// Reasoning is echoed back into history verbatim but must not be mistaken
+    /// for the model's answer — a round that only reasoned is not a final reply.
+    #[test]
+    fn reasoning_never_becomes_the_answer() {
+        let blocks = vec![
+            AssistantBlock::Reasoning(crate::infra::provider::types::Reasoning {
+                id: Some("rs_1".into()),
+                summary: vec!["thinking".into()],
+                encrypted: Some("OPAQUE".into()),
+            }),
+            AssistantBlock::Text("the answer".into()),
+        ];
+        match blocks_to_step(&blocks) {
+            Step::Final(text) => assert_eq!(text, "the answer"),
+            Step::ToolCalls { .. } => panic!("no tool was called"),
         }
     }
 

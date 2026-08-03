@@ -109,6 +109,16 @@ pub struct App {
     /// Name of the tool currently running, shown in the status line. `None`
     /// when nothing is mid-call.
     pub active_tool: Option<String>,
+    /// Index of the agent entry currently being streamed into, if any. Deltas
+    /// append to it; the authoritative end-of-round text replaces it
+    /// ([`finish_stream`](Self::finish_stream)), which is what keeps a streamed
+    /// answer from being rendered twice.
+    streaming: Option<usize>,
+    /// Characters of reasoning the model has streamed this round. Shown in the
+    /// status line so a long think reads as progress rather than a hang — the
+    /// reasoning text itself is deliberately not rendered into the transcript
+    /// (it is not part of the answer and is never persisted).
+    pub reasoning_chars: usize,
 }
 
 impl App {
@@ -128,6 +138,8 @@ impl App {
             modal_reason: None,
             tool_index: HashMap::new(),
             active_tool: None,
+            streaming: None,
+            reasoning_chars: 0,
         }
     }
 
@@ -146,6 +158,57 @@ impl App {
     pub fn begin_tools(&mut self) {
         self.tool_index.clear();
         self.active_tool = None;
+        self.streaming = None;
+        self.reasoning_chars = 0;
+    }
+
+    /// Append a streamed chunk of the agent's answer, starting a live entry if
+    /// this is the round's first chunk.
+    ///
+    /// Empty chunks are ignored rather than creating an entry: providers do emit
+    /// zero-length deltas, and one would otherwise leave a blank agent bubble in
+    /// the transcript.
+    pub fn stream_delta(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.streaming {
+            Some(at) => self.entries[at].text.push_str(text),
+            None => {
+                self.push(Role::Agent, text);
+                self.streaming = Some(self.entries.len() - 1);
+            }
+        }
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Settle a streamed round on its authoritative text.
+    ///
+    /// The stream and the final text can legitimately differ — the runtime
+    /// substitutes a fallback for an empty reply, and prefixes a note when a
+    /// turn stopped early — so the finished text *replaces* what streamed rather
+    /// than being appended to it. With nothing streamed (an older gateway, or a
+    /// round with no visible output) this is just a push.
+    pub fn finish_stream(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        match self.streaming.take() {
+            Some(at) => {
+                if text.trim().is_empty() {
+                    // Nothing authoritative to show: keep what streamed.
+                    return;
+                }
+                self.entries[at].text = text;
+            }
+            None => self.push(Role::Agent, text),
+        }
+        self.reasoning_chars = 0;
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Note streamed reasoning. Counted for the status line, not rendered: it is
+    /// work in progress, not the answer.
+    pub fn note_reasoning(&mut self, text: &str) {
+        self.reasoning_chars += text.chars().count();
     }
 
     /// Mark a turn as running and start its elapsed-time counter.
@@ -580,6 +643,96 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The failure this reconciliation exists to prevent: the final round
+    /// streams its answer *and* delivers it again as the reply, so a naive
+    /// implementation renders it twice.
+    #[test]
+    fn a_streamed_answer_is_not_rendered_twice() {
+        let mut app = App::new("s".into());
+        app.begin_tools();
+        for chunk in ["Hel", "lo ", "there"] {
+            app.stream_delta(chunk);
+        }
+        assert_eq!(app.entries.len(), 1, "one growing entry, not one per chunk");
+        assert_eq!(app.entries[0].text, "Hello there");
+
+        // The reply arrives carrying the same text.
+        app.finish_stream("Hello there");
+        assert_eq!(app.entries.len(), 1, "the reply settles the live entry");
+        assert_eq!(app.entries[0].text, "Hello there");
+    }
+
+    /// The stream and the final text legitimately differ — the runtime prefixes
+    /// a note when a turn stopped early — so the authoritative text wins.
+    #[test]
+    fn the_authoritative_text_replaces_what_streamed() {
+        let mut app = App::new("s".into());
+        app.stream_delta("partial thought");
+        app.finish_stream("(Reached the tool-call limit.) partial thought");
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(
+            app.entries[0].text,
+            "(Reached the tool-call limit.) partial thought"
+        );
+    }
+
+    /// With no deltas (an older gateway, or a round that only called tools) the
+    /// reply still has to land.
+    #[test]
+    fn a_reply_with_nothing_streamed_is_pushed() {
+        let mut app = App::new("s".into());
+        app.finish_stream("the answer");
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].text, "the answer");
+        assert!(matches!(app.entries[0].role, Role::Agent));
+    }
+
+    /// Each round gets its own entry: narration streamed before a tool call must
+    /// not be overwritten by the next round's stream.
+    #[test]
+    fn a_new_round_streams_into_a_new_entry() {
+        let mut app = App::new("s".into());
+        app.stream_delta("checking the config");
+        app.finish_stream("checking the config");
+        app.stream_delta("found it");
+        app.finish_stream("found it");
+        assert_eq!(
+            app.entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["checking the config", "found it"]
+        );
+    }
+
+    #[test]
+    fn empty_deltas_never_create_a_blank_bubble() {
+        let mut app = App::new("s".into());
+        app.stream_delta("");
+        assert!(app.entries.is_empty(), "providers do emit empty deltas");
+    }
+
+    /// An empty reply must not blank out text the user already watched arrive.
+    #[test]
+    fn an_empty_reply_keeps_what_streamed() {
+        let mut app = App::new("s".into());
+        app.stream_delta("real content");
+        app.finish_stream("   ");
+        assert_eq!(app.entries[0].text, "real content");
+    }
+
+    #[test]
+    fn reasoning_is_counted_but_never_rendered() {
+        let mut app = App::new("s".into());
+        app.note_reasoning("думаю");
+        app.note_reasoning("字");
+        assert!(app.entries.is_empty(), "reasoning is progress, not answer");
+        assert_eq!(app.reasoning_chars, 6, "counted in chars, not bytes");
+        // A finished round resets the counter for the next one.
+        app.finish_stream("done");
+        assert_eq!(app.reasoning_chars, 0);
     }
 
     fn type_str(app: &mut App, s: &str) {

@@ -31,12 +31,13 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
     "json",
     "multipart",
+    # `bytes_stream()` — the provider layer reads every completion as SSE.
+    "stream",
 ] }
 open-lark = { version = "0.14", default-features = false, features = [
     "websocket",
     "im",
 ] }
-rig = { package = "rig-core", version = "0.41" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { workspace = true }
@@ -45,8 +46,8 @@ sha2 = { workspace = true }
 # Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
 # (no signature verification — we only inspect the payload). See `infra/codex.rs`.
 base64 = "0.23.0"
-# Codex provider: a custom `rig` HTTP backend re-stamps the bearer per request,
-# so we touch `http`/`bytes` types directly (versions matched to rig + reqwest).
+# `http` for the Codex OAuth refresh request's header constants; `bytes` for the
+# provider layer's SSE chunk stream.
 http = "1.5.0"
 bytes = "1"
 croner = "3"
@@ -95,7 +96,7 @@ members = ["crates/komo-core"]
 resolver = "3"
 
 # Shared across the workspace so komo and komo-core pin one version each.
-# Crate-unique / heavy deps (toasty, rig, axum, ratatui, …) stay in their own
+# Crate-unique / heavy deps (toasty, axum, ratatui, …) stay in their own
 # manifests.
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

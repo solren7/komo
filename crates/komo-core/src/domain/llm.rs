@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::session::Session;
@@ -61,6 +63,29 @@ pub struct ToolOutcome {
     pub content: String,
 }
 
+/// Receives assistant output as the provider produces it, mid-round.
+///
+/// A round's [`Step`] only exists once the round *finishes*, which for a
+/// reasoning model on a long tool chain can be tens of seconds of silence. This
+/// is the seam that lets a watching client see the work as it happens instead:
+/// the backend calls it per streamed chunk, and the runtime forwards those onto
+/// the turn's event sink.
+///
+/// Fire-and-forget and synchronous, like
+/// [`ToolEventSink`](crate::domain::events::ToolEventSink): it is called from
+/// inside the provider's stream loop, so it must never block or await. Absent
+/// (`None`) for every turn with no watcher, which is the common case — an
+/// unwatched turn pays nothing for this.
+pub trait DeltaSink: Send + Sync {
+    /// A chunk of the assistant's visible answer.
+    fn text(&self, delta: &str);
+    /// A chunk of the model's reasoning, when the provider streams a summary of
+    /// it. Defaulted to a no-op: this is the interesting one to watch on a
+    /// reasoning model (most of a round's latency is here, before any visible
+    /// text exists), but a sink that only cares about the answer can ignore it.
+    fn reasoning(&self, _delta: &str) {}
+}
+
 /// Drives one user turn as a sequence of model round-trips. Created by
 /// [`LlmClient::begin_turn`], which assembles the per-turn system prompt and
 /// memory injection *once* (not per round). The runtime calls [`first`] to get
@@ -107,13 +132,21 @@ pub trait LlmClient: Send + Sync {
 
     /// Begin a tool-using turn for the main agent. The returned [`TurnDriver`]
     /// lets `AgentRuntime` own the multi-step tool loop, so planner control
-    /// points (budget, clarify, resume — roadmap §7) live there, not in rig.
+    /// points (budget, clarify, resume — roadmap §7) live there.
+    ///
+    /// `deltas` is where the backend streams this turn's output as it is
+    /// produced; `None` when nothing is watching. A backend is free to ignore it
+    /// (the default one-shot driver does).
     ///
     /// The default is a single-shot driver wrapping [`complete`](LlmClient::complete):
     /// it answers in one round with no tool calls. Tool-less backends (and test
-    /// stubs) inherit this for free; the main rig client overrides it with a
-    /// real tool-looping driver.
-    async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+    /// stubs) inherit this for free; the real provider client overrides it with a
+    /// tool-looping driver.
+    async fn begin_turn(
+        &self,
+        session: &Session,
+        _deltas: Option<Arc<dyn DeltaSink>>,
+    ) -> anyhow::Result<Box<dyn TurnDriver>> {
         let reply = self.complete(session).await?;
         Ok(Box::new(OneShotDriver(Some(reply))))
     }

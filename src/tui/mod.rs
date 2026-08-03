@@ -411,12 +411,23 @@ async fn event_loop(
                     TurnEvent::ToolFinished { seq, name, ok, summary, .. } => {
                         app.tool_finished(seq, name, ok, summary);
                     }
+                    // The model's answer as it is generated. Grows a live entry
+                    // so a long round reads as progress instead of a hang.
+                    TurnEvent::AssistantDelta { text } => {
+                        app.stream_delta(&text);
+                    }
+                    // Reasoning is progress, not answer: counted for the status
+                    // line, never rendered into the transcript.
+                    TurnEvent::ReasoningDelta { text } => {
+                        app.note_reasoning(&text);
+                    }
                     // Mid-turn narration: the agent saying what it is about to
-                    // do. Rendered as agent speech (which it is) ahead of the
-                    // tool lines it explains; the turn's answer still arrives
-                    // separately via `turn_rx`.
+                    // do, and the authoritative version of whatever just
+                    // streamed. Rendered as agent speech (which it is) ahead of
+                    // the tool lines it explains; the turn's answer still
+                    // arrives separately via `turn_rx`.
                     TurnEvent::AssistantText { text } => {
-                        app.push(Role::Agent, text);
+                        app.finish_stream(text);
                     }
                 }
             }
@@ -427,7 +438,9 @@ async fn event_loop(
                 // No tool is running once the turn is done.
                 app.active_tool = None;
                 match result {
-                    Ok(reply) => app.push(Role::Agent, reply),
+                    // The final round streamed this same text, so settle that
+                    // live entry on the reply rather than appending a duplicate.
+                    Ok(reply) => app.finish_stream(reply),
                     Err(error) => app.push(Role::Error, error),
                 }
             }

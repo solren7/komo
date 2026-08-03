@@ -1,9 +1,11 @@
 //! Live turn events for clients that want to watch the agent work in real time
 //! (the desktop GUI's tool-call activity feed).
 //!
-//! komo's rig tool loop has no token-level streaming, so this streams the
-//! *tool-call process* — each tool starting and finishing — not the assistant
-//! text token-by-token. Mirrors the [`ReplySink`](crate::domain::gateway::ReplySink)
+//! Two kinds of progress travel here: the *tool-call process* (each tool
+//! starting and finishing) and the model's output as it is generated
+//! ([`TurnEvent::AssistantDelta`] / [`TurnEvent::ReasoningDelta`], fed by
+//! [`DeltaSink`](crate::domain::llm::DeltaSink)).
+//! Mirrors the [`ReplySink`](crate::domain::gateway::ReplySink)
 //!
 //! The payload deliberately mirrors what the run ledger records for the same
 //! call ([`RunStep`](crate::domain::run::RunStep)) — same truncation cap, same
@@ -41,11 +43,27 @@ pub enum TurnEvent {
         started_at_ms: i64,
     },
     /// Text the model wrote in the same assistant turn as its tool calls — the
-    /// "checking the config first" narration. It is not the turn's answer (that
-    /// arrives as the reply), and it is never persisted; this is the one place a
-    /// client can watch the model reason, since komo's tool loop does no
-    /// token-level streaming.
+    /// "checking the config first" narration, emitted once the round completes.
+    /// It is not the turn's answer (that arrives as the reply) and is never
+    /// persisted.
+    ///
+    /// A client that renders [`Self::AssistantDelta`] has already shown these
+    /// bytes and should treat this as the authoritative end-of-round text rather
+    /// than appending it again.
     AssistantText { text: String },
+    /// A chunk of the assistant's output, as the provider generates it.
+    ///
+    /// Deltas are cumulative *in order*: concatenating every delta of one round
+    /// reproduces the text that round's [`Self::AssistantText`] carries. Clients
+    /// too old to know this variant drop the frame and fall back to the
+    /// end-of-round text, which is why it is additive rather than a replacement.
+    AssistantDelta { text: String },
+    /// A chunk of the model's reasoning summary, as it thinks.
+    ///
+    /// The interesting one to watch on a reasoning model: most of a round's
+    /// latency is spent here, before any visible answer exists. Never persisted
+    /// and never part of the reply — it is a view into work in progress.
+    ReasoningDelta { text: String },
     /// A tool call finished (after any transient-error retries collapse).
     ToolFinished {
         seq: i64,

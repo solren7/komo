@@ -40,8 +40,8 @@ komo workday [YYYY-MM-DD]          # Chinese working-day check (holidays + 调�
 Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 `info!` is a no-op). Gateway tees stderr into daily-rotated
 `~/.komo/logs/gateway.YYYY-MM-DD.log` (what `komo logs` reads). Level via
-`KOMO_LOG` (default `info,toasty=warn,rig_core=warn`; set `KOMO_LOG=debug` to
-see full tool results). Turns run in `run` spans, tool calls in `tool` spans,
+`KOMO_LOG` (default `info,toasty=warn`; set `KOMO_LOG=debug` to see full tool
+results and per-round token usage). Turns run in `run` spans, tool calls in `tool` spans,
 matching the run ledger. The chat TUI logs to `~/.komo/logs/chat-tui.log`
 instead (stderr would tear the alternate screen) and registers that path with
 `infra::logs::set_active`, which is how the `logs` tool finds the current
@@ -135,7 +135,10 @@ fallback for proactive output; a `/sethome` chat command override (db) wins.
 
 Model menu: `models = [...]` declares what a session may switch to; entries may
 be provider-qualified (`deepseek:deepseek-chat`) and `ModelConfig::menu()`
-drops entries whose provider has no key (except the running `model`). Choice is
+drops entries whose provider has no key (except the running `model`).
+**A DeepSeek entry must name a v4-or-later model**: komo speaks only the
+Responses API to DeepSeek, and the v3 models (`deepseek-chat`) have no
+`/v1/responses` endpoint. Choice is
 carried per turn in `X-Komo-Model`/`X-Komo-Effort`, validated against the menu,
 stored on the session; `RoutingLlm` dispatches across providers. Effort levels
 are per-provider (`Provider::efforts` ↔ `reasoning_params` must agree — there
@@ -151,15 +154,16 @@ streaming — see `infra/codex.rs`.
 ## Architecture
 
 ```
-CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn → TurnDriver (ONE rig completion / round)
+CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn → TurnDriver (ONE provider completion / round)
                                              └→ ToolExecutor::execute_round → tools   (loop until Step::Final)
                           ↘ MessageRepository · RunRepository (ledger) → Response
 ```
 
-komo owns the tool loop: rig does a single completion per round;
-`run_agent_loop` (`agent/runtime.rs`) is where round-level control lives
-(`max_turns` budget, cancellation, clarify). Tool errors return as outcome
-content the model can recover from; only a driver/LLM error aborts the turn.
+komo owns the tool loop **and its provider layer** (`infra/provider/`, no LLM
+crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is where
+round-level control lives (`max_turns` budget, cancellation, clarify). Tool
+errors return as outcome content the model can recover from; only a driver/LLM
+error aborts the turn.
 
 **Module map** (one line each; read the module for details):
 
@@ -168,10 +172,20 @@ content the model can recover from; only a driver/LLM error aborts the turn.
 - `agent/runtime.rs` — session lifecycle + the tool loop; loads only a recent
   transcript window per turn (`find_windowed`); wraps each turn in a ledger
   `Run` (all ledger writes best-effort, never fail the turn).
-- `infra/llm.rs` — `RigLlm<M>` over rig; `assemble` builds the tiered system
-  prompt once per turn (stable tier incl. `~/.komo/USER.md`, then memory
+- `infra/provider/` — komo's own provider layer. One module per **wire format**
+  (`Wire`), not per provider: `responses` (OpenAI / Codex / DeepSeek /
+  OpenRouter) and `messages` (Anthropic, which serves no Responses endpoint).
+  `transport` is the HTTP+SSE boundary where `error::LlmError` is built while the
+  status, headers and provider error `code` are all still intact — retryability
+  is `LlmError::is_retryable()` (exhaustive match) and the server's own
+  `Retry-After` beats any local backoff. Every request streams; a stream that
+  ends without its terminal frame is a retryable failure, never a short answer.
+  A new provider is a base URL + auth mode, not new code.
+- `infra/llm.rs` — `ProviderLlm` over that layer; `assemble` builds the tiered
+  system prompt once per turn (stable tier incl. `~/.komo/USER.md`, then memory
   prefix from `MemoryEnricher` — main agent only). `RoutingLlm` = cross-provider
-  dispatch. Codex is the streaming exception.
+  dispatch. Reasoning blocks are echoed back verbatim each round, which is what
+  carries a reasoning model's chain of thought across a tool loop.
 - `services/tool_execution/` — `ToolExecutor::execute_round`: per call, claim
   ledger seq → redact args → run with panic catch + `tool` span →
   transient-retry (connection errors retry anything; ambiguous only
@@ -285,8 +299,12 @@ content the model can recover from; only a driver/LLM error aborts the turn.
   `build_llm`.
 - **Swap persistence**: implement the repository traits; `agent/`/`domain/`
   need no changes.
+- **Add a provider**: an entry in `Provider` plus its base URL / auth / wire in
+  `infra/llm.rs` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
+  format* — only if it speaks neither Responses nor Messages — is a module in
+  `infra/provider/` and a `Wire` variant.
 - **Agent-loop control**: add round-level control points in `run_agent_loop`;
-  extend `TurnDriver`/`Step`, not rig. Clarify (`tools/ask_user.rs` +
+  extend `TurnDriver`/`Step`. Clarify (`tools/ask_user.rs` +
   `services/clarify.rs`) is the sentinel-tool reference.
 - **Scheduled action**: implement `Maintenance`, construct in `cli/gateway.rs`.
 - **Gateway ingress**: implement `Channel`, `add_channel` in `cli/gateway.rs`,

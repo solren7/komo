@@ -430,7 +430,7 @@ pub fn pinned_budget_usage(pinned: &[Memory]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::llm::{Step, ToolOutcome, TurnDriver};
+    use crate::domain::llm::{DeltaSink, Step, ToolOutcome, TurnDriver};
     use crate::domain::memory::{MemoryConfidence, MemoryKind, MemoryScope, MemoryStatus};
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -494,7 +494,11 @@ mod tests {
                 Err(e) => Err(anyhow::anyhow!("{e:#}")),
             }
         }
-        async fn begin_turn(&self, _session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+        async fn begin_turn(
+            &self,
+            _session: &Session,
+            _deltas: Option<Arc<dyn DeltaSink>>,
+        ) -> anyhow::Result<Box<dyn TurnDriver>> {
             struct Dead;
             #[async_trait]
             impl TurnDriver for Dead {

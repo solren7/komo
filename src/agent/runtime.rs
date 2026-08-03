@@ -7,8 +7,8 @@ use crate::{
     agent::review_coordinator::{ReviewCoordinator, ReviewTrigger},
     domain::{
         cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
-        events::TurnEvent,
-        llm::{LlmClient, Step, TokenUsage, ToolOutcome},
+        events::{ToolEventSink, TurnEvent},
+        llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
         message::Message,
         repository::{MessageRepository, SessionRepository},
         run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
@@ -348,7 +348,16 @@ impl AgentRuntime {
         let cancel = context.session.cancel.clone();
         let cancel = cancel.as_ref();
 
-        let mut driver = self.llm.begin_turn(session).await?;
+        // Stream the model's output to whoever is watching. Only built when a
+        // watcher is actually attached: an unwatched turn (every chat channel,
+        // every sweep) hands the backend `None` and pays nothing per chunk.
+        let deltas: Option<Arc<dyn DeltaSink>> = context
+            .session
+            .event_sink
+            .clone()
+            .map(|sink| Arc::new(StreamingDeltas(sink)) as Arc<dyn DeltaSink>);
+
+        let mut driver = self.llm.begin_turn(session, deltas).await?;
         let mut step = Self::until_cancelled(cancel, driver.first()).await?;
         let mut rounds = 0usize;
         // The model's most recent narration alongside its tool calls. Kept so the
@@ -454,6 +463,29 @@ impl AgentRuntime {
     }
 }
 
+/// Forwards the provider's streamed output onto the turn's event sink.
+///
+/// The two sinks exist for different reasons and are deliberately not merged:
+/// [`ToolEventSink`] is the fire-and-forget channel every watcher already reads
+/// (tool starts and finishes travel it), while [`DeltaSink`] is the seam the LLM
+/// backend writes into and knows nothing about sessions. This is the one adapter
+/// between them.
+struct StreamingDeltas(Arc<dyn ToolEventSink>);
+
+impl DeltaSink for StreamingDeltas {
+    fn text(&self, delta: &str) {
+        self.0.emit(TurnEvent::AssistantDelta {
+            text: delta.to_string(),
+        });
+    }
+
+    fn reasoning(&self, delta: &str) {
+        self.0.emit(TurnEvent::ReasoningDelta {
+            text: delta.to_string(),
+        });
+    }
+}
+
 /// What one pass of the agent loop produced.
 struct TurnOutcome {
     reply: String,
@@ -525,7 +557,11 @@ mod tests {
         async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
-        async fn begin_turn(&self, _session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+        async fn begin_turn(
+            &self,
+            _session: &Session,
+            _deltas: Option<Arc<dyn DeltaSink>>,
+        ) -> anyhow::Result<Box<dyn TurnDriver>> {
             // One turn per test, so hand the whole script to the driver.
             let steps = std::mem::take(&mut *self.script.lock().unwrap());
             Ok(Box::new(ScriptedDriver {
@@ -1064,7 +1100,11 @@ mod tests {
         async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
             anyhow::bail!("provider down")
         }
-        async fn begin_turn(&self, _session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+        async fn begin_turn(
+            &self,
+            _session: &Session,
+            _deltas: Option<Arc<dyn DeltaSink>>,
+        ) -> anyhow::Result<Box<dyn TurnDriver>> {
             anyhow::bail!("provider down")
         }
     }

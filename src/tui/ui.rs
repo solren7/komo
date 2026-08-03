@@ -193,9 +193,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Cyan),
         )])
     } else if app.in_flight {
+        // A reasoning model can spend most of a round thinking before any
+        // visible text exists; showing how much it has produced turns that
+        // silence into progress.
+        let thinking = if app.reasoning_chars > 0 {
+            format!(" 正在思考 {} 字", app.reasoning_chars)
+        } else {
+            " 正在思考".to_string()
+        };
         Line::from(vec![Span::styled(
             format!(
-                " {} 正在思考 · {} ",
+                " {}{thinking} · {} ",
                 SPINNER[app.spinner % SPINNER.len()],
                 elapsed_label(app)
             ),

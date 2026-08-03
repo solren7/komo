@@ -52,7 +52,7 @@ fn init_tracing() {
         ",toasty::db::pool=off"
     };
     let filter = EnvFilter::try_from_env("KOMO_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("info,toasty=warn{pool_noise}")));
 
     // The chat TUI owns the terminal (alternate screen): a stderr log line
     // would tear the display, so route tracing to a file for that mode.

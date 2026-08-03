@@ -1443,12 +1443,15 @@ async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, Api
 }
 
 /// The dreaming dry-run classification (backs `komo dream`, no `--apply`):
-/// which candidates would promote / archive, with their scores. Read-only.
+/// which candidates would promote / archive, with their scores, plus the full
+/// candidate count so a no-op does not look like an empty memory library.
 async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let report = state.actions.dream_preview().await?;
-    Ok(Json(
-        json!({ "promote": report.promote, "archive": report.archive }),
-    ))
+    Ok(Json(json!({
+        "promote": report.promote,
+        "archive": report.archive,
+        "candidate_count": report.candidate_count,
+    })))
 }
 
 // ---- interactive approval / clarify (for the GUI) --------------------------

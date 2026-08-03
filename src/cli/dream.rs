@@ -24,8 +24,8 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
         unreachable!("DreamPreview query answers with DreamPreview");
     };
 
-    if report.is_empty() {
-        println!("Nothing to dream about — no candidate meets the promote or archive bar.");
+    if !report.has_actions() {
+        println!("{}", no_action_summary(&report));
         return Ok(());
     }
 
@@ -34,6 +34,11 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
         &report.promote,
     );
     report_bucket("archive (old, gone cold)", &report.archive);
+
+    let observing = report.observing_count();
+    if observing > 0 {
+        println!("\nobserving: {observing} candidate(s) still within the evidence or aging window");
+    }
 
     if !apply {
         println!("\n(dry run — pass --apply to execute this cycle)");
@@ -49,6 +54,17 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn no_action_summary(report: &crate::services::operator_control::DreamReport) -> String {
+    if report.candidate_count == 0 {
+        "No candidate memories to dream about.".into()
+    } else {
+        format!(
+            "No state changes this cycle — {} candidate(s) are still being observed (0 ready to promote, 0 ready to archive).",
+            report.candidate_count
+        )
+    }
+}
+
 fn report_bucket(label: &str, items: &[DreamItem]) {
     if items.is_empty() {
         return;
@@ -62,5 +78,27 @@ fn report_bucket(label: &str, items: &[DreamItem]) {
     }
     if items.len() > 20 {
         println!("  … and {} more", items.len() - 20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::services::operator_control::DreamReport;
+
+    use super::no_action_summary;
+
+    #[test]
+    fn no_action_summary_distinguishes_no_candidates_from_observation() {
+        assert_eq!(
+            no_action_summary(&DreamReport::default()),
+            "No candidate memories to dream about."
+        );
+        assert_eq!(
+            no_action_summary(&DreamReport {
+                candidate_count: 3,
+                ..Default::default()
+            }),
+            "No state changes this cycle — 3 candidate(s) are still being observed (0 ready to promote, 0 ready to archive)."
+        );
     }
 }

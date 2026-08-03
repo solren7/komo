@@ -82,15 +82,35 @@ pub struct DreamItem {
 }
 
 /// The dreaming dry-run classification: which candidates would promote
-/// (strongest case first) and which would archive.
-#[derive(Debug, Clone, Default)]
+/// (strongest case first), which would archive, and how many remain under
+/// observation this cycle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamReport {
     pub promote: Vec<DreamItem>,
     pub archive: Vec<DreamItem>,
+    /// Every candidate considered by the sweep, including ones that remain in
+    /// the observation window. A missing field from an older gateway means the
+    /// CLI can still render the actionable buckets safely.
+    #[serde(default)]
+    pub candidate_count: usize,
 }
 
 impl DreamReport {
+    /// Whether this cycle has any state transition to apply.
+    pub fn has_actions(&self) -> bool {
+        !self.promote.is_empty() || !self.archive.is_empty()
+    }
+
+    /// Candidates that are neither ready to promote nor old and cold enough to
+    /// archive yet.
+    pub fn observing_count(&self) -> usize {
+        self.candidate_count
+            .saturating_sub(self.promote.len() + self.archive.len())
+    }
+
+    /// Backwards-compatible spelling for callers that mean “no state changes”,
+    /// not “there are no candidate memories”.
     pub fn is_empty(&self) -> bool {
-        self.promote.is_empty() && self.archive.is_empty()
+        !self.has_actions()
     }
 }

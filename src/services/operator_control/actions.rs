@@ -14,7 +14,7 @@ use crate::domain::cron::{
 };
 use crate::domain::home::HomeRepository;
 use crate::domain::memory::{
-    DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+    DreamVerdict, Memory, MemoryKind, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
@@ -440,6 +440,9 @@ pub fn skill_invocations(steps: Vec<RunStep>, name: &str, cap: usize) -> Vec<Ski
 pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
     let mut report = DreamReport::default();
     for m in memories {
+        if m.status == MemoryStatus::Candidate {
+            report.candidate_count += 1;
+        }
         let item = DreamItem {
             id: m.id.clone(),
             recall_count: m.recall_count,
@@ -503,5 +506,20 @@ mod tests {
         let rows = session_summaries(vec![s]);
         assert_eq!(rows[0].model, "deepseek:deepseek-chat");
         assert_eq!(rows[0].effort, "high");
+    }
+
+    #[test]
+    fn dream_preview_counts_candidates_that_remain_under_observation() {
+        let now = 1_000_000;
+        let mut young = Memory::new(MemoryKind::Fact, "still being observed");
+        young.status = MemoryStatus::Candidate;
+        young.created_at = now - 86_400;
+
+        let active = Memory::new(MemoryKind::Fact, "already active");
+        let report = dream_classify(&[young, active], now);
+
+        assert!(!report.has_actions());
+        assert_eq!(report.candidate_count, 1);
+        assert_eq!(report.observing_count(), 1);
     }
 }

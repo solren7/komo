@@ -28,7 +28,7 @@ use crate::domain::{
 };
 use crate::infra::rendezvous::{self, GatewayInfo};
 use crate::services::operator_control::{
-    DreamItem, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
+    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
 };
 
 /// How long to wait for the gateway to answer a request (a turn can take a
@@ -277,8 +277,9 @@ impl GatewayClient {
         self.get_field("/api/home", "override").await
     }
 
-    /// The dreaming dry-run: `(promote, archive)` candidate lists.
-    pub async fn dream_preview(&self) -> anyhow::Result<(Vec<DreamItem>, Vec<DreamItem>)> {
+    /// The dreaming dry-run: actionable candidate lists and the total number
+    /// under observation. `candidate_count` defaults for an older gateway.
+    pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
         let mut map: Map<String, Value> = self
             .http
             .get(self.url("/api/dream"))
@@ -295,7 +296,15 @@ impl GatewayClient {
         };
         let promote = take(&mut map, "promote")?;
         let archive = take(&mut map, "archive")?;
-        Ok((promote, archive))
+        let candidate_count = serde_json::from_value(
+            map.remove("candidate_count")
+                .unwrap_or_else(|| Value::from(promote.len() + archive.len())),
+        )?;
+        Ok(DreamReport {
+            promote,
+            archive,
+            candidate_count,
+        })
     }
 
     /// Apply a memory governance transition (`promote` | `reject` | `pin`)

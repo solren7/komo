@@ -7,8 +7,7 @@
 use crate::infra::gateway_client::{GatewayClient, PairApprove};
 
 use super::request::{
-    DreamReport, OperatorCommand, OperatorCommandResult, OperatorQuery, OperatorQueryResult,
-    PairApproveOutcome,
+    OperatorCommand, OperatorCommandResult, OperatorQuery, OperatorQueryResult, PairApproveOutcome,
 };
 
 pub(super) struct GatewayOperatorAdapter {
@@ -38,8 +37,7 @@ impl GatewayOperatorAdapter {
             OperatorQuery::Memories => OperatorQueryResult::Memories(self.client.memories().await?),
             OperatorQuery::Pairings => OperatorQueryResult::Pairings(self.client.pairings().await?),
             OperatorQuery::DreamPreview => {
-                let (promote, archive) = self.client.dream_preview().await?;
-                OperatorQueryResult::DreamPreview(DreamReport { promote, archive })
+                OperatorQueryResult::DreamPreview(self.client.dream_preview().await?)
             }
             OperatorQuery::SkillAudit { name } => {
                 OperatorQueryResult::SkillAudit(self.client.skill_audit(&name).await?)

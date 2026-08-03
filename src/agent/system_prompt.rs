@@ -100,6 +100,26 @@ const CRON_GUIDANCE: &str = "You CAN schedule recurring work: call the `cron` to
     only while `komo gateway` runs, their output is delivered to the user's home \
     channel rather than here, and creating or changing one asks the user to approve.";
 
+/// Injected whenever any tool is loaded. Two per-round economies the executor
+/// already supports but the model won't use unprompted: independent calls run
+/// concurrently when issued in one round, and a check whose inputs haven't
+/// changed doesn't need re-running.
+const TOOL_ECONOMY_GUIDANCE: &str = "Tool calls in one round run concurrently: \
+    when several calls do not depend on each other's results, issue them together \
+    in a single round instead of one per round. Do not re-run a check whose inputs \
+    have not changed since you last ran it — verify once, at the point the result \
+    actually matters.";
+
+/// Gated on `todo`. The description on the tool itself states the same policy,
+/// but models weight system-prompt behavioral rules higher — this is what
+/// actually stops a three-step git task from growing a bookkeeping side-channel.
+const TODO_GUIDANCE: &str = "The `todo` list is for longer, non-trivial work \
+    (many tool calls, or steps that can fail independently). Skip it entirely for \
+    short linear tasks — roughly three obvious steps or fewer, like \
+    commit-and-push. When you do keep a list, never spend a round on bookkeeping \
+    alone: batch the todo status update into the same round as your next real \
+    tool call.";
+
 /// Gated on the `ask_user` tool.
 const CLARIFY_GUIDANCE: &str = "When a key parameter is ambiguous, the target of an \
     action is unclear, or an irreversible action's intent is uncertain, ask first: \
@@ -279,6 +299,9 @@ impl SystemPromptBuilder {
         }
 
         // Tool-aware guidance: only inject when the tool is loaded.
+        if !self.tool_names.is_empty() {
+            parts.push(TOOL_ECONOMY_GUIDANCE.to_string());
+        }
         if self.has("time") {
             parts.push(TIME_GUIDANCE.to_string());
         }
@@ -299,6 +322,9 @@ impl SystemPromptBuilder {
         }
         if self.has("cron") {
             parts.push(CRON_GUIDANCE.to_string());
+        }
+        if self.has("todo") {
+            parts.push(TODO_GUIDANCE.to_string());
         }
         if self.has("ask_user") {
             parts.push(CLARIFY_GUIDANCE.to_string());
@@ -469,6 +495,34 @@ mod tests {
         assert!(p.contains("`time` tool"));
         // `cron` wasn't loaded, so its scheduler-routing guidance stays out.
         assert!(!p.contains("schedule recurring work"));
+    }
+
+    #[test]
+    fn todo_guidance_appears_only_with_the_todo_tool() {
+        let with = SystemPromptBuilder::new(&config())
+            .home(tmp("todo_on"))
+            .tools(vec!["todo".into()])
+            .build();
+        assert!(with.contains("Skip it entirely for"));
+        let without = SystemPromptBuilder::new(&config())
+            .home(tmp("todo_off"))
+            .tools(vec!["time".into()])
+            .build();
+        assert!(!without.contains("Skip it entirely for"));
+    }
+
+    #[test]
+    fn tool_economy_guidance_requires_at_least_one_tool() {
+        let with = SystemPromptBuilder::new(&config())
+            .home(tmp("economy_on"))
+            .tools(vec!["time".into()])
+            .build();
+        assert!(with.contains("run concurrently"));
+        // No tools loaded → no round-economy advice to give.
+        let without = SystemPromptBuilder::new(&config())
+            .home(tmp("economy_off"))
+            .build();
+        assert!(!without.contains("run concurrently"));
     }
 
     #[test]

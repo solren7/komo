@@ -5,14 +5,23 @@
 //! string (stable → context → volatile):
 //!
 //!   * **stable**   — identity/persona, the operator-authored user profile
-//!     (`~/.komo/USER.md`, main agent only), tool-aware behavioral guidance
-//!     (only for tools that are actually loaded), and the skills catalog.
-//!     Re-read only when a source file's mtime moves.
-//!   * **context**  — project instruction files (`AGENTS.md` / `CLAUDE.md` /
-//!     `.cursorrules`) found in the working directory. Stable within a session.
+//!     (`~/.komo/USER.md`) and machine-wide agent instructions
+//!     (`~/.komo/AGENTS.md`, else `~/.agents/AGENTS.md`), all main-agent only,
+//!     tool-aware behavioral guidance (only for tools that are actually
+//!     loaded), and the skills catalog. Re-read only when a source file's
+//!     mtime moves.
+//!   * **context**  — the project instruction file (`AGENTS.md`, else
+//!     `CLAUDE.md`, else `.cursorrules`) found in the working directory. Stable
+//!     within a session.
 //!   * **volatile** — day-precision date, model, provider. The only part that
 //!     drifts, kept last so the stable+context prefix stays byte-identical and
 //!     upstream prompt caches stay warm.
+//!
+//! Instructions come from two independent scopes — machine-wide and project — and
+//! the prompt carries one file from each. Within a scope it is first found wins,
+//! most specific first: `~/.komo/AGENTS.md` outranks the shared
+//! `~/.agents/AGENTS.md`, and `AGENTS.md` outranks `CLAUDE.md`. That also keeps
+//! the common `CLAUDE.md`→`AGENTS.md` symlink from being injected twice.
 //!
 //! Hermes builds this once per session and caches it; komo builds it once at
 //! agent construction (the chat REPL is one sitting = one session; the gateway
@@ -158,7 +167,9 @@ output (reminders, daily briefing). `/new` starts a fresh session; \
 - `komo doctor` (host terminal) shows config, model, and channel health; \
 `komo logs` tails the gateway log.";
 
-/// Project instruction files searched in the working directory, first found wins.
+/// Project instruction files searched in the working directory, first found
+/// wins. `AGENTS.md` leads because `CLAUDE.md` is so often a symlink to it —
+/// taking the first match is what keeps the same text out of the prompt twice.
 const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
 
 /// Cap on an included context file, mirroring hermes' 20k-char head truncation.
@@ -171,6 +182,26 @@ const CONTEXT_FILE_CAP: usize = 20_000;
 /// is the hand-written profile, they are what was pinned/recalled during use.
 const USER_PROFILE_HEADER: &str =
     "The following is what you know about the user, from their profile in ~/.komo/USER.md:";
+
+/// Machine-wide agent instruction files, first found wins — komo's own
+/// `~/.komo/AGENTS.md` outranks `~/.agents/AGENTS.md`, which is shared with
+/// whatever other agents read that directory. Same trust level as `USER.md`
+/// (hand-written by the operator) and, like it, main agent only.
+///
+/// `~/.agents` hangs off the **real** home directory, not `KOMO_HOME`: the file
+/// is shared, so it does not move when komo's own directory does.
+fn global_instruction_files(agents_dir: &Path, komo_home: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("~/.komo/AGENTS.md", komo_home.join("AGENTS.md")),
+        ("~/.agents/AGENTS.md", agents_dir.join("AGENTS.md")),
+    ]
+}
+
+/// Default `~/.agents`. An unresolvable home directory yields a path that simply
+/// never exists, which reads the same as "the operator keeps no such file".
+fn default_agents_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".agents")
+}
 
 /// Assembles komo's system prompt from cache-ordered tiers.
 ///
@@ -194,6 +225,11 @@ pub struct SystemPromptBuilder {
     /// aux/reviewer/briefing stay lean, and the reviewer must not have the
     /// profile bias its extraction).
     include_user_profile: bool,
+    /// Inject the machine-wide instruction files (main agent only, same
+    /// reasoning as `include_user_profile`).
+    include_global_instructions: bool,
+    /// Directory holding the shared `AGENTS.md` — `~/.agents`, overridden in tests.
+    agents_dir: PathBuf,
     model: String,
     provider: &'static str,
     home: PathBuf,
@@ -220,6 +256,8 @@ impl SystemPromptBuilder {
             workspace_root: None,
             operations_manual: false,
             include_user_profile: false,
+            include_global_instructions: false,
+            agents_dir: default_agents_dir(),
             model: config.model.clone(),
             provider: config.provider.name(),
             home: komo_home(),
@@ -260,10 +298,26 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Inject the operator's machine-wide instructions into the stable tier
+    /// (main agent only): `~/.komo/AGENTS.md` if it exists, else the shared
+    /// `~/.agents/AGENTS.md`.
+    pub fn global_instructions(mut self) -> Self {
+        self.include_global_instructions = true;
+        self
+    }
+
     /// Override the home directory used to look up `SOUL.md` (tests).
     #[cfg(test)]
     fn home(mut self, home: PathBuf) -> Self {
         self.home = home;
+        self
+    }
+
+    /// Point `~/.agents` somewhere else, and turn the injection on (tests).
+    #[cfg(test)]
+    fn global_instructions_in(mut self, agents_dir: PathBuf) -> Self {
+        self.agents_dir = agents_dir;
+        self.include_global_instructions = true;
         self
     }
 
@@ -295,6 +349,21 @@ impl SystemPromptBuilder {
                 .filter(|s| !s.is_empty())
             {
                 parts.push(format!("{USER_PROFILE_HEADER}\n\n{profile}"));
+            }
+        }
+
+        // Machine-wide instructions, komo's own file first. After the profile
+        // (who this is for) and before the tool guidance they may want to
+        // qualify. Head-capped like a project instruction file — a long shared
+        // file must not crowd out komo's own guidance.
+        if self.include_global_instructions {
+            for (label, path) in global_instruction_files(&self.agents_dir, &self.home) {
+                if let Some(text) = read_instructions(&path) {
+                    parts.push(format!(
+                        "The following are the operator's global agent instructions, from {label}:\n\n{text}"
+                    ));
+                    break;
+                }
             }
         }
 
@@ -347,17 +416,11 @@ impl SystemPromptBuilder {
             return String::new();
         };
         for name in CONTEXT_FILES {
-            let Ok(content) = std::fs::read_to_string(root.join(name)) else {
-                continue;
-            };
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                continue;
+            if let Some(text) = read_instructions(&root.join(name)) {
+                return format!(
+                    "The following are project instructions from `{name}` in the working directory:\n\n{text}"
+                );
             }
-            let body = cap(trimmed, CONTEXT_FILE_CAP);
-            return format!(
-                "The following are project instructions from `{name}` in the working directory:\n\n{body}"
-            );
         }
         String::new()
     }
@@ -390,6 +453,11 @@ impl SystemPromptBuilder {
         if self.include_user_profile {
             fp.push(mtime(&self.home.join("USER.md")));
         }
+        if self.include_global_instructions {
+            for (_, path) in global_instruction_files(&self.agents_dir, &self.home) {
+                fp.push(mtime(&path));
+            }
+        }
         if let Some(root) = &self.workspace_root {
             for name in CONTEXT_FILES {
                 fp.push(mtime(&root.join(name)));
@@ -419,6 +487,17 @@ impl SystemPromptBuilder {
         };
         join(vec![stable_context, self.volatile()])
     }
+}
+
+/// An instruction file's body, head-capped and ready to inject. `None` when the
+/// file is missing, unreadable, or blank — all three mean "the operator keeps no
+/// instructions here", so the next candidate in the group gets its turn.
+fn read_instructions(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some(cap(&text, CONTEXT_FILE_CAP))
 }
 
 /// Join non-empty parts with a blank line between them.
@@ -594,6 +673,172 @@ mod tests {
             !p.contains("~/.komo/USER.md"),
             "no header for a blank profile"
         );
+    }
+
+    #[test]
+    fn global_instructions_are_opt_in_main_agent_only_and_stable_tier() {
+        let home = tmp("global_home");
+        let agents = tmp("global_agents");
+        std::fs::write(agents.join("AGENTS.md"), "Always answer in Chinese.").unwrap();
+
+        // Off by default (aux/reviewer/briefing builders).
+        let off = SystemPromptBuilder::new(&config())
+            .home(home.clone())
+            .build();
+        assert!(
+            !off.contains("Always answer in Chinese."),
+            "global instructions must be gated off by default"
+        );
+
+        let on = SystemPromptBuilder::new(&config())
+            .home(home)
+            .global_instructions_in(agents)
+            .build();
+        assert!(on.contains("Always answer in Chinese."));
+        assert!(on.contains("~/.agents/AGENTS.md"), "the block is labeled");
+        let text_at = on.find("Always answer in Chinese.").unwrap();
+        let date_at = on.find("Today's date is").unwrap();
+        assert!(text_at < date_at, "belongs to the stable prefix");
+    }
+
+    /// Within the machine-wide scope only one file is injected, and komo's own
+    /// beats the one shared with other agents.
+    #[test]
+    fn komo_home_agents_file_outranks_the_shared_one() {
+        let home = tmp("global_prec_home");
+        let agents = tmp("global_prec_agents");
+        std::fs::write(home.join("AGENTS.md"), "komo-specific rule.").unwrap();
+        std::fs::write(agents.join("AGENTS.md"), "shared rule.").unwrap();
+
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .global_instructions_in(agents)
+            .build();
+        assert!(p.contains("komo-specific rule."));
+        assert!(!p.contains("shared rule."), "only the winner is injected");
+        assert!(p.contains("~/.komo/AGENTS.md"));
+        assert!(!p.contains("~/.agents/AGENTS.md"));
+    }
+
+    /// The same rule one scope down: a repo keeping both files (very often
+    /// `CLAUDE.md` symlinked to `AGENTS.md`) contributes one block, not two.
+    #[test]
+    fn workspace_agents_file_outranks_claude_md() {
+        let root = tmp("ctx_prec_root");
+        std::fs::write(root.join("AGENTS.md"), "canonical project rule.").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "stale copy.").unwrap();
+
+        let p = SystemPromptBuilder::new(&config())
+            .home(tmp("ctx_prec_home"))
+            .workspace_root(Some(root))
+            .build();
+        assert!(p.contains("canonical project rule."));
+        assert!(!p.contains("stale copy."));
+        assert!(p.contains("project instructions from `AGENTS.md`"));
+        assert_eq!(
+            p.matches("project instructions from").count(),
+            1,
+            "exactly one project block"
+        );
+    }
+
+    /// Both scopes are in play at once: one machine-wide block and one project
+    /// block, the project one last so it reads as the more specific override.
+    #[test]
+    fn machine_wide_and_project_instructions_both_land() {
+        let home = tmp("both_home");
+        let agents = tmp("both_agents");
+        let root = tmp("both_root");
+        std::fs::write(agents.join("AGENTS.md"), "machine-wide rule.").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "project rule.").unwrap();
+
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .global_instructions_in(agents)
+            .workspace_root(Some(root))
+            .build();
+        let global_at = p.find("machine-wide rule.").expect("machine-wide block");
+        let project_at = p.find("project rule.").expect("project block");
+        assert!(global_at < project_at, "project instructions come last");
+    }
+
+    #[test]
+    fn global_instructions_absent_when_file_missing_or_empty() {
+        let home = tmp("global_empty_home");
+        let agents = tmp("global_empty_agents");
+        let p = SystemPromptBuilder::new(&config())
+            .home(home.clone())
+            .global_instructions_in(agents.clone())
+            .build();
+        assert!(
+            !p.contains("global agent instructions"),
+            "no header when absent"
+        );
+
+        std::fs::write(agents.join("AGENTS.md"), "\n \n").unwrap();
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .global_instructions_in(agents)
+            .build();
+        assert!(
+            !p.contains("global agent instructions"),
+            "no header when blank"
+        );
+    }
+
+    /// A blank `~/.komo/AGENTS.md` must not shadow a real shared one — "present
+    /// but empty" means the operator keeps nothing there.
+    #[test]
+    fn a_blank_higher_priority_file_falls_through() {
+        let home = tmp("fallthrough_home");
+        let agents = tmp("fallthrough_agents");
+        std::fs::write(home.join("AGENTS.md"), "   \n").unwrap();
+        std::fs::write(agents.join("AGENTS.md"), "shared rule.").unwrap();
+
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .global_instructions_in(agents)
+            .build();
+        assert!(p.contains("shared rule."));
+        assert!(p.contains("~/.agents/AGENTS.md"));
+    }
+
+    /// What wiring actually reads: the shared file under the **real** home
+    /// directory, not `KOMO_HOME`; komo's own under `KOMO_HOME`, and it goes first.
+    #[test]
+    fn global_instruction_files_resolve_to_the_documented_paths() {
+        assert_eq!(default_agents_dir().parent(), dirs::home_dir().as_deref());
+
+        let komo_home = PathBuf::from("/komo-home");
+        let files = global_instruction_files(&default_agents_dir(), &komo_home);
+        assert_eq!(files[0].0, "~/.komo/AGENTS.md", "komo's own is tried first");
+        assert_eq!(files[0].1, komo_home.join("AGENTS.md"));
+        assert_eq!(files[1].0, "~/.agents/AGENTS.md");
+        assert!(files[1].1.ends_with(".agents/AGENTS.md"));
+    }
+
+    /// The prompt is memoized per builder; editing the shared file has to take
+    /// effect on the next turn without restarting the gateway.
+    #[test]
+    fn editing_global_instructions_busts_the_cache() {
+        let agents = tmp("global_cache_agents");
+        let path = agents.join("AGENTS.md");
+        std::fs::write(&path, "first").unwrap();
+        let builder = SystemPromptBuilder::new(&config())
+            .home(tmp("global_cache_home"))
+            .global_instructions_in(agents);
+        assert!(builder.build().contains("first"));
+
+        std::fs::write(&path, "second").unwrap();
+        // mtime is second-precision on some filesystems; move it explicitly so
+        // the fingerprint change is not a race.
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        let rebuilt = builder.build();
+        assert!(rebuilt.contains("second"), "edit must be picked up");
+        assert!(!rebuilt.contains("first"));
     }
 
     #[test]

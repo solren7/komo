@@ -125,6 +125,15 @@ become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
 `HASS_TOKEN` (channel offline, others unaffected). **Never re-read config.toml
 or call `std::env::var` in callers** — the only exception is `KOMO_HOME`.
 
+Operator-authored prompt files (`agent/system_prompt.rs`, main agent only):
+persona `~/.komo/SOUL.md`, profile `~/.komo/USER.md`, and **one instruction file
+per scope, first found wins** — machine-wide `~/.komo/AGENTS.md` else
+`~/.agents/AGENTS.md` (the latter under the real home, not `KOMO_HOME`, since
+other agents share it), plus project `AGENTS.md` else `CLAUDE.md` else
+`.cursorrules` from the working directory. Taking only the first match per scope
+is what keeps a `CLAUDE.md`→`AGENTS.md` symlink from being injected twice. All of
+them are head-capped and re-read on mtime change (no restart needed).
+
 Channels (`[channels.feishu|telegram|wechat|homeassistant]`): behavior keys in
 the table, credentials in `.env`. `allow_from` pre-trusts senders; everyone
 else must pair (`komo pair approve <code>`; codes stored salted-hashed,
@@ -182,7 +191,8 @@ error aborts the turn.
   ends without its terminal frame is a retryable failure, never a short answer.
   A new provider is a base URL + auth mode, not new code.
 - `infra/llm.rs` — `ProviderLlm` over that layer; `assemble` builds the tiered
-  system prompt once per turn (stable tier incl. `~/.komo/USER.md`, then memory
+  system prompt once per turn (stable tier incl. `~/.komo/USER.md` and the
+  machine-wide instruction file, then memory
   prefix from `MemoryEnricher` — main agent only). `RoutingLlm` = cross-provider
   dispatch. Reasoning blocks are echoed back verbatim each round, which is what
   carries a reasoning model's chain of thought across a tool loop.

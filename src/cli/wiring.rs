@@ -342,7 +342,10 @@ pub async fn build(
             .operations_manual()
             // …and the operator-authored user profile (~/.komo/USER.md), for the
             // same reason the aux/reviewer/briefing builders don't get it.
-            .user_profile(),
+            .user_profile()
+            // …and their machine-wide agent instructions (~/.agents/AGENTS.md),
+            // shared with whatever other agents read that directory.
+            .global_instructions(),
     );
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 

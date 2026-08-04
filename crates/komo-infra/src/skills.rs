@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::domain::{
+use komo_core::domain::{
     repository::SkillRepository,
     skill::{SOURCE_REVIEWER, Skill, valid_skill_name},
 };
@@ -349,7 +349,7 @@ fn render(skill: &Skill) -> String {
     if !skill.description.is_empty() {
         front.push_str(&format!("description: {}\n", skill.description));
     }
-    if skill.source != crate::domain::skill::SOURCE_USER {
+    if skill.source != komo_core::domain::skill::SOURCE_USER {
         front.push_str(&format!("source: {}\n", skill.source));
     }
     if skill.protected {

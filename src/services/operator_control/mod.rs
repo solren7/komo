@@ -24,8 +24,8 @@ pub use request::*;
 
 use crate::domain::run::RunRepository;
 use crate::infra::gateway_client::GatewayClient;
-use crate::infra::persistence::{db::Db, kanban::KanbanDb};
 use komo_config::RuntimeConfig;
+use komo_infra::persistence::{db::Db, kanban::KanbanDb};
 
 use direct::DirectOperatorAdapter;
 use gateway::GatewayOperatorAdapter;

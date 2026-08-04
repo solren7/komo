@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 use tracing::info;
 
-use crate::infra::persistence::{
+use crate::persistence::{
     DEFAULT_POOL_SIZE, ensure_columns, prepare_turso_path, turso_marker_path, with_write_retry,
 };
 
-use crate::domain::{
+use komo_core::domain::{
     home::HomeRepository,
     message::{Message, Role},
     pairing::{
@@ -1366,7 +1366,7 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         disabled: false,
         // Every db-era skill was a reviewer extraction (there was no other
         // writer); tag it so the imported candidate shows its provenance.
-        source: crate::domain::skill::SOURCE_REVIEWER.to_string(),
+        source: komo_core::domain::skill::SOURCE_REVIEWER.to_string(),
     }
 }
 
@@ -1397,17 +1397,17 @@ fn reminder_from_record(record: ReminderRecord) -> Reminder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::reminder::ReminderStatus;
+    use komo_core::domain::reminder::ReminderStatus;
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
     }
 
     #[tokio::test]
     async fn run_ledger_roundtrips_with_ordered_steps() {
-        use crate::domain::run::{Run, RunStatus, RunStep};
+        use komo_core::domain::run::{Run, RunStatus, RunStep};
         let db = Db::connect(&sqlite_url("komo_run_repo_test.db"))
             .await
             .unwrap();
@@ -1479,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_prune_drops_old_runs_and_their_steps() {
-        use crate::domain::run::{Run, RunStatus, RunStep};
+        use komo_core::domain::run::{Run, RunStatus, RunStep};
         let db = Db::connect(&sqlite_url("komo_run_prune_test.db"))
             .await
             .unwrap();
@@ -1540,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_interrupted_fails_only_running_runs() {
-        use crate::domain::run::{INTERRUPTED_ERROR, Run, RunStatus};
+        use komo_core::domain::run::{INTERRUPTED_ERROR, Run, RunStatus};
         let db = Db::connect(&sqlite_url("komo_run_reconcile_test.db"))
             .await
             .unwrap();
@@ -1666,7 +1666,7 @@ mod tests {
             .await
             .unwrap();
         let now_unix = chrono::Utc::now().timestamp();
-        let reminder = crate::domain::reminder::Reminder::recurring(
+        let reminder = komo_core::domain::reminder::Reminder::recurring(
             "take medication".to_string(),
             now_unix + 3600,
             "0 9 * * *".to_string(),
@@ -1711,7 +1711,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_session_todo_set_get_clear() {
-        use crate::domain::todo::{TodoItem, TodoStatus};
+        use komo_core::domain::todo::{TodoItem, TodoStatus};
         let db = Db::connect(&sqlite_url("komo_session_todo_test.db"))
             .await
             .unwrap();
@@ -1773,7 +1773,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_pairing_upsert_approve_revoke_roundtrip() {
-        use crate::domain::pairing::ApproveOutcome;
+        use komo_core::domain::pairing::ApproveOutcome;
 
         let db = Db::connect(&sqlite_url("komo_pairing_repo_test.db"))
             .await
@@ -1788,7 +1788,10 @@ mod tests {
         // The plaintext code is never persisted — only the salted hash.
         assert_eq!(found.code_hash, request.code_hash);
         assert_ne!(found.code_hash, code);
-        assert_eq!(found.status, crate::domain::pairing::PairingStatus::Pending);
+        assert_eq!(
+            found.status,
+            komo_core::domain::pairing::PairingStatus::Pending
+        );
         assert_eq!(
             PairingRepository::count_active_pending(&db, "telegram")
                 .await
@@ -1821,7 +1824,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             found.status,
-            crate::domain::pairing::PairingStatus::Approved
+            komo_core::domain::pairing::PairingStatus::Approved
         );
 
         assert!(
@@ -1844,7 +1847,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_pairing_locks_out_after_repeated_bad_codes() {
-        use crate::domain::pairing::{APPROVE_MAX_FAILURES, ApproveOutcome};
+        use komo_core::domain::pairing::{APPROVE_MAX_FAILURES, ApproveOutcome};
 
         let db = Db::connect(&sqlite_url("komo_pairing_lockout_test.db"))
             .await
@@ -1953,7 +1956,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "debug-builds");
         assert!(rows[0].protected);
-        assert_eq!(rows[0].source, crate::domain::skill::SOURCE_REVIEWER);
+        assert_eq!(rows[0].source, komo_core::domain::skill::SOURCE_REVIEWER);
     }
 
     #[tokio::test]
@@ -2050,7 +2053,7 @@ mod tests {
     #[tokio::test]
     async fn adds_missing_session_columns_in_place() {
         let path = std::env::temp_dir().join("komo_db_addcol.db");
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD session_records shape (no
         //    reviewed_through) plus its messages table, then drop the handle.
@@ -2146,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn adds_missing_run_columns_in_place() {
         let path = std::env::temp_dir().join("komo_db_addcol_runs.db");
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD run_records shape (no recoverable):
         //    one crash-residue row, still `running` with the ended_at sentinel.

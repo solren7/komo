@@ -15,8 +15,8 @@ use crate::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
-use crate::infra::logs;
 use crate::tools::fs_common;
+use komo_infra::logs;
 
 /// Lines returned when the caller doesn't say.
 const DEFAULT_LINES: usize = 120;

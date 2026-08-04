@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use komo_infra::skills::FsSkillStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -12,7 +13,6 @@ use crate::{
         skill::{SOURCE_LEARNED, Skill},
         tool::{Tool, ToolError, ToolOutput, parse_args},
     },
-    infra::skills::FsSkillStore,
     services::skill_registry::{LocatedSkill, SkillRegistry, skill_files},
 };
 

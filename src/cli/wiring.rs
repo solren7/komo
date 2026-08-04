@@ -5,6 +5,10 @@
 //! that differs is the `Approver` — interactive at a TTY vs. auto-deny in the
 //! unattended gateway — so it is passed in.
 
+use komo_infra::memory::memory_db::MemoryDb;
+use komo_infra::permissions_store::PermissionsStore;
+use komo_infra::persistence::{db::Db, kanban::KanbanDb};
+use komo_infra::skills::FsSkillStore;
 use std::sync::Arc;
 
 use crate::{
@@ -16,13 +20,7 @@ use crate::{
         approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
         repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
     },
-    infra::{
-        llm::{PreambleFn, build_llm},
-        memory::memory_db::MemoryDb,
-        permissions_store::PermissionsStore,
-        persistence::{db::Db, kanban::KanbanDb},
-        skills::FsSkillStore,
-    },
+    infra::llm::{PreambleFn, build_llm},
     services::{
         clarify::ClarifyState,
         memory_enrichment::MemoryEnricher,
@@ -183,7 +181,7 @@ pub async fn build(
     //   <workspace>/.claude/skills, the governed ~/.komo/skills store, then the
     //   user-global ~/.agents/skills and ~/.claude/skills shared by other agents.
     let root = workspace.roots().first().cloned().unwrap_or_default();
-    let skill_dirs = crate::infra::skills::runtime_skill_dirs(
+    let skill_dirs = komo_infra::skills::runtime_skill_dirs(
         &config.runtime.skills_path,
         &root,
         skill_store.root(),

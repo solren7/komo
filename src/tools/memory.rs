@@ -357,7 +357,7 @@ fn render_scored(hits: &[ScoredMemory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::memory::md_memory::MdMemoryStore;
+    use komo_infra::memory::md_memory::MdMemoryStore;
 
     fn temp_tool(name: &str) -> MemoryTool {
         let dir = std::env::temp_dir().join(name);

@@ -123,8 +123,10 @@ pub(crate) fn stage_sqlite_backup(path: &Path) -> anyhow::Result<()> {
 /// it (`-log`/`-wal`/`-shm`/`-journal`, plus our `.turso`/`.sqlite-backup`), so a
 /// reused temp path starts clean. A stale MVCC `-log` against a fresh header is
 /// read as corruption, so this must be thorough.
-#[cfg(test)]
-pub(crate) fn reset_test_db(path: &Path) {
+/// Exposed to dependent crates' tests through the `test-support` feature (the
+/// agent's own tests reuse it), so it still never exists in a release build.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_test_db(path: &Path) {
     for suffix in [
         "",
         "-log",

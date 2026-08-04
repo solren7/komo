@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::domain::policy::{
+use komo_core::domain::policy::{
     Access, Category, Effect, Matcher, Rule, SavedRules, category_str, matcher_str,
 };
 
@@ -241,7 +241,7 @@ fn from_rule(rule: &Rule, now: &str) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::ActionRef;
+    use komo_core::domain::approval::ActionRef;
 
     fn home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("komo_perms_{tag}"));

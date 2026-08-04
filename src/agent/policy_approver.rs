@@ -18,8 +18,8 @@ use crate::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
     policy::{Policy, Rule, Verdict, channel_of},
 };
-use crate::infra::permissions_store::PermissionsStore;
 use crate::services::tool_execution::current_session;
+use komo_infra::permissions_store::PermissionsStore;
 
 /// Wraps an [`Approver`], applying a [`Policy`] before falling back to it.
 pub struct PolicyApprover {

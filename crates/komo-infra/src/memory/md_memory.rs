@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::domain::memory::{
+use komo_core::domain::memory::{
     Memory, MemoryConfidence, MemoryRepository, MemoryScope, MemoryStatus, parse_memory_confidence,
     parse_memory_kind, parse_memory_status,
 };
@@ -165,7 +165,7 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
         content: body.trim().to_string(),
         status: status.unwrap_or(default_status),
         confidence: confidence.unwrap_or(default_confidence),
-        importance: importance.unwrap_or(crate::domain::memory::DEFAULT_IMPORTANCE),
+        importance: importance.unwrap_or(komo_core::domain::memory::DEFAULT_IMPORTANCE),
         pinned,
         scope: MemoryScope::from_parts(&scope_type, &scope_key),
         source,
@@ -208,7 +208,7 @@ impl MemoryRepository for MdMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::MemoryKind;
+    use komo_core::domain::memory::MemoryKind;
 
     fn temp_store(name: &str) -> MdMemoryStore {
         let dir = std::env::temp_dir().join(name);

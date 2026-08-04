@@ -11,12 +11,12 @@
 //! here: with no gateway the run executes in-process with interactive approval
 //! at the TTY, built on the very stores the operator backend already opened.
 
+use komo_infra::persistence::cron::CronDb;
 use std::sync::Arc;
 
 use crate::{
     cli::{approver::CliApprover, wiring},
     domain::approval::Approver,
-    infra::persistence::cron::CronDb,
     services::operator_control::OperatorControl,
 };
 use komo_config::ConfigSnapshot;

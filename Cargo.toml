@@ -11,6 +11,8 @@ komo-core = { path = "crates/komo-core" }
 komo-provider = { path = "crates/komo-provider" }
 # Config resolution (config.toml + .env + KOMO_* env into one snapshot).
 komo-config = { path = "crates/komo-config" }
+# Storage + the outbound adapters that depend on nothing above them.
+komo-infra = { path = "crates/komo-infra" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -96,9 +98,16 @@ similar = "3.1.1"
 tokio = { version = "1.52.0", features = ["full", "test-util"] }
 # `ServiceExt::oneshot`, to drive a router in-process (api channel CORS tests).
 tower = { version = "0.5", features = ["util"] }
+# `reset_test_db` for the agent-runtime tests (feature is off in real builds).
+komo-infra = { path = "crates/komo-infra", features = ["test-support"] }
 
 [workspace]
-members = ["crates/komo-core", "crates/komo-config", "crates/komo-provider"]
+members = [
+    "crates/komo-core",
+    "crates/komo-config",
+    "crates/komo-provider",
+    "crates/komo-infra",
+]
 resolver = "3"
 
 # Dev builds keep file/line backtraces but skip full variable debuginfo —

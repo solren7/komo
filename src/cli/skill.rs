@@ -8,9 +8,9 @@
 
 use crate::{
     cli::inspect::local_time,
-    infra::skills::FsSkillStore,
     services::operator_control::{OperatorControl, OperatorQuery, OperatorQueryResult},
 };
+use komo_infra::skills::FsSkillStore;
 use std::{collections::HashSet, path::PathBuf};
 
 fn store() -> FsSkillStore {

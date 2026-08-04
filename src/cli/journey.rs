@@ -13,6 +13,7 @@
 //! from the current status plus `updated_at > created_at`. Skill event times
 //! come from the `SKILL.md` file mtimes (proposal / activation).
 
+use komo_infra::skills::FsSkillStore;
 use std::path::Path;
 
 use crate::{
@@ -21,7 +22,6 @@ use crate::{
         memory::{Memory, MemoryStatus},
         skill::Skill,
     },
-    infra::skills::FsSkillStore,
     services::operator_control::OperatorControl,
 };
 

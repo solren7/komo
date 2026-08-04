@@ -9,8 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 
-use crate::domain::cron::{CronAction, CronJob, CronJobRepository, parse_cron_run_status};
-use crate::infra::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
+use crate::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
+use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository, parse_cron_run_status};
 
 // Optional i64 fields use 0 as the "unset" sentinel; `args` is a JSON array
 // string; `enabled` is 0/1; `last_status` is ""/"ok"/"failed" (same conventions
@@ -60,7 +60,7 @@ impl CronDb {
                 ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
                 ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
             ];
-            crate::infra::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
+            crate::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
         }
         let driver = match &path {
             Some(p) => Turso::file(p).concurrent_writes(),
@@ -77,7 +77,7 @@ impl CronDb {
         if let Some(p) = &path {
             // Born Turso-native: stamp the marker so the shared prologue never
             // mistakes this file for a legacy SQLite db later.
-            let marker = crate::infra::persistence::turso_marker_path(p);
+            let marker = crate::persistence::turso_marker_path(p);
             if !marker.exists() {
                 std::fs::write(&marker, b"turso-native\n").ok();
             }
@@ -265,11 +265,11 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::cron::CronRunStatus;
+    use komo_core::domain::cron::CronRunStatus;
 
     fn turso_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
     }
 
@@ -337,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn upgrades_command_only_schema_in_place() {
         let path = std::env::temp_dir().join("komo_cron_addcol.db");
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD command-only schema (no
         //    kind/prompt/skills) + one command row, then drop the handle.
@@ -370,7 +370,7 @@ mod tests {
             .unwrap();
         }
         std::fs::write(
-            crate::infra::persistence::turso_marker_path(&path),
+            crate::persistence::turso_marker_path(&path),
             b"turso-native\n",
         )
         .unwrap();

@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Duration;
 
-use crate::infra::logs;
+use komo_infra::logs;
 
 /// How often follow mode polls the file for appended bytes.
 const FOLLOW_POLL: Duration = Duration::from_millis(500);

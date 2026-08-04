@@ -147,7 +147,7 @@ fn model_health(config: &ConfigSnapshot) {
     } else {
         // Codex authenticates from ~/.codex/auth.json — validate that
         // login rather than looking for an env key.
-        match crate::infra::codex::CodexAuth::load() {
+        match komo_infra::codex::CodexAuth::load() {
             Ok(_) => println!("  {OK} Codex OAuth (~/.codex/auth.json)"),
             Err(e) => println!("  {BAD} Codex auth: {e}"),
         }
@@ -186,7 +186,7 @@ fn policy_health(config: &ConfigSnapshot) {
     println!("\npolicy:");
     // Saved grants are reported whether or not a [policy] table exists — they are
     // accumulated at runtime, so an operator with no config can still have them.
-    let saved = crate::infra::permissions_store::PermissionsStore::load(&config.runtime.home);
+    let saved = komo_infra::permissions_store::PermissionsStore::load(&config.runtime.home);
     if !saved.is_empty() {
         println!(
             "  {OK} {} saved grant(s) from approval prompts  (see `komo policy saved list`)",

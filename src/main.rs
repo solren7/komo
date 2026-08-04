@@ -138,6 +138,6 @@ fn open_tui_log() -> Option<std::fs::File> {
         .ok()?;
     // Tell the `logs` tool where this process's own diagnostics land, so the
     // agent can read them mid-conversation without guessing at a filename.
-    infra::logs::set_active(path);
+    komo_infra::logs::set_active(path);
     Some(file)
 }

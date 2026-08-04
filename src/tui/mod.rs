@@ -29,6 +29,7 @@ mod markdown;
 mod paste;
 mod ui;
 
+use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use std::{io, path::PathBuf, sync::Arc};
 
 use crossterm::{
@@ -53,10 +54,7 @@ use crate::{
         repository::{MessageRepository, SessionRepository},
         session::Session,
     },
-    infra::{
-        gateway_client::{GatewayClient, folder_workspace_id, folder_workspace_path},
-        persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
-    },
+    infra::gateway_client::{GatewayClient, folder_workspace_id, folder_workspace_path},
     services::{
         clarify::ClarifyState,
         tool_execution::{SessionContext, with_session},

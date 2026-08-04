@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 use tracing::info;
 
-use crate::domain::task::{Task, TaskRepository, parse_task_status};
-use crate::infra::persistence::{
+use crate::persistence::{
     DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
 };
+use komo_core::domain::task::{Task, TaskRepository, parse_task_status};
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
 #[derive(Debug, toasty::Model)]
@@ -223,11 +223,11 @@ fn task_from_record(record: TaskRecord) -> anyhow::Result<Task> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::task::TaskStatus;
+    use komo_core::domain::task::TaskStatus;
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
     }
 

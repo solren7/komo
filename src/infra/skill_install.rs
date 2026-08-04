@@ -22,7 +22,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::domain::skill::Skill;
-use crate::infra::skills::FsSkillStore;
+use komo_infra::skills::FsSkillStore;
 
 /// Outcome of a successful install.
 pub struct Installed {

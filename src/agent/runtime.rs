@@ -524,6 +524,8 @@ fn stop_reply(stopped: &str, current: &str, narration: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_infra::persistence::db::Db;
+
     use crate::{
         agent::interaction::CancelState,
         domain::{
@@ -534,7 +536,6 @@ mod tests {
             session::Session,
             tool::{Tool, ToolError, ToolOutput},
         },
-        infra::persistence::db::Db,
         tools::time::TimeTool,
     };
     use async_trait::async_trait;
@@ -649,7 +650,7 @@ mod tests {
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        crate::infra::persistence::reset_test_db(&path);
+        komo_infra::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
     }
 

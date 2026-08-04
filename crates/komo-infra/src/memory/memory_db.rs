@@ -20,13 +20,13 @@ use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 use tracing::info;
 
-use crate::domain::memory::{
+use crate::memory::md_memory::MdMemoryStore;
+use crate::persistence::{
+    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
+};
+use komo_core::domain::memory::{
     Memory, MemoryRepository, MemoryScope, parse_memory_confidence, parse_memory_kind,
     parse_memory_status,
-};
-use crate::infra::memory::md_memory::MdMemoryStore;
-use crate::infra::persistence::{
-    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
 };
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
@@ -298,7 +298,7 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "\"recall_query_hashes\" text NOT NULL DEFAULT ''",
         ),
     ];
-    crate::infra::persistence::ensure_columns(path, "memory_records", EXPECTED).await
+    crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await
 }
 
 /// Read every memory row from a legacy SQLite db file (opened with toasty's
@@ -320,11 +320,11 @@ async fn extract_sqlite_rows(backup: &Path) -> anyhow::Result<Vec<Memory>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryConfidence, MemoryContext, MemoryKind, MemoryStatus};
+    use komo_core::domain::memory::{MemoryConfidence, MemoryContext, MemoryKind, MemoryStatus};
 
     fn turso_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
         format!("turso:{}", path.display())
     }
 
@@ -334,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn migrates_legacy_sqlite_file_into_turso() {
         let path = std::env::temp_dir().join("komo_memory_db_migrate.db");
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
 
         // 1. Seed a legacy SQLite file with two memories via the SQLite driver.
         {
@@ -408,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn adds_missing_recall_columns_in_place() {
         let path = std::env::temp_dir().join("komo_memory_db_addcol.db");
-        crate::infra::persistence::reset_test_db(&path);
+        crate::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD 15-column schema (no recall_count)
         //    and one row, then drop the handle.

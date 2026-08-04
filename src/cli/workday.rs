@@ -5,7 +5,7 @@
 //! without waiting for a scheduled sweep. Defaults to today.
 
 use crate::domain::workday::WorkdayCalendar;
-use crate::infra::workday::HolidayCalendar;
+use komo_infra::workday::HolidayCalendar;
 
 pub async fn check(date: Option<String>) -> anyhow::Result<()> {
     let date = match date {

@@ -1,3 +1,4 @@
+use komo_infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,6 @@ use crate::{
         message::{Message, Role},
         session::Session,
     },
-    infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers},
     services::memory_enrichment::MemoryEnricher,
 };
 use komo_config::{ModelConfig, Provider, split_model_id};

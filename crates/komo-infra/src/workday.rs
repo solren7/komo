@@ -26,7 +26,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::domain::workday::{WorkdayCalendar, is_weekday};
+use komo_core::domain::workday::{WorkdayCalendar, is_weekday};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const API_BASE: &str = "https://api.jiejiariapi.com/v1/holidays";

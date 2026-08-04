@@ -44,7 +44,7 @@ Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 results and per-round token usage). Turns run in `run` spans, tool calls in `tool` spans,
 matching the run ledger. The chat TUI logs to `~/.komo/logs/chat-tui.log`
 instead (stderr would tear the alternate screen) and registers that path with
-`infra::logs::set_active`, which is how the `logs` tool finds the current
+`komo_infra::logs::set_active`, which is how the `logs` tool finds the current
 process's own log mid-conversation.
 
 ## Data & storage rules
@@ -65,14 +65,14 @@ is not idempotent):
 - New table / non-additive change on disposable state → delete the affected
   file (`TaskRecord`→kanban.db, `CronJobRecord`→cron.db, anything else incl.
   `RunRecord`/`RunStepRecord`→state.db).
-- **Column additions never need a reset**: `infra/persistence/mod.rs::ensure_columns`
+- **Column additions never need a reset**: `komo-infra/src/persistence/mod.rs::ensure_columns`
   ALTERs in place on connect. Extend `EXPECTED` in `memory_db.rs` for
   `MemoryRecord` columns, and the matching list in `db.rs::connect` for
   state.db (`SESSION_COLUMNS` / `MESSAGE_COLUMNS` / `RUN_COLUMNS` /
   `STEP_COLUMNS`). Columns must be NOT NULL + DEFAULT, or nullable.
   Durable data (memory.db) must **only** ever change additively.
 
-Turso/toasty invariants (`infra/persistence/`, `infra/memory/memory_db.rs` —
+Turso/toasty invariants (`komo-infra`'s `persistence/`, `memory/memory_db.rs` —
 the only places the ORM appears; model structs private to their file):
 
 - Backend is Turso in MVCC `concurrent_writes` mode; no `rusqlite`. DB URL is
@@ -158,7 +158,7 @@ aux callers.
 
 The `codex` provider authenticates from the Codex CLI's OAuth file
 (`~/.codex/auth.json`, auto-refreshed) instead of an env key, and requires
-streaming — see `infra/codex.rs`.
+streaming — see `komo-infra/src/codex.rs`.
 
 ## Architecture
 
@@ -173,6 +173,24 @@ LLM crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is w
 round-level control lives (`max_turns` budget, cancellation, clarify). Tool
 errors return as outcome content the model can recover from; only a driver/LLM
 error aborts the turn.
+
+**Crate layout.** The lower half of the tree is split out of the binary so it
+compiles in parallel and so an edit there does not rebuild everything (`src/` was
+one 50k-line crate). Depend downward only:
+
+```
+komo-core      traits + value types, no I/O, no runtime — the GUI client reuses it
+komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot   (→ core)
+komo-provider  wire formats + HTTP/SSE; references nothing else in komo
+komo-infra     persistence · memory · skills · logs · workday ·
+               permissions_store · codex                     (→ core, config, provider)
+komo (bin)     agent · services · tools · tui · cli, plus the parts of the old
+               `infra/` that reach upward (llm.rs, messaging/, gateway_client,
+               skill_install) — see `src/infra/mod.rs`
+```
+
+A dependent crate's tests reach `persistence::reset_test_db` through
+komo-infra's `test-support` feature (a dev-dependency, so it never ships).
 
 **Module map** (one line each; read the module for details):
 
@@ -218,7 +236,7 @@ error aborts the turn.
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
   hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
   `skill`, `cron`, `delegate`, `ask_user` (clarify), `logs` (tail of komo's own
-  tracing log — file lookup shared with `komo logs` via `infra/logs.rs`, same
+  tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`).
 - `tools/delegate.rs` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
@@ -248,7 +266,7 @@ error aborts the turn.
   truncated not scrubbed. `komo run resume` re-dispatches a *fresh* primed
   turn (the ledger is an audit record, not a checkpoint); `recoverable` is set
   only by crash reconciliation, cleared at-most-once, never auto-resumed.
-- `domain/skill.rs` + `infra/skills.rs` + `services/skill_registry.rs` —
+- `domain/skill.rs` + `komo-infra`'s `skills` + `services/skill_registry.rs` —
   skills are `SKILL.md` files under `~/.komo/skills/` (active) and
   `.candidates/` (proposals). Automated writes (`save` — reviewer + `skill
   learn`) only ever produce candidates; `install` is the human-in-the-loop
@@ -262,7 +280,7 @@ error aborts the turn.
   crash never re-fires a slot), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
   runtime with read-only tools + deny-all unattended approver; degrades to
   tool-less `complete` on error), `DreamSweep`. `WorkdayGated` decorator gates
-  a sweep to Chinese working days (`infra/workday.rs`, cached per-year).
+  a sweep to Chinese working days (`komo-infra`'s `workday`, cached per-year).
 - `agent/gateway.rs` + `agent/interaction.rs` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). Chat commands: `/new` (rotate

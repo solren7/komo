@@ -5,6 +5,8 @@
 //! never touches memory.db or kanban.db, and a batch of memory transitions
 //! reuses one connection instead of reconnecting per id.
 
+use komo_infra::memory::memory_db::MemoryDb;
+use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use std::sync::Arc;
 
 use tokio::sync::OnceCell;
@@ -18,10 +20,6 @@ use crate::domain::{
     repository::SessionRepository,
     run::RunRepository,
     task::TaskRepository,
-};
-use crate::infra::{
-    memory::memory_db::MemoryDb,
-    persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
 };
 
 use super::actions;

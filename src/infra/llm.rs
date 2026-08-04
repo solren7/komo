@@ -680,8 +680,31 @@ fn reclaim_context(history: &mut Vec<Turn>) -> bool {
         return false;
     }
     let mut rest = history.split_off(cut);
-    while rest.first().is_some_and(Turn::is_assistant) {
-        rest.remove(0);
+    // The cut can land inside a tool round, so keep peeling until the window
+    // opens on real user text. A leading assistant message is rejected
+    // outright by some providers, and a tool result whose function_call went
+    // with the dropped half is an orphan strict providers reject the same way
+    // (DeepSeek: 400). The two strips alternate because each can create the
+    // other's condition: removing an assistant turn with tool calls orphans
+    // the results right after it.
+    while let Some(first) = rest.first_mut() {
+        match first {
+            Turn::Assistant { .. } => {
+                rest.remove(0);
+            }
+            Turn::User(blocks) => {
+                // Any tool result this far forward pairs with an assistant
+                // turn strictly before it — dropped by the cut or by a prior
+                // iteration either way. Plain text (the user's ask, or a
+                // mid-turn interjection) is kept.
+                blocks.retain(|block| !matches!(block, UserBlock::ToolResult { .. }));
+                if blocks.is_empty() {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+        }
     }
     if rest.is_empty() {
         // Dropping would leave nothing to send; let the turn fail honestly
@@ -1449,6 +1472,47 @@ mod tests {
         let rendered = format!("{history:?}");
         assert!(!rendered.contains("q0"), "the oldest exchange is gone");
         assert!(rendered.contains("q7"), "the newest is kept");
+    }
+
+    /// The cut can land inside a tool round; the kept half must not open on
+    /// tool results whose function_calls went with the dropped half — strict
+    /// providers (DeepSeek) reject such orphans with a 400.
+    #[test]
+    fn reclaiming_never_leaves_orphaned_tool_results_at_the_window_head() {
+        let call_turn = Turn::Assistant {
+            id: None,
+            blocks: vec![AssistantBlock::ToolCall {
+                id: "fc_1".into(),
+                call_id: Some("call_1".into()),
+                name: "read".into(),
+                args: "{}".into(),
+            }],
+        };
+        let mut history = vec![
+            Turn::user("q0"),
+            Turn::assistant("a0"),
+            Turn::user("q1"),
+            call_turn,
+            // Small on purpose: big results are shrunk by the first step and
+            // never reach the half-drop this test is about.
+            tool_result_turn("ok"),
+            Turn::assistant("a1"),
+            Turn::user("q2"),
+            Turn::assistant("a2"),
+        ];
+
+        assert!(reclaim_context(&mut history));
+        // The cut (len 8 → 4) lands right between the call and its result.
+        let rendered = format!("{history:?}");
+        assert!(
+            !rendered.contains("ToolResult"),
+            "no orphaned tool result may survive: {rendered}"
+        );
+        assert!(
+            matches!(history.first(), Some(Turn::User(blocks))
+                if matches!(blocks.first(), Some(UserBlock::Text(t)) if t == "q2")),
+            "the window must open on real user text: {rendered}"
+        );
     }
 
     /// Nothing left to give: the caller has to surface the failure rather than

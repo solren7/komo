@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 komo-core = { path = "crates/komo-core" }
+# The provider layer (wire formats + HTTP/SSE boundary). Its own crate because
+# it references nothing else in komo — the `Wire`-per-format bet made it a
+# self-contained unit, so it compiles in parallel with everything above it.
+komo-provider = { path = "crates/komo-provider" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -49,14 +53,14 @@ base64 = "0.23.0"
 # `http` for the Codex OAuth refresh request's header constants; `bytes` for the
 # provider layer's SSE chunk stream.
 http = "1.5.0"
-bytes = "1"
+bytes = { workspace = true }
 croner = "3"
 chrono = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # Both `ring` and `aws-lc-rs` are activated transitively. Select ring explicitly
 # before any TLS client is constructed (notably open-lark's WebSocket runtime).
 rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
-futures-util = "0.3.33"
+futures-util = { workspace = true }
 wechatbot = "=0.4.0"
 qrcode = { version = "0.14.1", default-features = false }
 # PNG only — render the wechat login QR for delivery over chat (no image codecs we don't need).
@@ -92,8 +96,19 @@ tokio = { version = "1.52.0", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [workspace]
-members = ["crates/komo-core"]
+members = ["crates/komo-core", "crates/komo-provider"]
 resolver = "3"
+
+# Dev builds keep file/line backtraces but skip full variable debuginfo —
+# noticeably faster codegen + linking on this 50k-line bin crate, and a much
+# smaller target/. Debugging with a full debugger needs `debug = true` back.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies don't need debuginfo at all (their code isn't being debugged
+# here); this mostly cuts cold-build time and target/ size.
+[profile.dev.package."*"]
+debug = false
 
 # Shared across the workspace so komo and komo-core pin one version each.
 # Crate-unique / heavy deps (toasty, axum, ratatui, …) stay in their own
@@ -110,6 +125,8 @@ tracing = "0.1"
 time = { version = "0.3.54", features = ["formatting", "macros"] }
 uuid = { version = "1.24.0", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+bytes = "1"
+futures-util = "0.3.33"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "charset",

@@ -4,7 +4,6 @@ pub mod gateway_client;
 pub mod llm;
 pub mod logs;
 pub mod permissions_store;
-pub mod provider;
 pub mod rendezvous;
 pub mod skill_install;
 pub mod skills;

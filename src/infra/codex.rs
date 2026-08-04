@@ -12,7 +12,7 @@
 //! Because the access token lives only a few hours and the gateway is a
 //! long-running process, refresh can't happen once at startup. [`CodexAuth`]
 //! resolves a fresh token on demand, and the provider layer's
-//! [`TokenSource`](crate::infra::provider::TokenSource) hook calls it to stamp a
+//! [`TokenSource`](komo_provider::TokenSource) hook calls it to stamp a
 //! bearer on **every** outgoing request, so a turn an hour into the process
 //! still authenticates.
 //! Refreshed tokens are written back to `auth.json` so the Codex CLI and komo
@@ -27,7 +27,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::infra::provider::TokenSource;
+use komo_provider::TokenSource;
 
 /// Codex CLI's OAuth client id (matches `codex-rs`), used for token refresh.
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";

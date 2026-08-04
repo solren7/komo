@@ -168,8 +168,8 @@ CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn 
                           ↘ MessageRepository · RunRepository (ledger) → Response
 ```
 
-komo owns the tool loop **and its provider layer** (`infra/provider/`, no LLM
-crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is where
+komo owns the tool loop **and its provider layer** (`crates/komo-provider`, no
+LLM crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is where
 round-level control lives (`max_turns` budget, cancellation, clarify). Tool
 errors return as outcome content the model can recover from; only a driver/LLM
 error aborts the turn.
@@ -181,7 +181,9 @@ error aborts the turn.
 - `agent/runtime.rs` — session lifecycle + the tool loop; loads only a recent
   transcript window per turn (`find_windowed`); wraps each turn in a ledger
   `Run` (all ledger writes best-effort, never fail the turn).
-- `infra/provider/` — komo's own provider layer. One module per **wire format**
+- `crates/komo-provider` — komo's own provider layer, its own crate because it
+  references nothing else in komo (so it compiles in parallel with the rest).
+  One module per **wire format**
   (`Wire`), not per provider: `responses` (OpenAI / Codex / DeepSeek /
   OpenRouter) and `messages` (Anthropic, which serves no Responses endpoint).
   `transport` is the HTTP+SSE boundary where `error::LlmError` is built while the
@@ -312,7 +314,7 @@ error aborts the turn.
 - **Add a provider**: an entry in `Provider` plus its base URL / auth / wire in
   `infra/llm.rs` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
   format* — only if it speaks neither Responses nor Messages — is a module in
-  `infra/provider/` and a `Wire` variant.
+  `crates/komo-provider` and a `Wire` variant.
 - **Agent-loop control**: add round-level control points in `run_agent_loop`;
   extend `TurnDriver`/`Step`. Clarify (`tools/ask_user.rs` +
   `services/clarify.rs`) is the sentinel-tool reference.

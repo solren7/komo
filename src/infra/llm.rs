@@ -13,14 +13,12 @@ use crate::{
         message::{Message, Role},
         session::Session,
     },
-    infra::{
-        codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers},
-        provider::{
-            AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind,
-            ProviderClient, ToolSchema, Turn, UserBlock, Wire,
-        },
-    },
+    infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers},
     services::memory_enrichment::MemoryEnricher,
+};
+use komo_provider::{
+    AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind, ProviderClient,
+    ToolSchema, Turn, UserBlock, Wire,
 };
 
 /// Produces the system prompt (preamble) on demand. Called once per user turn
@@ -957,7 +955,7 @@ fn build_provider_llm(
             Auth::ApiKey(config.api_key.clone()),
             vec![(
                 "anthropic-version".to_string(),
-                crate::infra::provider::messages::ANTHROPIC_VERSION.to_string(),
+                komo_provider::messages::ANTHROPIC_VERSION.to_string(),
             )],
         ),
         _ => (Auth::Bearer(config.api_key.clone()), Vec::new()),
@@ -1466,7 +1464,7 @@ mod tests {
         assert!(reclaim_context(&mut history));
         assert!(history.len() <= 8);
         assert!(
-            !history.first().is_some_and(Turn::is_assistant),
+            !matches!(history.first(), Some(Turn::Assistant { .. })),
             "history must still open on a user message"
         );
         let rendered = format!("{history:?}");
@@ -1720,7 +1718,7 @@ mod tests {
     #[test]
     fn reasoning_never_becomes_the_answer() {
         let blocks = vec![
-            AssistantBlock::Reasoning(crate::infra::provider::types::Reasoning {
+            AssistantBlock::Reasoning(komo_provider::types::Reasoning {
                 id: Some("rs_1".into()),
                 summary: vec!["thinking".into()],
                 encrypted: Some("OPAQUE".into()),

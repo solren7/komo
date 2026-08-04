@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::domain::cron::{CronJob, CronJobRepository, CronJobSpec};
 use crate::domain::home::HomeRepository;
 use crate::domain::memory::{
-    DreamVerdict, Memory, MemoryKind, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+    DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
@@ -345,6 +345,7 @@ pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_core::domain::memory::MemoryKind;
     use komo_core::domain::session::{SESSION_STATUS_ARCHIVE, SESSION_STATUS_DELETED};
 
     fn session(id: &str, status: &str) -> Session {

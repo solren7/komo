@@ -95,6 +95,12 @@ pub fn tail(path: &Path, lines: usize, contains: Option<&str>) -> std::io::Resul
             break;
         }
         end += read as u64;
+        // Older log files carry ANSI color codes (tracing wrote them before the
+        // file writers turned color off); strip them so the tail is clean text
+        // and the filter can't be defeated by an escape sequence mid-token.
+        if line.contains('\u{1b}') {
+            line = strip_ansi(&line);
+        }
         if let Some(needle) = &needle
             && !line.to_lowercase().contains(needle)
         {
@@ -114,6 +120,39 @@ pub fn tail(path: &Path, lines: usize, contains: Option<&str>) -> std::io::Resul
         end,
         matched,
     })
+}
+
+/// Remove ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL`),
+/// and two-byte escapes. Anything malformed just loses its ESC.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // CSI: skip until the final byte (0x40..=0x7e).
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: terminated by BEL (or ST, whose ESC restarts this loop).
+                for n in chars.by_ref() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            _ => {} // two-byte escape: the consumed char was the whole sequence
+        }
+    }
+    out
 }
 
 /// `BufRead::read_line` that tolerates invalid UTF-8 by replacing it, returning
@@ -177,6 +216,30 @@ mod tests {
             body.len() as u64,
             "follow resumes exactly at end of file"
         );
+    }
+
+    #[test]
+    fn tail_strips_ansi_from_old_log_files() {
+        let dir = temp_dir("komo_logs_test_ansi");
+        let path = dir.join("gateway.2026-08-04.log");
+        // The shape tracing wrote before file writers turned color off.
+        std::fs::write(
+            &path,
+            "\u{1b}[2m2026-08-04T03:02:04Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m run failed\n",
+        )
+        .unwrap();
+
+        let t = tail(&path, 10, Some("warn")).unwrap();
+        assert_eq!(t.lines, vec!["2026-08-04T03:02:04Z  WARN run failed\n"]);
+    }
+
+    #[test]
+    fn strip_ansi_handles_csi_osc_and_bare_escapes() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\u{1b}[1;33mbold\u{1b}[0m"), "bold");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{7}rest"), "rest");
+        assert_eq!(strip_ansi("a\u{1b}Mb"), "ab");
+        assert_eq!(strip_ansi("dangling\u{1b}"), "dangling");
     }
 
     #[test]

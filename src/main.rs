@@ -62,22 +62,38 @@ fn init_tracing() {
     // (`gateway.YYYY-MM-DD.log`, 30 files kept, older ones auto-deleted):
     // stderr keeps `docker logs` / launchd capture working, the dated files
     // are the durable month of history `komo logs` reads.
-    let writer = if will_run_tui() {
-        open_tui_log()
-            .map(|f| fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)))
-            .unwrap_or_else(|| fmt::writer::BoxMakeWriter::new(std::io::stderr))
+    // ANSI color codes may only be emitted when *every* destination is a
+    // terminal: a log file with escape sequences is unreadable raw and pollutes
+    // whatever reads it back (`komo logs`, the `logs` tool feeding the model).
+    use std::io::IsTerminal;
+    let stderr_tty = std::io::stderr().is_terminal();
+    let (writer, ansi) = if will_run_tui() {
+        match open_tui_log() {
+            Some(f) => (
+                fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)),
+                false,
+            ),
+            None => (fmt::writer::BoxMakeWriter::new(std::io::stderr), stderr_tty),
+        }
     } else if std::env::args().nth(1).as_deref() == Some("gateway") {
         match open_gateway_log() {
             Some(daily) => {
                 use tracing_subscriber::fmt::writer::MakeWriterExt;
-                fmt::writer::BoxMakeWriter::new((std::io::stderr).and(daily))
+                (
+                    fmt::writer::BoxMakeWriter::new((std::io::stderr).and(daily)),
+                    false,
+                )
             }
-            None => fmt::writer::BoxMakeWriter::new(std::io::stderr),
+            None => (fmt::writer::BoxMakeWriter::new(std::io::stderr), stderr_tty),
         }
     } else {
-        fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        (fmt::writer::BoxMakeWriter::new(std::io::stderr), stderr_tty)
     };
-    let _ = fmt().with_env_filter(filter).with_writer(writer).try_init();
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(ansi)
+        .try_init();
 }
 
 /// Daily-rotating gateway log under `~/.komo/logs`, one file per day

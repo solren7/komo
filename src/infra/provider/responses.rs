@@ -116,7 +116,30 @@ fn input_items(history: &[Turn]) -> Vec<Value> {
                 }
             }
             Turn::Assistant { id, blocks } => {
+                // Emit in block order, flushing accumulated text before any
+                // non-text item. Deferring the text to the end (the old shape)
+                // reordered "narrate, then call" into "call, then narrate",
+                // which put a message item between a function_call and its
+                // function_call_output — DeepSeek rejects that adjacency break
+                // with "No tool output found for tool call".
                 let mut text_parts = Vec::new();
+                let mut message_id = id.clone();
+                let flush = |items: &mut Vec<Value>,
+                             text_parts: &mut Vec<Value>,
+                             message_id: &mut Option<String>| {
+                    if text_parts.is_empty() {
+                        return;
+                    }
+                    let mut item = json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": std::mem::take(text_parts),
+                    });
+                    if let Some(id) = message_id.take() {
+                        item["id"] = json!(id);
+                    }
+                    items.push(item);
+                };
                 for block in blocks {
                     match block {
                         AssistantBlock::Text(text) => {
@@ -128,6 +151,7 @@ fn input_items(history: &[Turn]) -> Vec<Value> {
                             name,
                             args,
                         } => {
+                            flush(&mut items, &mut text_parts, &mut message_id);
                             let mut item = json!({
                                 "type": "function_call",
                                 "name": name,
@@ -140,21 +164,12 @@ fn input_items(history: &[Turn]) -> Vec<Value> {
                             items.push(item);
                         }
                         AssistantBlock::Reasoning(reasoning) => {
+                            flush(&mut items, &mut text_parts, &mut message_id);
                             items.push(reasoning_item(reasoning));
                         }
                     }
                 }
-                if !text_parts.is_empty() {
-                    let mut item = json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": text_parts,
-                    });
-                    if let Some(id) = id {
-                        item["id"] = json!(id);
-                    }
-                    items.push(item);
-                }
+                flush(&mut items, &mut text_parts, &mut message_id);
             }
         }
     }
@@ -505,11 +520,12 @@ mod tests {
             types,
             vec![
                 "message",
-                "function_call",
                 "message",
+                "function_call",
                 "function_call_output"
             ],
-            "each block is its own top-level item"
+            "each block is its own top-level item, in the model's own order — \
+             nothing may sit between a function_call and its output"
         );
         // The call and its output must agree on the handle the API keys on.
         let call = input.iter().find(|i| i["type"] == "function_call").unwrap();
@@ -519,6 +535,60 @@ mod tests {
             .unwrap();
         assert_eq!(call["call_id"], output["call_id"]);
         assert_eq!(call["arguments"], r#"{"path":"foo"}"#);
+    }
+
+    /// The regression behind DeepSeek's `No tool output found for tool call`
+    /// 400: narration emitted *before* the calls must stay before them, or a
+    /// message item lands between a function_call and its
+    /// function_call_output and strict providers reject the request.
+    #[test]
+    fn narration_before_tool_calls_keeps_its_place() {
+        let history = vec![
+            Turn::Assistant {
+                id: None,
+                blocks: vec![
+                    AssistantBlock::Text("let me check two things".into()),
+                    AssistantBlock::ToolCall {
+                        id: "fc_1".into(),
+                        call_id: Some("call_1".into()),
+                        name: "read".into(),
+                        args: "{}".into(),
+                    },
+                    AssistantBlock::ToolCall {
+                        id: "fc_2".into(),
+                        call_id: Some("call_2".into()),
+                        name: "read".into(),
+                        args: "{}".into(),
+                    },
+                ],
+            },
+            Turn::User(vec![
+                UserBlock::ToolResult {
+                    id: "fc_1".into(),
+                    call_id: Some("call_1".into()),
+                    text: "a".into(),
+                },
+                UserBlock::ToolResult {
+                    id: "fc_2".into(),
+                    call_id: Some("call_2".into()),
+                    text: "b".into(),
+                },
+            ]),
+        ];
+        let body = request("m", "s", &history, &[schema()], None);
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output"
+            ],
+            "only outputs may follow the round's function_calls"
+        );
     }
 
     #[test]

@@ -12,7 +12,12 @@
 //! `tool-output-store.ts`.
 //!
 //! Files live under `<komo home>/tool-output/<session>/<call>.txt` and are kept
-//! for [`RETENTION`]. Cleanup is not a cron job: the gateway sweeps once at
+//! for [`RETENTION`]. Each session directory also carries an `index.jsonl` —
+//! one JSON line per stored output (file, tool, size, timestamp) — so an
+//! operator can see what produced a file without opening it. The index is an
+//! append-only journal: an entry may outlive its file once the sweep runs.
+//!
+//! Cleanup is not a cron job: the gateway sweeps once at
 //! startup and the store re-sweeps at most hourly while it writes, which is
 //! plenty for a directory nobody reads except on demand.
 
@@ -20,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use serde_json::json;
 use tracing::{debug, warn};
 
 /// How long a stored output stays readable. Long enough that a model can come
@@ -35,6 +41,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// head and tail. A result can be under the byte budget yet be thousands of
 /// one-word lines; a screen of those teaches the model less than the two ends do.
 const MAX_PREVIEW_LINES: usize = 2000;
+
+/// Per-session metadata journal: one JSON line per stored output.
+const INDEX_FILE: &str = "index.jsonl";
 
 /// A tool result sized for the model, plus the full-output files it left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,16 +96,23 @@ impl ToolOutputStore {
     /// head+tail preview naming that file. If the write fails for any reason the
     /// result degrades to the previous behavior — a plain truncation — because a
     /// full disk must not turn a working tool call into a failure.
-    pub fn bound(&self, session_id: &str, call_id: &str, output: String, cap: usize) -> Bounded {
+    pub fn bound(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        output: String,
+        cap: usize,
+    ) -> Bounded {
         if output.len() <= cap {
             return Bounded::passthrough(output);
         }
-        let path = self
-            .root
-            .join(sanitize(session_id))
-            .join(format!("{}.txt", sanitize(call_id)));
+        let file = format!("{}.txt", sanitize(call_id));
+        let dir = self.root.join(sanitize(session_id));
+        let path = dir.join(&file);
         match write_full(&path, &output) {
             Ok(()) => {
+                index_append(&dir, &file, tool, output.len());
                 self.maybe_sweep();
                 Bounded {
                     text: preview(&output, cap, &path),
@@ -125,6 +141,11 @@ impl ToolOutputStore {
             };
             let mut left = 0;
             for file in files.flatten() {
+                // The index is metadata, not an output: it never ages out on
+                // its own and must not keep an otherwise-empty directory alive.
+                if file.file_name().to_str() == Some(INDEX_FILE) {
+                    continue;
+                }
                 if expired(&file.path()) {
                     match std::fs::remove_file(file.path()) {
                         Ok(()) => removed += 1,
@@ -138,6 +159,7 @@ impl ToolOutputStore {
                 }
             }
             if left == 0 {
+                let _ = std::fs::remove_file(dir.join(INDEX_FILE));
                 let _ = std::fs::remove_dir(&dir);
             }
         }
@@ -166,6 +188,32 @@ fn write_full(path: &Path, output: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, output)
+}
+
+/// Append one metadata line to the session's `index.jsonl`. Best-effort: the
+/// stored output is already on disk, and a missing index entry must not fail
+/// the tool call that produced it.
+fn index_append(dir: &Path, file: &str, tool: &str, bytes: usize) {
+    let stored_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let line = json!({
+        "file": file,
+        "tool": tool,
+        "bytes": bytes,
+        "stored_at": stored_at,
+    });
+    let append = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(INDEX_FILE))
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{line}")
+        });
+    if let Err(error) = append {
+        debug!(%error, dir = %dir.display(), "could not append tool-output index entry");
+    }
 }
 
 fn expired(path: &Path) -> bool {
@@ -298,7 +346,7 @@ mod tests {
     #[test]
     fn a_result_under_the_cap_touches_no_disk() {
         let store = store("passthrough");
-        let out = store.bound("cli:1", "call-1", "small".to_string(), 1024);
+        let out = store.bound("cli:1", "call-1", "shell", "small".to_string(), 1024);
         assert_eq!(out.text, "small");
         assert!(out.output_paths.is_empty());
         assert!(!store.root().exists(), "nothing should be written");
@@ -310,7 +358,7 @@ mod tests {
     fn an_over_limit_result_keeps_both_ends_and_stores_the_whole_thing() {
         let store = store("both_ends");
         let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
-        let out = store.bound("cli:1", "call-7", body.clone(), 512);
+        let out = store.bound("cli:1", "call-7", "shell", body.clone(), 512);
 
         assert!(out.text.contains("line 0"), "{}", out.text);
         assert!(out.text.contains("line 499"), "{}", out.text);
@@ -332,7 +380,7 @@ mod tests {
         let store = store("size");
         let body: String = (0..2000).map(|i| format!("line {i}\n")).collect();
         let cap = 4096;
-        let out = store.bound("cli:1", "call-8", body, cap);
+        let out = store.bound("cli:1", "call-8", "shell", body, cap);
         // The marker names a path whose length isn't known up front, so the
         // budget covers the two ends; the preview must not run away past it.
         assert!(out.text.len() <= cap * 2, "preview was {}", out.text.len());
@@ -345,7 +393,7 @@ mod tests {
     fn a_single_multibyte_line_is_cut_on_a_char_boundary() {
         let store = store("multibyte");
         let body = "界".repeat(4000); // 3 bytes each, no newlines
-        let out = store.bound("cli:1", "call-9", body, 1024);
+        let out = store.bound("cli:1", "call-9", "shell", body, 1024);
         assert!(out.text.starts_with('界'));
         assert!(out.text.ends_with('界'));
         let _ = std::fs::remove_dir_all(store.root());
@@ -360,7 +408,7 @@ mod tests {
 
         let store = store("paths");
         let body = "x".repeat(2048);
-        let out = store.bound("../evil", "../worse", body, 64);
+        let out = store.bound("../evil", "../worse", "shell", body, 64);
         let path = &out.output_paths[0];
         assert!(
             path.starts_with(store.root()),
@@ -368,6 +416,21 @@ mod tests {
             path.display(),
             store.root().display()
         );
+        let _ = std::fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn a_stored_output_gets_an_index_entry() {
+        let store = store("index");
+        let body = "x".repeat(2048);
+        let out = store.bound("cli:1", "run-1-0000", "logs", body, 64);
+        let dir = out.output_paths[0].parent().unwrap().to_path_buf();
+        let index = std::fs::read_to_string(dir.join(INDEX_FILE)).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(index.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["file"], "run-1-0000.txt");
+        assert_eq!(entry["tool"], "logs");
+        assert_eq!(entry["bytes"], 2048);
+        assert!(entry["stored_at"].as_str().unwrap().contains('T'));
         let _ = std::fs::remove_dir_all(store.root());
     }
 
@@ -399,6 +462,9 @@ mod tests {
         let store = store("empty_dir");
         let dir = store.root().join("cli-1");
         std::fs::create_dir_all(&dir).unwrap();
+        // A fresh index must not keep the directory alive once every output
+        // has expired.
+        std::fs::write(dir.join(INDEX_FILE), "{}\n").unwrap();
         let stale = dir.join("stale.txt");
         std::fs::write(&stale, "old").unwrap();
         std::fs::File::open(&stale)
@@ -416,10 +482,10 @@ mod tests {
     fn the_sweep_is_debounced_between_writes() {
         let store = store("debounce");
         let body = "x".repeat(4096);
-        store.bound("cli:1", "a", body.clone(), 128);
+        store.bound("cli:1", "a", "shell", body.clone(), 128);
         let first = *store.last_sweep.lock().unwrap();
         assert!(first.is_some(), "the first over-limit write sweeps");
-        store.bound("cli:1", "b", body, 128);
+        store.bound("cli:1", "b", "shell", body, 128);
         assert_eq!(
             *store.last_sweep.lock().unwrap(),
             first,

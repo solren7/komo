@@ -22,8 +22,8 @@ use crate::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::services::search;
 use crate::tools::fs_common;
+use komo_services::search;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;

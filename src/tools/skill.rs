@@ -2,18 +2,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_infra::skills::FsSkillStore;
+use komo_services::skill_registry::{LocatedSkill, SkillRegistry, skill_files};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        approval::{ApprovalRequest, Decision},
-        context::ToolContext,
-        repository::SkillRepository,
-        skill::{SOURCE_LEARNED, Skill},
-        tool::{Tool, ToolError, ToolOutput, parse_args},
-    },
-    services::skill_registry::{LocatedSkill, SkillRegistry, skill_files},
+use crate::domain::{
+    approval::{ApprovalRequest, Decision},
+    context::ToolContext,
+    repository::SkillRepository,
+    skill::{SOURCE_LEARNED, Skill},
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 #[derive(Deserialize)]

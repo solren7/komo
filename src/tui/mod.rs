@@ -30,6 +30,8 @@ mod paste;
 mod ui;
 
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
+use komo_services::clarify::ClarifyState;
+use komo_services::tool_execution::{SessionContext, with_session};
 use std::{io, path::PathBuf, sync::Arc};
 
 use crossterm::{
@@ -55,10 +57,6 @@ use crate::{
         session::Session,
     },
     infra::gateway_client::{GatewayClient, folder_workspace_id, folder_workspace_path},
-    services::{
-        clarify::ClarifyState,
-        tool_execution::{SessionContext, with_session},
-    },
 };
 use komo_config::ConfigSnapshot;
 

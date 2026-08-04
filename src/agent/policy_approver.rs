@@ -18,8 +18,8 @@ use crate::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
     policy::{Policy, Rule, Verdict, channel_of},
 };
-use crate::services::tool_execution::current_session;
 use komo_infra::permissions_store::PermissionsStore;
+use komo_services::tool_execution::current_session;
 
 /// Wraps an [`Approver`], applying a [`Policy`] before falling back to it.
 pub struct PolicyApprover {
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use crate::domain::approval::ActionRef;
     use crate::domain::policy::{Category, Effect, Matcher, Rule};
-    use crate::services::tool_execution::{SessionContext, with_session};
+    use komo_services::tool_execution::{SessionContext, with_session};
     use std::sync::Mutex;
 
     struct Recording {

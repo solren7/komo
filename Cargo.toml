@@ -13,6 +13,9 @@ komo-provider = { path = "crates/komo-provider" }
 komo-config = { path = "crates/komo-config" }
 # Storage + the outbound adapters that depend on nothing above them.
 komo-infra = { path = "crates/komo-infra" }
+# The tool loop's services: execution, output bounding, memory enrichment,
+# the skill registry, and the fs/search primitives tools are built on.
+komo-services = { path = "crates/komo-services" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -100,6 +103,8 @@ tokio = { version = "1.52.0", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # `reset_test_db` for the agent-runtime tests (feature is off in real builds).
 komo-infra = { path = "crates/komo-infra", features = ["test-support"] }
+# A static `SkillRegistry` for the skill tool's tests.
+komo-services = { path = "crates/komo-services", features = ["test-support"] }
 
 [workspace]
 members = [
@@ -107,6 +112,7 @@ members = [
     "crates/komo-config",
     "crates/komo-provider",
     "crates/komo-infra",
+    "crates/komo-services",
 ]
 resolver = "3"
 

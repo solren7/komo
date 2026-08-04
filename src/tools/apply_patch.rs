@@ -20,8 +20,8 @@ use crate::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::services::{diff, file_mutation, patch};
 use crate::tools::fs_common;
+use komo_services::{diff, file_mutation, patch};
 
 #[derive(Deserialize)]
 struct PatchArgs {

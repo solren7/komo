@@ -15,18 +15,16 @@
 //! a side effect — but each ask is a normal `RunStep`, so the ledger shows
 //! what was asked and answered.
 
+use komo_services::clarify::ClarifyState;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        context::ToolContext,
-        tool::{Tool, ToolError, ToolOutput, parse_args},
-    },
-    services::clarify::ClarifyState,
+use crate::domain::{
+    context::ToolContext,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 #[derive(Deserialize)]
@@ -170,7 +168,7 @@ impl Tool for AskUserTool {
         // timeout (120s) aborts the question long before the user's 10 minutes
         // are up — the same contract approval-gated tools have via
         // `APPROVAL_BOUND`.
-        Some(crate::services::clarify::CLARIFY_BOUND)
+        Some(komo_services::clarify::CLARIFY_BOUND)
     }
 }
 

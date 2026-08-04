@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
-use crate::domain::skill::Skill;
+use komo_core::domain::skill::Skill;
 
 /// Discovers skills from a set of `<name>/SKILL.md` directories.
 ///
@@ -42,9 +42,10 @@ const WALK_BUDGET: usize = 1000;
 
 impl SkillRegistry {
     /// A static registry over a fixed skill list — never re-scans disk.
-    /// Test-only: production builds the live, disk-backed registry via
+    /// Test-only (exposed to dependent crates' tests by the `test-support`
+    /// feature): production builds the live, disk-backed registry via
     /// [`load_from_dirs`](Self::load_from_dirs).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(skills: Vec<Skill>) -> Self {
         Self {
             dirs: Vec::new(),

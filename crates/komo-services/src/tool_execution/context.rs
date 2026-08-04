@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-pub use crate::domain::context::{RunContext, SessionContext, ToolContext};
+pub use komo_core::domain::context::{RunContext, SessionContext, ToolContext};
 
 /// Everything the executor needs to know about the turn a round of tool calls
 /// belongs to. Built once per turn by `AgentRuntime::run_agent_loop`.

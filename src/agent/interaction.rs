@@ -19,6 +19,8 @@
 //! The turn's session context (id + reply sink) reaches the approver through
 //! the task-local in `services::tool_execution`.
 
+use komo_services::clarify::ClarifyState;
+use komo_services::tool_execution::{SessionContext, current_session, with_session};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -29,18 +31,14 @@ use futures_util::FutureExt;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use crate::{
-    domain::{
-        approval::{ApprovalRequest, Approver, Decision, Risk},
-        cancel::CancelSignal,
-        gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
-        home::HomeRepository,
-        pairing::{ApproveOutcome, PairingRepository, PairingStatus},
-        repository::SessionRepository,
-        todo::SessionTodoRepository,
-    },
-    services::clarify::ClarifyState,
-    services::tool_execution::{SessionContext, current_session, with_session},
+use crate::domain::{
+    approval::{ApprovalRequest, Approver, Decision, Risk},
+    cancel::CancelSignal,
+    gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
+    home::HomeRepository,
+    pairing::{ApproveOutcome, PairingRepository, PairingStatus},
+    repository::SessionRepository,
+    todo::SessionTodoRepository,
 };
 
 /// How long an approval prompt waits for a reply before auto-denying.

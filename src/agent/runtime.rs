@@ -14,10 +14,10 @@ use crate::{
         run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
         session::Session,
     },
-    services::tool_execution::{
-        RunContext, SessionContext, SpinDetector, ToolExecutor, ToolTurnContext, TurnResultBudget,
-        current_session, with_session,
-    },
+};
+use komo_services::tool_execution::{
+    RunContext, SessionContext, SpinDetector, ToolExecutor, ToolTurnContext, TurnResultBudget,
+    current_session, with_session,
 };
 
 /// Fed back to the model in place of tool results once the per-turn round
@@ -700,7 +700,7 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::new()));
         let interjected = Arc::new(Mutex::new(Vec::new()));
         let mut executor =
-            ToolExecutor::new(crate::services::tool_execution::ToolExecutionConfig::default());
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
         for t in tools {
             executor.register(t);
         }
@@ -1123,7 +1123,7 @@ mod tests {
             messages: db.clone(),
             runs: db.clone(),
             tool_executor: ToolExecutor::new(
-                crate::services::tool_execution::ToolExecutionConfig::default(),
+                komo_services::tool_execution::ToolExecutionConfig::default(),
             ),
             max_turns: 30,
             history_window: 0,

@@ -32,13 +32,13 @@ pub use context::{
     TurnResultBudget, current_session, with_session,
 };
 
-use crate::domain::approval::{ApprovalRequest, Approver, Decision};
-use crate::domain::events::TurnEvent;
-use crate::domain::llm::{ToolCallReq, ToolOutcome};
-use crate::domain::policy::{Access, Category, Policy};
-use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
-use crate::domain::tool::{Tool, ToolError};
-use crate::services::tool_output_store::{Bounded, ToolOutputStore};
+use crate::tool_output_store::{Bounded, ToolOutputStore};
+use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+use komo_core::domain::events::TurnEvent;
+use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
+use komo_core::domain::policy::{Access, Category, Policy};
+use komo_core::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
+use komo_core::domain::tool::{Tool, ToolError};
 
 /// Live `TurnEvent` args/result use the **ledger's** cap, not a smaller one of
 /// their own. A watcher renders a running call from the stream and the same call
@@ -89,7 +89,7 @@ fn cap_structured(structured: serde_json::Value) -> serde_json::Value {
 /// they are never filtered. A tool added without an entry here defaults to that
 /// safe side — it stays advertised.
 ///
-/// [`ActionRef`]: crate::domain::approval::ActionRef
+/// [`ActionRef`]: komo_core::domain::approval::ActionRef
 fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
     match name {
         "shell" => Some((Category::Shell, None)),
@@ -237,7 +237,7 @@ impl ToolExecutor {
     /// missing tool never is.
     ///
     /// [`definitions`]: Self::definitions
-    /// [`Policy::wholly_denied`]: crate::domain::policy::Policy::wholly_denied
+    /// [`Policy::wholly_denied`]: komo_core::domain::policy::Policy::wholly_denied
     pub fn drop_policy_denied(&mut self, policy: &Policy) -> Vec<String> {
         let core = Arc::get_mut(&mut self.core)
             .expect("filter the catalog during wiring, before the executor is shared");
@@ -426,7 +426,7 @@ impl ToolExecutionCore {
             ))
         } else {
             let mut attempt: usize = 0;
-            let outcome: Result<crate::domain::tool::ToolOutput, ToolError> = loop {
+            let outcome: Result<komo_core::domain::tool::ToolOutput, ToolError> = loop {
                 // Span so the tool's own logs carry the run's `seq`/`name`.
                 // Spans don't cross `tokio::spawn` on their own — instrument
                 // the spawned future. A fresh span per attempt keeps each
@@ -478,7 +478,7 @@ impl ToolExecutionCore {
                     },
                     None => join.await,
                 };
-                let attempt_result: Result<crate::domain::tool::ToolOutput, ToolError> =
+                let attempt_result: Result<komo_core::domain::tool::ToolOutput, ToolError> =
                     match joined {
                         Ok(result) => result,
                         Err(join_err) if join_err.is_panic() => {
@@ -686,9 +686,9 @@ mod tests {
     //! where they are asserted.
 
     use super::*;
-    use crate::domain::run::{Run, RunRepository, RunStep};
-    use crate::domain::tool::ToolOutput;
     use async_trait::async_trait;
+    use komo_core::domain::run::{Run, RunRepository, RunStep};
+    use komo_core::domain::tool::ToolOutput;
     use serde_json::Value;
 
     /// Render args as the tool's *payload* rather than as JSON: these tests pass
@@ -799,7 +799,7 @@ mod tests {
     }
 
     fn wildcard_deny(category: Category, access: Option<Access>) -> Policy {
-        use crate::domain::policy::{Effect, Matcher, Rule, Verdict};
+        use komo_core::domain::policy::{Effect, Matcher, Rule, Verdict};
         Policy::new(
             vec![Rule {
                 channels: None,
@@ -851,7 +851,7 @@ mod tests {
         let mut tools = catalog_with(FILE_AND_SHELL);
         let dropped = tools.drop_policy_denied(&wildcard_deny(
             Category::File,
-            Some(crate::domain::policy::Access::Write),
+            Some(komo_core::domain::policy::Access::Write),
         ));
         assert_eq!(dropped, vec!["apply_patch", "edit", "write"]);
         let left: std::collections::BTreeSet<String> = tools
@@ -1347,7 +1347,7 @@ mod tests {
     /// between a cancel and two more attempts.
     #[tokio::test]
     async fn a_claimed_cancel_ends_the_call_once_and_reads_as_cancelled() {
-        use crate::domain::cancel::{CANCELLED_ERROR, CancelSignal, Cancelled};
+        use komo_core::domain::cancel::{CANCELLED_ERROR, CancelSignal, Cancelled};
 
         struct AlreadyCancelled;
         #[async_trait]
@@ -1455,9 +1455,7 @@ mod tests {
 
         let root = std::env::temp_dir().join("komo_exec_output_store");
         let _ = std::fs::remove_dir_all(&root);
-        let store = Arc::new(crate::services::tool_output_store::ToolOutputStore::new(
-            root.clone(),
-        ));
+        let store = Arc::new(crate::tool_output_store::ToolOutputStore::new(root.clone()));
         let repo = RecordingRuns::new();
         let mut executor = ToolExecutor::new(ToolExecutionConfig {
             max_result_bytes: 512,
@@ -1488,9 +1486,7 @@ mod tests {
     async fn an_unledgered_call_truncates_instead_of_storing() {
         let root = std::env::temp_dir().join("komo_exec_output_store_unledgered");
         let _ = std::fs::remove_dir_all(&root);
-        let store = Arc::new(crate::services::tool_output_store::ToolOutputStore::new(
-            root.clone(),
-        ));
+        let store = Arc::new(crate::tool_output_store::ToolOutputStore::new(root.clone()));
         let mut executor = ToolExecutor::new(ToolExecutionConfig {
             max_result_bytes: 1024,
             ..Default::default()

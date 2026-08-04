@@ -17,8 +17,8 @@ use crate::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::services::file_mutation;
 use crate::tools::fs_common;
+use komo_services::file_mutation;
 
 #[derive(Deserialize)]
 struct WriteArgs {

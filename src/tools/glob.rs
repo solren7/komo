@@ -17,8 +17,8 @@ use crate::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::services::search;
 use crate::tools::fs_common;
+use komo_services::search;
 
 /// Paths returned by one call unless `limit` says fewer.
 const DEFAULT_LIMIT: usize = 100;

@@ -1,4 +1,5 @@
 use komo_infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers};
+use komo_services::memory_enrichment::MemoryEnricher;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,13 +8,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
-        message::{Message, Role},
-        session::Session,
-    },
-    services::memory_enrichment::MemoryEnricher,
+use crate::domain::{
+    llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
+    message::{Message, Role},
+    session::Session,
 };
 use komo_config::{ModelConfig, Provider, split_model_id};
 use komo_provider::{
@@ -842,7 +840,7 @@ fn blocks_to_step(blocks: &[AssistantBlock]) -> Step {
 /// for aux/delegate sub-agents (they must not be fed the user's memory library).
 pub fn build_llm(
     config: &ModelConfig,
-    tools: Option<&crate::services::tool_execution::ToolExecutor>,
+    tools: Option<&komo_services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
     enricher: Option<Arc<MemoryEnricher>>,
     cache_family: Option<&str>,
@@ -886,7 +884,7 @@ pub fn build_llm(
 /// Build the backend for exactly one provider.
 fn build_provider_llm(
     config: &ModelConfig,
-    tools: Option<&crate::services::tool_execution::ToolExecutor>,
+    tools: Option<&komo_services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
     enricher: Option<Arc<MemoryEnricher>>,
     cache_family: Option<&str>,

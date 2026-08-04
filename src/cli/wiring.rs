@@ -9,6 +9,11 @@ use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
 use komo_infra::skills::FsSkillStore;
+use komo_services::clarify::ClarifyState;
+use komo_services::memory_enrichment::MemoryEnricher;
+use komo_services::skill_registry::SkillRegistry;
+use komo_services::tool_execution::{ToolExecutionConfig, ToolExecutor};
+use komo_services::tool_output_store::ToolOutputStore;
 use std::sync::Arc;
 
 use crate::{
@@ -21,13 +26,6 @@ use crate::{
         repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
     },
     infra::llm::{PreambleFn, build_llm},
-    services::{
-        clarify::ClarifyState,
-        memory_enrichment::MemoryEnricher,
-        skill_registry::SkillRegistry,
-        tool_execution::{ToolExecutionConfig, ToolExecutor},
-        tool_output_store::ToolOutputStore,
-    },
     tools::{
         apply_patch::ApplyPatchTool, ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
         edit::EditTool, glob::GlobTool, grep::GrepTool, homeassistant::HomeAssistantTool,

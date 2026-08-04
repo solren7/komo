@@ -29,6 +29,8 @@
 //! the bearer-key middleware. Only loopback origins are allowed and credentials
 //! are off, so the bearer key remains the sole thing that grants access.
 
+use komo_services::clarify::ClarifyState;
+use komo_services::tool_execution::{SessionContext, with_session};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{convert::Infallible, time::Duration};
@@ -73,16 +75,12 @@ use crate::{
         pairing::ApproveOutcome,
         session::{DEFAULT_WORKSPACE, Session},
     },
-    services::{
-        clarify::ClarifyState,
-        operator_control::{
-            MemoryTransitionAction, ResumeOutcome,
-            actions::{
-                OperatorActions, TransitionOutcome, no_cron_job_message, not_recoverable_message,
-                resolve_resume,
-            },
+    services::operator_control::{
+        MemoryTransitionAction, ResumeOutcome,
+        actions::{
+            OperatorActions, TransitionOutcome, no_cron_job_message, not_recoverable_message,
+            resolve_resume,
         },
-        tool_execution::{SessionContext, with_session},
     },
 };
 use komo_config::{ApiConfig, ModelEntry};

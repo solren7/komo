@@ -22,8 +22,8 @@ use crate::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::services::{diff, file_mutation};
 use crate::tools::fs_common;
+use komo_services::{diff, file_mutation};
 
 /// Lines of `-`/`+` context shown back to the model per edit.
 const PREVIEW_LINES: usize = 6;

@@ -1,6 +1,6 @@
 //! Transient-error retry classification (roadmap §7).
 
-use crate::domain::tool::RetryHint;
+use komo_core::domain::tool::RetryHint;
 
 /// Total attempts for a tool whose failure is judged retryable (1 initial +
 /// retries). Kept a constant, not config: transient-error retry is an internal
@@ -12,7 +12,7 @@ pub(crate) const TOOL_RETRY_MAX_ATTEMPTS: usize = 3;
 pub(crate) const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
 
 /// How a failed tool call may be retried. Preferred path: a tool classifies its
-/// own failure at the source via [`crate::domain::tool::TransientError`] (the
+/// own failure at the source via [`komo_core::domain::tool::TransientError`] (the
 /// reqwest-backed tools do this in `tools::http`, where the typed
 /// `reqwest::Error` / status is intact), and [`classify_error`] reads that hint
 /// directly. Fallback path: for errors that carry no hint, classify from the
@@ -63,7 +63,7 @@ const AMBIGUOUS_MARKERS: &[&str] = &[
 pub(crate) fn classify_error(err: &anyhow::Error) -> Retry {
     // Typed hint first: lossless, set where the failure arose. anyhow walks the
     // chain, so a `.context(...)`-wrapped `TransientError` is still found.
-    if let Some(te) = err.downcast_ref::<crate::domain::tool::TransientError>() {
+    if let Some(te) = err.downcast_ref::<komo_core::domain::tool::TransientError>() {
         return match te.hint {
             RetryHint::Connection => Retry::ConnLevel,
             RetryHint::Ambiguous => Retry::Ambiguous,
@@ -119,8 +119,8 @@ mod tests {
 
     #[test]
     fn classify_error_prefers_typed_hint_over_text() {
-        use crate::domain::tool::TransientError;
         use anyhow::Context as _;
+        use komo_core::domain::tool::TransientError;
         // A typed hint wins regardless of what the message text would match —
         // here the text says "invalid" (would be Retry::No via the heuristic).
         let conn = anyhow::Error::new(TransientError::new(

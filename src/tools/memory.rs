@@ -1,19 +1,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use komo_services::memory_enrichment::pinned_budget_usage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        context::ToolContext,
-        memory::{
-            Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
-            MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
-        },
-        tool::{Tool, ToolError, ToolOutput, parse_args},
+use crate::domain::{
+    context::ToolContext,
+    memory::{
+        Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
+        MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
     },
-    services::memory_enrichment::pinned_budget_usage,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 /// Default cap on search results.

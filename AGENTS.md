@@ -184,13 +184,16 @@ komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot   (→ core)
 komo-provider  wire formats + HTTP/SSE; references nothing else in komo
 komo-infra     persistence · memory · skills · logs · workday ·
                permissions_store · codex                     (→ core, config, provider)
-komo (bin)     agent · services · tools · tui · cli, plus the parts of the old
-               `infra/` that reach upward (llm.rs, messaging/, gateway_client,
-               skill_install) — see `src/infra/mod.rs`
+komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
+               skill_registry · diff/patch/search/file_mutation  (→ core, config)
+komo (bin)     agent · tools · tui · cli, plus the parts of the old `infra/` and
+               `services/` that reach upward (llm.rs, messaging/, gateway_client,
+               skill_install, operator_control) — see those two `mod.rs` files
 ```
 
-A dependent crate's tests reach `persistence::reset_test_db` through
-komo-infra's `test-support` feature (a dev-dependency, so it never ships).
+Test-only constructors a dependent crate's tests need — `persistence::reset_test_db`,
+`SkillRegistry::new` — are behind each crate's `test-support` feature, enabled
+only as a dev-dependency so they never ship.
 
 **Module map** (one line each; read the module for details):
 

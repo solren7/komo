@@ -16,13 +16,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::domain::llm::LlmClient;
-use crate::domain::memory::{
+use komo_core::domain::llm::LlmClient;
+use komo_core::domain::memory::{
     Memory, MemoryContext, MemoryRepository, ScoredMemory, recall_query_hash, select_pinned,
     select_recall,
 };
-use crate::domain::message::Message;
-use crate::domain::session::Session;
+use komo_core::domain::message::Message;
+use komo_core::domain::session::Session;
 
 /// The finished, injection-ready memory blocks for one turn, already wrapped
 /// in the anti-self-amplification markers and untrusted-data caveats. The two
@@ -430,9 +430,9 @@ pub fn pinned_budget_usage(pinned: &[Memory]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::llm::{DeltaSink, Step, ToolOutcome, TurnDriver};
-    use crate::domain::memory::{MemoryConfidence, MemoryKind, MemoryScope, MemoryStatus};
     use async_trait::async_trait;
+    use komo_core::domain::llm::{DeltaSink, Step, ToolOutcome, TurnDriver};
+    use komo_core::domain::memory::{MemoryConfidence, MemoryKind, MemoryScope, MemoryStatus};
     use std::sync::Mutex;
 
     // ---- fakes over the existing repository/LLM seams ----

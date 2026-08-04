@@ -2348,6 +2348,7 @@ dependencies = [
  "komo-core",
  "komo-infra",
  "komo-provider",
+ "komo-services",
  "libc",
  "open-lark",
  "pulldown-cmark",
@@ -2444,6 +2445,27 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "komo-services"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "globset",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "komo-config",
+ "komo-core",
+ "serde",
+ "serde_json",
+ "similar",
+ "time",
  "tokio",
  "tracing",
 ]

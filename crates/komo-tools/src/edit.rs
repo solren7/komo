@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::tools::fs_common;
 use komo_services::{diff, file_mutation};
 
 /// Lines of `-`/`+` context shown back to the model per edit.
@@ -67,7 +67,7 @@ impl Tool for EditTool {
 
     /// This call can park on an approval prompt, so it must outlast one.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(crate::domain::tool::APPROVAL_BOUND)
+        Some(komo_core::domain::tool::APPROVAL_BOUND)
     }
 
     /// The replacement text can be large and may carry secrets; keep the shape
@@ -253,9 +253,9 @@ fn preview(value: &str, marker: char) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
-    use crate::domain::context::{SessionContext, ToolContext};
-    use crate::tools::test_support::approving_ctx;
+    use crate::test_support::approving_ctx;
+    use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+    use komo_core::domain::context::{SessionContext, ToolContext};
     use std::path::PathBuf;
 
     fn tool_in(tag: &str) -> (EditTool, PathBuf) {

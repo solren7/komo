@@ -11,11 +11,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
-use crate::tools::fs_common;
 use komo_infra::logs;
 
 /// Lines returned when the caller doesn't say.
@@ -176,7 +176,7 @@ fn resolve(source: &str) -> Result<std::path::PathBuf, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::detached_ctx;
+    use crate::test_support::detached_ctx;
 
     #[tokio::test]
     async fn unknown_source_is_recoverable_invalid_input() {

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     cancel::Cancelled,
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -72,10 +72,10 @@ impl Tool for WebSearchTool {
                 .query(&[("q", args.query.as_str())])
                 .send()
                 .await
-                .map_err(|e| crate::tools::http::transport_error(e, "search request failed"))?;
-            resp.text().await.map_err(|e| {
-                crate::tools::http::transport_error(e, "failed to read search results")
-            })
+                .map_err(|e| crate::http::transport_error(e, "search request failed"))?;
+            resp.text()
+                .await
+                .map_err(|e| crate::http::transport_error(e, "failed to read search results"))
         };
         // A search is a read with nothing to leave half-done, so a cancelled turn
         // drops the request instead of holding the connection open to its timeout.

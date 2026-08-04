@@ -14,15 +14,15 @@
 //! valid `SKILL.md` is located, so a failed clone/fetch never leaves a
 //! half-written skill. Installs land **active** (governance decision: an install
 //! is either an operator CLI action or an approved tool call — a human is always
-//! in the loop). With the live [`SkillRegistry`](crate::services::skill_registry),
+//! in the loop). With the live [`SkillRegistry`](komo-services' `skill_registry`),
 //! the agent sees the new skill on its next `skill` list — no gateway restart.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::domain::skill::Skill;
-use komo_infra::skills::FsSkillStore;
+use crate::skills::FsSkillStore;
+use komo_core::domain::skill::Skill;
 
 /// Outcome of a successful install.
 pub struct Installed {

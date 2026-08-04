@@ -14,12 +14,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::tools::fs_common;
 
 /// Lines returned by one call, unless `limit` asks for fewer.
 const MAX_LINES: usize = 2_000;
@@ -342,7 +342,7 @@ fn truncate_chars(line: &str, max: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::detached_ctx;
+    use crate::test_support::detached_ctx;
     use std::path::PathBuf;
 
     /// A workspace rooted at a fresh temp dir, plus the tool over it.
@@ -550,18 +550,18 @@ mod tests {
     async fn a_policy_deny_blocks_the_read_without_leaking_content() {
         struct DenyReads;
         #[async_trait::async_trait]
-        impl crate::domain::approval::Approver for DenyReads {
+        impl komo_core::domain::approval::Approver for DenyReads {
             async fn decide(
                 &self,
-                _r: &crate::domain::approval::ApprovalRequest,
-            ) -> crate::domain::approval::Decision {
-                crate::domain::approval::Decision::deny_because("secrets are off limits")
+                _r: &komo_core::domain::approval::ApprovalRequest,
+            ) -> komo_core::domain::approval::Decision {
+                komo_core::domain::approval::Decision::deny_because("secrets are off limits")
             }
         }
         let (tool, dir) = tool_in("denied");
         std::fs::write(dir.join("s.txt"), "TOP-SECRET").unwrap();
-        let ctx = crate::domain::context::ToolContext::new(
-            crate::domain::context::SessionContext::detached("cli:t"),
+        let ctx = komo_core::domain::context::ToolContext::new(
+            komo_core::domain::context::SessionContext::detached("cli:t"),
             None,
             Arc::new(DenyReads),
         );

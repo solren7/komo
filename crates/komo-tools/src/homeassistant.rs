@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -89,17 +89,11 @@ impl HomeAssistantTool {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| {
-                crate::tools::http::transport_error(e, "request to Home Assistant failed")
-            })?;
+            .map_err(|e| crate::http::transport_error(e, "request to Home Assistant failed"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(crate::tools::http::status_error(
-                status,
-                "Home Assistant",
-                &body,
-            ));
+            return Err(crate::http::status_error(status, "Home Assistant", &body));
         }
         serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("invalid JSON from Home Assistant: {e}"))
@@ -135,7 +129,7 @@ impl Tool for HomeAssistantTool {
 
     /// These calls can park on an approval prompt, so they must outlast one.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(crate::domain::tool::APPROVAL_BOUND)
+        Some(komo_core::domain::tool::APPROVAL_BOUND)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -301,16 +295,12 @@ impl HomeAssistantTool {
                     .send()
                     .await
                     .map_err(|e| {
-                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                        crate::http::transport_error(e, "request to Home Assistant failed")
                     })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(crate::tools::http::status_error(
-                        status,
-                        "Home Assistant",
-                        &text,
-                    ));
+                    return Err(crate::http::status_error(status, "Home Assistant", &text));
                 }
                 // The response is the array of entities that changed state.
                 let changed = serde_json::from_str::<Value>(&text)
@@ -389,16 +379,12 @@ impl HomeAssistantTool {
                     .send()
                     .await
                     .map_err(|e| {
-                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                        crate::http::transport_error(e, "request to Home Assistant failed")
                     })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(crate::tools::http::status_error(
-                        status,
-                        "Home Assistant",
-                        &text,
-                    ));
+                    return Err(crate::http::status_error(status, "Home Assistant", &text));
                 }
                 Ok(format!(
                     "Saved automation {id}{name}; HA reloaded automations."
@@ -433,16 +419,12 @@ impl HomeAssistantTool {
                     .send()
                     .await
                     .map_err(|e| {
-                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                        crate::http::transport_error(e, "request to Home Assistant failed")
                     })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(crate::tools::http::status_error(
-                        status,
-                        "Home Assistant",
-                        &text,
-                    ));
+                    return Err(crate::http::status_error(status, "Home Assistant", &text));
                 }
                 Ok(format!("Deleted automation {id}; HA reloaded automations."))
             }
@@ -767,11 +749,11 @@ mod tests {
 
     /// The approver now rides on the turn's context, not the tool.
     fn allow() -> ToolContext {
-        crate::tools::test_support::approving_ctx("cli:test")
+        crate::test_support::approving_ctx("cli:test")
     }
 
     fn deny() -> ToolContext {
-        crate::tools::test_support::detached_ctx("cli:test")
+        crate::test_support::detached_ctx("cli:test")
     }
 
     #[tokio::test]

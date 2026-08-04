@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
@@ -183,9 +183,9 @@ enum Asked {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
-    use crate::domain::context::{SessionContext, ToolContext};
-    use crate::domain::gateway::ReplySink;
+    use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+    use komo_core::domain::context::{SessionContext, ToolContext};
+    use komo_core::domain::gateway::ReplySink;
     use std::sync::Mutex;
 
     struct RecordingSink {

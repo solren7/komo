@@ -149,7 +149,7 @@ const RELOAD_HINT: &str = "Takes effect on the agent's next `skill` list (no res
 /// Pure file+network ops — works while the gateway holds the db lock; the live
 /// registry means the running agent sees it on its next `skill` list, no restart.
 pub async fn install(source: &str) -> anyhow::Result<()> {
-    let installed = crate::infra::skill_install::install(&store(), source).await?;
+    let installed = komo_infra::skill_install::install(&store(), source).await?;
     let files = if installed.files == 1 {
         "1 file".to_string()
     } else {

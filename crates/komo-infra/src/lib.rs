@@ -14,5 +14,6 @@ pub mod logs;
 pub mod memory;
 pub mod permissions_store;
 pub mod persistence;
+pub mod skill_install;
 pub mod skills;
 pub mod workday;

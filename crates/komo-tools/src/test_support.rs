@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
     context::{SessionContext, ToolContext},
 };

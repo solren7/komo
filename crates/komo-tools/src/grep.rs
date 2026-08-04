@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::tools::fs_common;
 use komo_services::search;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -223,7 +223,7 @@ fn clip(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::detached_ctx;
+    use crate::test_support::detached_ctx;
 
     fn tool_in(tag: &str) -> (GrepTool, PathBuf) {
         let dir = std::env::temp_dir().join(format!("komo_greptool_{tag}"));
@@ -363,29 +363,29 @@ mod tests {
     async fn a_denied_path_is_never_searched() {
         struct DenySecrets;
         #[async_trait::async_trait]
-        impl crate::domain::approval::Approver for DenySecrets {
+        impl komo_core::domain::approval::Approver for DenySecrets {
             async fn decide(
                 &self,
-                r: &crate::domain::approval::ApprovalRequest,
-            ) -> crate::domain::approval::Decision {
+                r: &komo_core::domain::approval::ApprovalRequest,
+            ) -> komo_core::domain::approval::Decision {
                 let secret = match &r.action {
-                    Some(crate::domain::approval::ActionRef::File { path, .. }) => {
+                    Some(komo_core::domain::approval::ActionRef::File { path, .. }) => {
                         path.to_string_lossy().contains("secrets")
                     }
                     _ => false,
                 };
                 if secret {
-                    crate::domain::approval::Decision::deny_because("off limits")
+                    komo_core::domain::approval::Decision::deny_because("off limits")
                 } else {
-                    crate::domain::approval::Decision::Allow
+                    komo_core::domain::approval::Decision::Allow
                 }
             }
         }
 
         let (tool, dir) = tool_in("denied");
         std::fs::write(dir.join("secrets.env"), "needle = hunter2\n").unwrap();
-        let ctx = crate::domain::context::ToolContext::new(
-            crate::domain::context::SessionContext::detached("cli:t"),
+        let ctx = komo_core::domain::context::ToolContext::new(
+            komo_core::domain::context::SessionContext::detached("cli:t"),
             None,
             Arc::new(DenySecrets),
         );

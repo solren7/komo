@@ -6,7 +6,7 @@ use komo_services::skill_registry::{LocatedSkill, SkillRegistry, skill_files};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ApprovalRequest, Decision},
     context::ToolContext,
     repository::SkillRepository,
@@ -64,7 +64,7 @@ impl Tool for SkillTool {
 
     /// These calls can park on an approval prompt, so they must outlast one.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(crate::domain::tool::APPROVAL_BOUND)
+        Some(komo_core::domain::tool::APPROVAL_BOUND)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -188,7 +188,7 @@ impl Tool for SkillTool {
                         }
                     }));
                 }
-                let installed = crate::infra::skill_install::install(&self.store, &source).await?;
+                let installed = komo_infra::skill_install::install(&self.store, &source).await?;
                 let about = if installed.description.is_empty() {
                     String::new()
                 } else {
@@ -258,7 +258,7 @@ fn render_view(located: &LocatedSkill) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::skill::Skill;
+    use komo_core::domain::skill::Skill;
 
     fn registry() -> Arc<SkillRegistry> {
         Arc::new(SkillRegistry::new(vec![Skill {
@@ -281,7 +281,7 @@ mod tests {
     /// Install is the only action that consults the approver; every other test
     /// runs with this deny-all context, which would fail loudly if one did.
     fn ctx() -> ToolContext {
-        crate::tools::test_support::detached_ctx("cli:test")
+        crate::test_support::detached_ctx("cli:test")
     }
 
     fn tool_with(tag: &str) -> (SkillTool, Arc<FsSkillStore>) {
@@ -455,7 +455,7 @@ mod tests {
         // Lands as a candidate (not active), tagged with `learned` provenance.
         assert!(store.find_active("sync-cal").is_none());
         let cand = store.find_candidate("sync-cal").unwrap();
-        assert_eq!(cand.source, crate::domain::skill::SOURCE_LEARNED);
+        assert_eq!(cand.source, komo_core::domain::skill::SOURCE_LEARNED);
         assert_eq!(cand.description, "Sync the calendar");
         assert!(cand.instructions.contains("Step 2. Sync."));
     }
@@ -499,7 +499,7 @@ mod tests {
                 instructions: "orig".to_string(),
                 protected: false,
                 disabled: false,
-                source: crate::domain::skill::SOURCE_LEARNED.to_string(),
+                source: komo_core::domain::skill::SOURCE_LEARNED.to_string(),
             })
             .await
             .unwrap();

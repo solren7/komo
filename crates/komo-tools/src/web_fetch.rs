@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest},
     cancel::Cancelled,
     context::ToolContext,
@@ -210,7 +210,7 @@ impl Tool for WebFetchTool {
                 request = request.header(name, value);
             }
             let mut resp = request.send().await.map_err(|e| {
-                crate::tools::http::transport_error(e, format!("request to {} failed", args.url))
+                crate::http::transport_error(e, format!("request to {} failed", args.url))
             })?;
 
             let status = resp.status();
@@ -253,7 +253,7 @@ impl Tool for WebFetchTool {
             while let Some(chunk) = resp
                 .chunk()
                 .await
-                .map_err(|e| crate::tools::http::transport_error(e, "failed to read body"))?
+                .map_err(|e| crate::http::transport_error(e, "failed to read body"))?
             {
                 body.extend_from_slice(&chunk);
                 if body.len() >= MAX_RESPONSE_BYTES {
@@ -542,8 +542,8 @@ fn decode_entity(rest: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{Approver, Decision};
-    use crate::domain::context::{SessionContext, ToolContext};
+    use komo_core::domain::approval::{Approver, Decision};
+    use komo_core::domain::context::{SessionContext, ToolContext};
     use std::sync::Arc;
 
     struct DenyAll;
@@ -722,7 +722,7 @@ mod tests {
         let err = WebFetchTool::new()
             .call(
                 json!({ "url": url }),
-                &crate::tools::test_support::approving_ctx("cli:test"),
+                &crate::test_support::approving_ctx("cli:test"),
             )
             .await
             .unwrap_err();
@@ -742,7 +742,7 @@ mod tests {
         let out = WebFetchTool::new()
             .call(
                 json!({ "url": url }),
-                &crate::tools::test_support::approving_ctx("cli:test"),
+                &crate::test_support::approving_ctx("cli:test"),
             )
             .await
             .unwrap();
@@ -754,7 +754,7 @@ mod tests {
         let out = WebFetchTool::new()
             .call(
                 json!({ "url": url, "format": "html" }),
-                &crate::tools::test_support::approving_ctx("cli:test"),
+                &crate::test_support::approving_ctx("cli:test"),
             )
             .await
             .unwrap();
@@ -767,7 +767,7 @@ mod tests {
         let err = WebFetchTool::new()
             .call(
                 json!({ "url": url }),
-                &crate::tools::test_support::approving_ctx("cli:test"),
+                &crate::test_support::approving_ctx("cli:test"),
             )
             .await
             .unwrap_err();

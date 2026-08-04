@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
     cancel::Cancelled,
     context::ToolContext,
@@ -228,7 +228,10 @@ impl Tool for ShellTool {
     /// opaque error instead of this tool's "retry with a bigger timeout". The
     /// slack also covers a human sitting on the approval prompt.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_millis(MAX_TIMEOUT_MS) + crate::domain::tool::APPROVAL_BOUND)
+        Some(
+            std::time::Duration::from_millis(MAX_TIMEOUT_MS)
+                + komo_core::domain::tool::APPROVAL_BOUND,
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -494,8 +497,8 @@ fn kill_group(pgid: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{Approver, Decision, Risk};
-    use crate::domain::context::{SessionContext, ToolContext};
+    use komo_core::domain::approval::{Approver, Decision, Risk};
+    use komo_core::domain::context::{SessionContext, ToolContext};
     use std::sync::Mutex;
 
     fn ctx_with(approver: Arc<dyn Approver>) -> ToolContext {
@@ -618,7 +621,7 @@ mod tests {
     /// hitting stop mid-command.
     struct CancelAfter(std::time::Duration);
     #[async_trait::async_trait]
-    impl crate::domain::cancel::CancelSignal for CancelAfter {
+    impl komo_core::domain::cancel::CancelSignal for CancelAfter {
         fn is_cancelled(&self) -> bool {
             false
         }
@@ -660,7 +663,7 @@ mod tests {
         // its run don't describe the same stop two different ways.
         assert_eq!(
             err.to_string(),
-            crate::domain::cancel::CANCELLED_ERROR,
+            komo_core::domain::cancel::CANCELLED_ERROR,
             "{err}"
         );
 

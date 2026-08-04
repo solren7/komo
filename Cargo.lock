@@ -2349,6 +2349,7 @@ dependencies = [
  "komo-infra",
  "komo-provider",
  "komo-services",
+ "komo-tools",
  "libc",
  "open-lark",
  "pulldown-cmark",
@@ -2398,6 +2399,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "croner",
  "dirs",
  "serde",
  "serde_json",
@@ -2468,6 +2470,25 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "komo-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "http",
+ "komo-core",
+ "komo-infra",
+ "komo-services",
+ "libc",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

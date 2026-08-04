@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput},
 };
@@ -30,17 +30,17 @@ impl Tool for TimeTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::context::SessionContext;
+    use komo_core::domain::context::SessionContext;
     use std::sync::Arc;
 
     struct DenyAll;
     #[async_trait]
-    impl crate::domain::approval::Approver for DenyAll {
+    impl komo_core::domain::approval::Approver for DenyAll {
         async fn decide(
             &self,
-            _r: &crate::domain::approval::ApprovalRequest,
-        ) -> crate::domain::approval::Decision {
-            crate::domain::approval::Decision::deny()
+            _r: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            komo_core::domain::approval::Decision::deny()
         }
     }
 

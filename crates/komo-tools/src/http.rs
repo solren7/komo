@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::domain::tool::{RetryHint, TransientError};
+use komo_core::domain::tool::{RetryHint, TransientError};
 
 /// Classify a transport-level `reqwest::Error`. `None` = not transient (a
 /// terminal error such as an invalid URL or a body-decode failure — never

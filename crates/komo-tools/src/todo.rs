@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status},
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -176,8 +176,8 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
-    use crate::domain::context::{SessionContext, ToolContext};
+    use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+    use komo_core::domain::context::{SessionContext, ToolContext};
     use std::sync::Arc;
     use std::sync::Mutex;
 

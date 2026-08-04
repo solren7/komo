@@ -14,3 +14,5 @@ dirs = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+# Cron-expression parsing for `domain::cron`'s next-occurrence math.
+croner = "3"

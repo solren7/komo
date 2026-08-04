@@ -16,6 +16,8 @@ komo-infra = { path = "crates/komo-infra" }
 # The tool loop's services: execution, output bounding, memory enrichment,
 # the skill registry, and the fs/search primitives tools are built on.
 komo-services = { path = "crates/komo-services" }
+# Every tool but `delegate`, which needs the runtime it dispatches into.
+komo-tools = { path = "crates/komo-tools" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -105,6 +107,8 @@ tower = { version = "0.5", features = ["util"] }
 komo-infra = { path = "crates/komo-infra", features = ["test-support"] }
 # A static `SkillRegistry` for the skill tool's tests.
 komo-services = { path = "crates/komo-services", features = ["test-support"] }
+# Shared tool-test fixtures for the delegate tool's tests.
+komo-tools = { path = "crates/komo-tools", features = ["test-support"] }
 
 [workspace]
 members = [
@@ -113,6 +117,7 @@ members = [
     "crates/komo-provider",
     "crates/komo-infra",
     "crates/komo-services",
+    "crates/komo-tools",
 ]
 resolver = "3"
 

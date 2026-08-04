@@ -5,7 +5,7 @@ use komo_services::memory_enrichment::pinned_budget_usage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     memory::{
         Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
@@ -365,7 +365,7 @@ mod tests {
 
     /// A CLI-shaped session: global + session scope, no channel scope.
     fn ctx() -> ToolContext {
-        crate::tools::test_support::detached_ctx("cli:test")
+        crate::test_support::detached_ctx("cli:test")
     }
 
     #[tokio::test]

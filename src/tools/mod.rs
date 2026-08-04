@@ -1,26 +1,5 @@
-#[cfg(test)]
-pub mod test_support;
-
-pub mod apply_patch;
-pub mod ask_user;
-pub mod cron;
+//! What is left of `tools/` after the rest moved to `komo-tools`: `delegate`
+//! runs a sub-agent as a **real agent turn**, so it holds an `AgentRuntime` and
+//! cannot sit below the agent. Recursion stays blocked structurally — the
+//! sub-agent's tool set has `delegate: None`.
 pub mod delegate;
-pub mod edit;
-pub mod fs_common;
-pub mod glob;
-pub mod grep;
-pub mod homeassistant;
-pub mod http;
-pub mod logs;
-pub mod memory;
-pub mod read;
-pub mod reminder;
-pub mod session;
-pub mod shell;
-pub mod skill;
-pub mod task;
-pub mod time;
-pub mod todo;
-pub mod web_fetch;
-pub mod web_search;
-pub mod write;

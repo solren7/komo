@@ -5,10 +5,9 @@
 //! - `llm` assembles the tiered system prompt (`agent::system_prompt`) and wires
 //!   the tool executor in, over `komo-provider`'s wire layer.
 //! - `messaging` hosts the chat channels, which dispatch real turns.
-//! - `gateway_client` / `skill_install` speak the operator-control vocabulary.
+//! - `gateway_client` speaks the operator-control vocabulary.
 pub mod gateway_client;
 pub mod llm;
 pub mod rendezvous;
-pub mod skill_install;
 
 pub mod messaging;

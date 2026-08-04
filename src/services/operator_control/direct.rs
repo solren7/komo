@@ -7,6 +7,7 @@
 
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
+use komo_services::cron_actions;
 use std::sync::Arc;
 
 use tokio::sync::OnceCell;
@@ -196,7 +197,7 @@ impl DirectOperatorAdapter {
                 }
             }
             OperatorCommand::CronAdd { spec } => OperatorCommandResult::CronAdded(Box::new(
-                actions::add_cron_job(self.cron().await?.as_ref(), spec, now()).await?,
+                cron_actions::add_cron_job(self.cron().await?.as_ref(), spec, now()).await?,
             )),
             OperatorCommand::CronRemove { name } => {
                 if !CronJobRepository::delete(self.cron().await?.as_ref(), &name).await? {
@@ -205,15 +206,22 @@ impl DirectOperatorAdapter {
                 OperatorCommandResult::CronRemoved
             }
             OperatorCommand::CronSetEnabled { name, enabled } => {
-                match actions::set_cron_enabled(self.cron().await?.as_ref(), &name, enabled, now())
-                    .await?
+                match cron_actions::set_cron_enabled(
+                    self.cron().await?.as_ref(),
+                    &name,
+                    enabled,
+                    now(),
+                )
+                .await?
                 {
                     Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
                     None => anyhow::bail!(actions::no_cron_job_message(&name)),
                 }
             }
             OperatorCommand::CronTrigger { name } => {
-                match actions::trigger_cron_job(self.cron().await?.as_ref(), &name, now()).await? {
+                match cron_actions::trigger_cron_job(self.cron().await?.as_ref(), &name, now())
+                    .await?
+                {
                     Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
                     None => anyhow::bail!(actions::no_cron_job_message(&name)),
                 }

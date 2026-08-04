@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::tools::fs_common;
 use komo_services::search;
 
 /// Paths returned by one call unless `limit` says fewer.
@@ -140,7 +140,7 @@ impl Tool for GlobTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::detached_ctx;
+    use crate::test_support::detached_ctx;
 
     /// A small tree with a gitignored directory, inside a workspace.
     fn tool_in(tag: &str) -> (GlobTool, PathBuf) {

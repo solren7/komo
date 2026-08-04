@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
     context::ToolContext,
     tool::ToolError,
@@ -192,7 +192,7 @@ pub async fn allow_write_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::detached_ctx;
+    use crate::test_support::detached_ctx;
 
     fn ws(root: &str) -> Arc<Workspace> {
         Arc::new(Workspace::new(vec![PathBuf::from(root)]))
@@ -214,12 +214,12 @@ mod tests {
 
     #[test]
     fn selected_workspace_overrides_the_process_default() {
-        let mut session = crate::domain::context::SessionContext::detached("test");
+        let mut session = komo_core::domain::context::SessionContext::detached("test");
         session.workspace_root = Some(PathBuf::from("/home/u/selected"));
-        let ctx = crate::domain::context::ToolContext::new(
+        let ctx = komo_core::domain::context::ToolContext::new(
             session,
             None,
-            std::sync::Arc::new(crate::tools::test_support::SafeOnly),
+            std::sync::Arc::new(crate::test_support::SafeOnly),
         );
         let resolved = resolve(&ws("/home/u/default"), &ctx, "src/main.rs").unwrap();
         assert_eq!(resolved, PathBuf::from("/home/u/selected/src/main.rs"));

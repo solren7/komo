@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     task::{Task, TaskRepository, TaskStatus, parse_task_status},
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -304,7 +304,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        crate::tools::test_support::detached_ctx("cli:test")
+        crate::test_support::detached_ctx("cli:test")
     }
 
     #[tokio::test]

@@ -4,13 +4,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    agent::daemon::next_occurrence_local,
-    domain::{
-        context::ToolContext,
-        reminder::{Reminder, ReminderRepository, ReminderStatus},
-        tool::{Tool, ToolError, ToolOutput, parse_args},
-    },
+use komo_core::domain::{
+    context::ToolContext,
+    cron::next_occurrence_local,
+    reminder::{Reminder, ReminderRepository, ReminderStatus},
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 #[derive(Deserialize)]
@@ -299,7 +297,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        crate::tools::test_support::detached_ctx("cli:test")
+        crate::test_support::detached_ctx("cli:test")
     }
 
     #[tokio::test]

@@ -185,15 +185,23 @@ komo-provider  wire formats + HTTP/SSE; references nothing else in komo
 komo-infra     persistence · memory · skills · logs · workday ·
                permissions_store · codex                     (→ core, config, provider)
 komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
-               skill_registry · diff/patch/search/file_mutation  (→ core, config)
-komo (bin)     agent · tools · tui · cli, plus the parts of the old `infra/` and
-               `services/` that reach upward (llm.rs, messaging/, gateway_client,
-               skill_install, operator_control) — see those two `mod.rs` files
+               skill_registry · cron_actions ·
+               diff/patch/search/file_mutation                (→ core, config)
+komo-tools     every tool but `delegate`             (→ core, infra, services)
+komo (bin)     agent · tui · cli, plus what reaches upward: `infra/llm.rs`,
+               `infra/messaging/`, `infra/gateway_client`,
+               `services/operator_control`, `tools/delegate` — each of those
+               `mod.rs` files says why it stayed
 ```
 
 Test-only constructors a dependent crate's tests need — `persistence::reset_test_db`,
-`SkillRegistry::new` — are behind each crate's `test-support` feature, enabled
-only as a dev-dependency so they never ship.
+`SkillRegistry::new`, `komo-tools`' fixtures — are behind each crate's
+`test-support` feature, enabled only as a dev-dependency so they never ship.
+
+Cron scheduling math (`next_occurrence_local`) lives in `komo-core`'s
+`domain::cron`, and every job mutation goes through `komo-services`'
+`cron_actions` — the `cron` tool, the gateway handlers and the CLI adapter all
+call the same functions, which is what keeps validation from forking.
 
 **Module map** (one line each; read the module for details):
 
@@ -229,7 +237,7 @@ only as a dev-dependency so they never ship.
   must outlast the 5-min approval prompt, `APPROVAL_BOUND`).
   `Tool::call(Value, &ToolContext)` is the **only** tool entry point; the
   `SESSION` task-local serves the approvers only — tools take `ctx.session`.
-- `tools/` — `time`, `shell` (own process group, hardline floor no approval
+- `komo-tools` — `time`, `shell` (own process group, hardline floor no approval
   unlocks, nested timeouts), `grep`/`glob` (ripgrep libraries in-process;
   policy runs over paths **before** content is read), `read`/`write` +
   `fs_common` (workspace-confined; `write_if_unchanged` guards the approval
@@ -238,10 +246,11 @@ only as a dev-dependency so they never ship.
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
   hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
-  `skill`, `cron`, `delegate`, `ask_user` (clarify), `logs` (tail of komo's own
+  `skill`, `cron`, `ask_user` (clarify), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`).
-- `tools/delegate.rs` — sub-agent as a real agent turn on a `delegate:<uuid>`
+- `tools/delegate.rs` (in the bin — it holds an `AgentRuntime`) — sub-agent as a
+  real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
@@ -326,7 +335,7 @@ only as a dev-dependency so they never ship.
 
 ## Extension points
 
-- **Add a tool**: implement `Tool` in `src/tools/`, register in `cli/wiring.rs`
+- **Add a tool**: implement `Tool` in `crates/komo-tools/src/`, register in `cli/wiring.rs`
   (and add it to `tool_execution::policy_scope` if it should be policy-filterable).
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`), construct in
   `build_llm`.

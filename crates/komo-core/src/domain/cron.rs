@@ -16,6 +16,7 @@
 //! the store the sweep treats both origins identically.
 
 use async_trait::async_trait;
+use croner::Cron;
 
 /// Default wall-clock budget for a job command — hermes' cron-job budget
 /// (15 min), generous enough for a script that clones a repo and pushes an MR.
@@ -280,5 +281,62 @@ mod tests {
         let a = CronJob::new_command("a", "* * * * *", "/bin/true", 0);
         let b = CronJob::new_command("b", "* * * * *", "/bin/true", 0);
         assert_ne!(a.id, b.id);
+    }
+}
+
+/// Compute the next occurrence of a cron expression strictly after `after`.
+/// Timezone-generic so tests can use `FixedOffset` for determinism while
+/// production uses `Local`.
+pub fn next_occurrence_in<Tz>(
+    expr: &str,
+    after: chrono::DateTime<Tz>,
+) -> anyhow::Result<chrono::DateTime<Tz>>
+where
+    Tz: chrono::TimeZone + Clone,
+{
+    let cron = expr
+        .parse::<Cron>()
+        .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
+    Ok(cron.find_next_occurrence(&after, false)?)
+}
+
+/// Production wrapper: compute the next local-time occurrence after `after_unix`
+/// and return it as a Unix timestamp. Computes from the given time (usually
+/// `now`) so a resting daemon always jumps to the next future slot.
+pub fn next_occurrence_local(expr: &str, after_unix: i64) -> anyhow::Result<i64> {
+    let after_utc = chrono::DateTime::from_timestamp(after_unix, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp: {after_unix}"))?;
+    let after_local = after_utc.with_timezone(&chrono::Local);
+    let next = next_occurrence_in(expr, after_local)?;
+    Ok(next.timestamp())
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use chrono::{Datelike, TimeZone, Timelike};
+
+    #[test]
+    fn next_occurrence_in_rejects_invalid_expr() {
+        let result = next_occurrence_in("not a cron", chrono::Utc::now());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn next_occurrence_in_computes_strictly_future_fire() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let expr = "0 9 * * *"; // 9 AM daily
+
+        // 8 AM local → next occurrence is 9 AM the same day
+        let at_8am = tz.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap();
+        let next = next_occurrence_in(expr, at_8am).unwrap();
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.day(), 1);
+
+        // exactly 9 AM local → next is 9 AM the following day (strictly future)
+        let at_9am = tz.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let next = next_occurrence_in(expr, at_9am).unwrap();
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.day(), 2);
     }
 }

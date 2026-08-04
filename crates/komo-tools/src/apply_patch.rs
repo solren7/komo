@@ -15,12 +15,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use crate::fs_common;
+use komo_core::domain::{
     context::ToolContext,
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
-use crate::tools::fs_common;
 use komo_services::{diff, file_mutation, patch};
 
 #[derive(Deserialize)]
@@ -65,7 +65,7 @@ impl Tool for ApplyPatchTool {
 
     /// This call can park on an approval prompt, so it must outlast one.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(crate::domain::tool::APPROVAL_BOUND)
+        Some(komo_core::domain::tool::APPROVAL_BOUND)
     }
 
     /// The patch body is the change itself — arbitrarily large, possibly
@@ -239,9 +239,9 @@ fn ensure_newline(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ActionRef, ApprovalRequest, Approver, Decision};
-    use crate::domain::context::{SessionContext, ToolContext};
-    use crate::tools::test_support::approving_ctx;
+    use crate::test_support::approving_ctx;
+    use komo_core::domain::approval::{ActionRef, ApprovalRequest, Approver, Decision};
+    use komo_core::domain::context::{SessionContext, ToolContext};
 
     fn tool_in(tag: &str) -> (ApplyPatchTool, PathBuf) {
         let dir = std::env::temp_dir().join(format!("komo_patch_{tag}"));
@@ -297,7 +297,7 @@ mod tests {
         #[async_trait]
         impl Approver for CountPrompts {
             async fn decide(&self, r: &ApprovalRequest) -> Decision {
-                if r.risk != crate::domain::approval::Risk::Safe {
+                if r.risk != komo_core::domain::approval::Risk::Safe {
                     *self.0.lock().unwrap() += 1;
                 }
                 Decision::Allow

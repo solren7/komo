@@ -15,15 +15,15 @@
 //! also ships is intentionally left out of v0.1: this is the in-process loop
 //! only, which a later `komo daemon --install` can wrap.
 
+use croner::Cron;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use croner::Cron;
 use tracing::{error, info, warn};
 
 use crate::domain::{
-    cron::{CronAction, CronJob, CronJobRepository, CronRunStatus},
+    cron::{CronAction, CronJob, CronJobRepository, CronRunStatus, next_occurrence_local},
     gateway::MessageHandler,
     llm::LlmClient,
     memory::{Memory, MemoryRepository},
@@ -586,33 +586,6 @@ fn truncate_tail(s: &str, cap: usize) -> String {
 /// Grace window: reminders missed by up to this many seconds are delivered late
 /// (with a "missed" prefix); older ones are marked missed without re-notifying.
 const REMINDER_GRACE_SECS: i64 = 600;
-
-/// Compute the next occurrence of a cron expression strictly after `after`.
-/// Timezone-generic so tests can use `FixedOffset` for determinism while
-/// production uses `Local`.
-pub fn next_occurrence_in<Tz>(
-    expr: &str,
-    after: chrono::DateTime<Tz>,
-) -> anyhow::Result<chrono::DateTime<Tz>>
-where
-    Tz: chrono::TimeZone + Clone,
-{
-    let cron = expr
-        .parse::<Cron>()
-        .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
-    Ok(cron.find_next_occurrence(&after, false)?)
-}
-
-/// Production wrapper: compute the next local-time occurrence after `after_unix`
-/// and return it as a Unix timestamp. Computes from the given time (usually
-/// `now`) so a resting daemon always jumps to the next future slot.
-pub fn next_occurrence_local(expr: &str, after_unix: i64) -> anyhow::Result<i64> {
-    let after_utc = chrono::DateTime::from_timestamp(after_unix, 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp: {after_unix}"))?;
-    let after_local = after_utc.with_timezone(&chrono::Local);
-    let next = next_occurrence_in(expr, after_local)?;
-    Ok(next.timestamp())
-}
 
 /// Deliver a group of due items as a **single coalesced notification**, so a
 /// sweep that finds several at once — the common case being the backlog flush
@@ -1678,32 +1651,6 @@ mod tests {
             .filter(|r| r.status == ReminderStatus::Fired)
             .count();
         assert_eq!(fired, 3);
-    }
-
-    // ── cron helpers ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn next_occurrence_in_computes_strictly_future_fire() {
-        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let expr = "0 9 * * *"; // 9 AM daily
-
-        // 8 AM local → next occurrence is 9 AM the same day
-        let at_8am = tz.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap();
-        let next = next_occurrence_in(expr, at_8am).unwrap();
-        assert_eq!(next.hour(), 9);
-        assert_eq!(next.day(), 1);
-
-        // exactly 9 AM local → next is 9 AM the following day (strictly future)
-        let at_9am = tz.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let next = next_occurrence_in(expr, at_9am).unwrap();
-        assert_eq!(next.hour(), 9);
-        assert_eq!(next.day(), 2);
-    }
-
-    #[test]
-    fn next_occurrence_in_rejects_invalid_expr() {
-        let result = next_occurrence_in("not a cron", chrono::Utc::now());
-        assert!(result.is_err());
     }
 
     // ── recurring sweep ───────────────────────────────────────────────────────

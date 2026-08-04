@@ -14,6 +14,26 @@ use komo_services::memory_enrichment::MemoryEnricher;
 use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::{ToolExecutionConfig, ToolExecutor};
 use komo_services::tool_output_store::ToolOutputStore;
+use komo_tools::apply_patch::ApplyPatchTool;
+use komo_tools::ask_user::AskUserTool;
+use komo_tools::cron::CronTool;
+use komo_tools::edit::EditTool;
+use komo_tools::glob::GlobTool;
+use komo_tools::grep::GrepTool;
+use komo_tools::homeassistant::HomeAssistantTool;
+use komo_tools::logs::LogsTool;
+use komo_tools::memory::MemoryTool;
+use komo_tools::read::ReadTool;
+use komo_tools::reminder::ReminderTool;
+use komo_tools::session::SessionTool;
+use komo_tools::shell::ShellTool;
+use komo_tools::skill::SkillTool;
+use komo_tools::task::TaskTool;
+use komo_tools::time::TimeTool;
+use komo_tools::todo::TodoTool;
+use komo_tools::web_fetch::WebFetchTool;
+use komo_tools::web_search::WebSearchTool;
+use komo_tools::write::WriteTool;
 use std::sync::Arc;
 
 use crate::{
@@ -26,13 +46,7 @@ use crate::{
         repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
     },
     infra::llm::{PreambleFn, build_llm},
-    tools::{
-        apply_patch::ApplyPatchTool, ask_user::AskUserTool, cron::CronTool, delegate::DelegateTool,
-        edit::EditTool, glob::GlobTool, grep::GrepTool, homeassistant::HomeAssistantTool,
-        logs::LogsTool, memory::MemoryTool, read::ReadTool, reminder::ReminderTool,
-        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
-        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteTool,
-    },
+    tools::delegate::DelegateTool,
 };
 use komo_config::ConfigSnapshot;
 

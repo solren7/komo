@@ -11,6 +11,7 @@
 //! and out to the gateway client, so it is wiring rather than a service.
 
 pub mod clarify;
+pub mod cron_actions;
 pub mod diff;
 pub mod file_mutation;
 pub mod memory_enrichment;

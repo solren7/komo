@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 
-use crate::domain::{
+use komo_core::domain::{
     context::ToolContext,
     message::Message,
     repository::{MessageRepository, SessionRepository},
@@ -236,10 +236,10 @@ fn rfc3339(unix: i64) -> String {
 
 fn role_tag(m: &Message) -> &'static str {
     match m.role {
-        crate::domain::message::Role::User => "user",
-        crate::domain::message::Role::Assistant => "assistant",
-        crate::domain::message::Role::System => "system",
-        crate::domain::message::Role::Tool => "tool",
+        komo_core::domain::message::Role::User => "user",
+        komo_core::domain::message::Role::Assistant => "assistant",
+        komo_core::domain::message::Role::System => "system",
+        komo_core::domain::message::Role::Tool => "tool",
     }
 }
 
@@ -305,9 +305,9 @@ fn full_line(idx: usize, m: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::{ApprovalRequest, Approver, Decision};
-    use crate::domain::context::SessionContext;
-    use crate::domain::session::Session;
+    use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+    use komo_core::domain::context::SessionContext;
+    use komo_core::domain::session::Session;
 
     struct FakeSessions(Vec<Session>);
 

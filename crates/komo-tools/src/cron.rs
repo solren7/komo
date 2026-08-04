@@ -26,18 +26,16 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    domain::{
-        approval::{ActionRef, ApprovalRequest, Decision},
-        context::ToolContext,
-        cron::{
-            CronAction, CronJob, CronJobRepository, CronJobSpec, CronRunStatus,
-            DEFAULT_CRON_JOB_TIMEOUT_SECS,
-        },
-        tool::{Tool, ToolError, ToolOutput, parse_args},
+use komo_core::domain::{
+    approval::{ActionRef, ApprovalRequest, Decision},
+    context::ToolContext,
+    cron::{
+        CronAction, CronJob, CronJobRepository, CronJobSpec, CronRunStatus,
+        DEFAULT_CRON_JOB_TIMEOUT_SECS,
     },
-    services::operator_control::actions,
+    tool::{Tool, ToolError, ToolOutput, parse_args},
 };
+use komo_services::cron_actions as actions;
 
 /// How much of an agent job's prompt a listing shows.
 const PROMPT_PREVIEW: usize = 100;
@@ -122,7 +120,7 @@ impl Tool for CronTool {
 
     /// These calls can park on an approval prompt, so they must outlast one.
     fn max_duration(&self) -> Option<std::time::Duration> {
-        Some(crate::domain::tool::APPROVAL_BOUND)
+        Some(komo_core::domain::tool::APPROVAL_BOUND)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -463,7 +461,7 @@ fn local_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::Decision;
+    use komo_core::domain::approval::Decision;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -507,7 +505,7 @@ mod tests {
     /// Records what it was asked and answers with a fixed verdict.
     struct Recorder {
         allow: bool,
-        seen: Mutex<Vec<(String, crate::domain::approval::Risk)>>,
+        seen: Mutex<Vec<(String, komo_core::domain::approval::Risk)>>,
     }
 
     impl Recorder {
@@ -520,7 +518,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::domain::approval::Approver for Recorder {
+    impl komo_core::domain::approval::Approver for Recorder {
         async fn decide(&self, request: &ApprovalRequest) -> Decision {
             self.seen
                 .lock()
@@ -541,7 +539,7 @@ mod tests {
     /// context, not the tool).
     async fn run(t: &CronTool, args: Value, rec: &Arc<Recorder>) -> Result<ToolOutput, ToolError> {
         let ctx = ToolContext::new(
-            crate::domain::context::SessionContext::detached("cli:test"),
+            komo_core::domain::context::SessionContext::detached("cli:test"),
             None,
             rec.clone(),
         );
@@ -570,7 +568,7 @@ mod tests {
 
         let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, crate::domain::approval::Risk::Normal);
+        assert_eq!(seen[0].1, komo_core::domain::approval::Risk::Normal);
     }
 
     #[tokio::test]
@@ -585,7 +583,7 @@ mod tests {
         .await
         .unwrap();
         let seen = rec.seen.lock().unwrap();
-        assert_eq!(seen[0].1, crate::domain::approval::Risk::Dangerous);
+        assert_eq!(seen[0].1, komo_core::domain::approval::Risk::Dangerous);
         assert!(seen[0].0.contains("/opt/rotate.py --push"), "{}", seen[0].0);
         assert_eq!(jobs.jobs.lock().unwrap().len(), 1);
     }

@@ -525,6 +525,7 @@ fn stop_reply(stopped: &str, current: &str, narration: &str) -> String {
 mod tests {
     use super::*;
     use komo_infra::persistence::db::Db;
+    use komo_tools::time::TimeTool;
 
     use crate::{
         agent::interaction::CancelState,
@@ -536,7 +537,6 @@ mod tests {
             session::Session,
             tool::{Tool, ToolError, ToolOutput},
         },
-        tools::time::TimeTool,
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;

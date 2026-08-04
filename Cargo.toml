@@ -124,16 +124,12 @@ members = [
 ]
 resolver = "3"
 
-# Dev builds keep file/line backtraces but skip full variable debuginfo —
-# noticeably faster codegen + linking on this 50k-line bin crate, and a much
-# smaller target/. Debugging with a full debugger needs `debug = true` back.
-[profile.dev]
-debug = "line-tables-only"
-
-# Dependencies don't need debuginfo at all (their code isn't being debugged
-# here); this mostly cuts cold-build time and target/ size.
+# Keep full symbols for Komo itself during local development, but omit them from
+# third-party crates. The dependency graph (notably Turso and Tantivy) dominates
+# cold-build time and debug artifact size; their source-level debugging is rarely
+# needed while working on Komo.
 [profile.dev.package."*"]
-debug = false
+debug = "none"
 
 # Shared across the workspace so komo and komo-core pin one version each.
 # Crate-unique / heavy deps (toasty, axum, ratatui, …) stay in their own

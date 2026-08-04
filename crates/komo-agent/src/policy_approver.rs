@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::info;
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
     policy::{Policy, Rule, Verdict, channel_of},
 };
@@ -132,7 +132,7 @@ impl Approver for PolicyApprover {
 /// A policy denial, explained to the model: naming the rule that blocked it is
 /// what stops the model from retrying the same call in a loop, and tells it
 /// whether to look for another route or give up and report the block.
-fn policy_denial(decision: crate::domain::policy::Decision) -> Decision {
+fn policy_denial(decision: komo_core::domain::policy::Decision) -> Decision {
     match decision.rule {
         // The index is the one `komo policy list` prints, so the operator can
         // find the exact line if the user asks why.
@@ -150,8 +150,8 @@ fn policy_denial(decision: crate::domain::policy::Decision) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::approval::ActionRef;
-    use crate::domain::policy::{Category, Effect, Matcher, Rule};
+    use komo_core::domain::approval::ActionRef;
+    use komo_core::domain::policy::{Category, Effect, Matcher, Rule};
     use komo_services::tool_execution::{SessionContext, with_session};
     use std::sync::Mutex;
 

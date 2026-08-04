@@ -2344,6 +2344,7 @@ dependencies = [
  "http",
  "ignore",
  "image",
+ "komo-agent",
  "komo-config",
  "komo-core",
  "komo-infra",
@@ -2377,6 +2378,32 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "wechatbot",
+]
+
+[[package]]
+name = "komo-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "croner",
+ "dirs",
+ "futures-util",
+ "komo-config",
+ "komo-core",
+ "komo-infra",
+ "komo-provider",
+ "komo-services",
+ "komo-tools",
+ "libc",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

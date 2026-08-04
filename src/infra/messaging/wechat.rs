@@ -28,6 +28,9 @@
 //! ordinary WeChat groups, so there is no group/mention gate — the
 //! `PairingGuard` is the only admission control.
 
+use komo_agent::gateway::Channel;
+use komo_agent::interaction::GatewayDispatcher;
+use komo_agent::pairing::PairingGuard;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -42,7 +45,6 @@ use tracing::{error, info, warn};
 use wechatbot::{BotOptions, WeChatBot};
 
 use crate::{
-    agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
     domain::{
         gateway::{ReplySink, WeChatLogin},
         pairing::PairingRepository,

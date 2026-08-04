@@ -17,21 +17,16 @@
 //! across crashes/reboots (launchd `KeepAlive` / systemd `Restart=always`) is
 //! still deferred — this is the in-process host only.
 
+use crate::daemon::{Maintenance, Schedule, supervise};
+use crate::interaction::GatewayDispatcher;
+use crate::runtime::AgentRuntime;
+use komo_core::domain::{gateway::MessageHandler, notify::Notifier};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
-
-use crate::{
-    agent::{
-        daemon::{Maintenance, Schedule, supervise},
-        interaction::GatewayDispatcher,
-        runtime::AgentRuntime,
-    },
-    domain::{gateway::MessageHandler, notify::Notifier},
-};
 
 /// How long the shutdown notice may take before we stop waiting and shut down.
 const SHUTDOWN_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);

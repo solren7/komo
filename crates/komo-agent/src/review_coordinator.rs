@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::warn;
 
-use crate::domain::{
+use komo_core::domain::{
     repository::{MessageRepository, SessionRepository},
     reviewer::{ReviewOutcome, Reviewer},
     session::Session,
@@ -191,9 +191,9 @@ impl Drop for InFlightGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::message::Message;
-    use crate::domain::repository::ReviewCandidate;
     use async_trait::async_trait;
+    use komo_core::domain::message::Message;
+    use komo_core::domain::repository::ReviewCandidate;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Sessions with hand-set candidates/turn counts; records watermark marks

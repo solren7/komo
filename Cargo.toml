@@ -18,6 +18,8 @@ komo-infra = { path = "crates/komo-infra" }
 komo-services = { path = "crates/komo-services" }
 # Every tool but `delegate`, which needs the runtime it dispatches into.
 komo-tools = { path = "crates/komo-tools" }
+# The agent: tool loop, gateway, sweeps, and the provider client it drives.
+komo-agent = { path = "crates/komo-agent" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -118,6 +120,7 @@ members = [
     "crates/komo-infra",
     "crates/komo-services",
     "crates/komo-tools",
+    "crates/komo-agent",
 ]
 resolver = "3"
 

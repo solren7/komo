@@ -186,7 +186,7 @@ impl DirectOperatorAdapter {
                 revoked: PairingRepository::revoke(self.db().await?.as_ref(), &id).await?,
             },
             OperatorCommand::DreamApply => {
-                let summary = crate::agent::daemon::DreamSweep {
+                let summary = komo_agent::daemon::DreamSweep {
                     memories: self.memory().await?.clone() as Arc<dyn MemoryRepository>,
                 }
                 .apply()

@@ -1,20 +1,18 @@
+use crate::review_coordinator::{ReviewCoordinator, ReviewTrigger};
+use komo_core::domain::{
+    cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
+    events::{ToolEventSink, TurnEvent},
+    llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
+    message::Message,
+    repository::{MessageRepository, SessionRepository},
+    run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
+    session::Session,
+};
 use std::future::Future;
 use std::sync::Arc;
 
 use tracing::{Instrument, info, info_span, warn};
 
-use crate::{
-    agent::review_coordinator::{ReviewCoordinator, ReviewTrigger},
-    domain::{
-        cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
-        events::{ToolEventSink, TurnEvent},
-        llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
-        message::Message,
-        repository::{MessageRepository, SessionRepository},
-        run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
-        session::Session,
-    },
-};
 use komo_services::tool_execution::{
     RunContext, SessionContext, SpinDetector, ToolExecutor, ToolTurnContext, TurnResultBudget,
     current_session, with_session,
@@ -527,18 +525,16 @@ mod tests {
     use komo_infra::persistence::db::Db;
     use komo_tools::time::TimeTool;
 
-    use crate::{
-        agent::interaction::CancelState,
-        domain::{
-            llm::{LlmClient, Step, ToolCallReq, TurnDriver},
-            message::Role,
-            repository::SessionRepository,
-            run::RunStatus,
-            session::Session,
-            tool::{Tool, ToolError, ToolOutput},
-        },
-    };
+    use crate::interaction::CancelState;
     use async_trait::async_trait;
+    use komo_core::domain::{
+        llm::{LlmClient, Step, ToolCallReq, TurnDriver},
+        message::Role,
+        repository::SessionRepository,
+        run::RunStatus,
+        session::Session,
+        tool::{Tool, ToolError, ToolOutput},
+    };
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -617,7 +613,7 @@ mod tests {
         async fn call(
             &self,
             input: serde_json::Value,
-            _ctx: &crate::domain::context::ToolContext,
+            _ctx: &komo_core::domain::context::ToolContext,
         ) -> Result<ToolOutput, ToolError> {
             // Echo the payload, not its JSON encoding: the assertion is about
             // results threading back through the loop.
@@ -642,7 +638,7 @@ mod tests {
         async fn call(
             &self,
             _input: serde_json::Value,
-            _ctx: &crate::domain::context::ToolContext,
+            _ctx: &komo_core::domain::context::ToolContext,
         ) -> Result<ToolOutput, ToolError> {
             Err(ToolError::Failed(anyhow::anyhow!("boom")))
         }
@@ -738,7 +734,7 @@ mod tests {
         async fn call(
             &self,
             _input: serde_json::Value,
-            _ctx: &crate::domain::context::ToolContext,
+            _ctx: &komo_core::domain::context::ToolContext,
         ) -> Result<ToolOutput, ToolError> {
             self.started.notify_waiters();
             self.released.notified().await;
@@ -828,7 +824,7 @@ mod tests {
     /// An [`InterjectSource`] that hands over a fixed message once — the shape
     /// of a user typing while a round runs.
     struct SaysOnce(Mutex<Option<String>>);
-    impl crate::domain::gateway::InterjectSource for SaysOnce {
+    impl komo_core::domain::gateway::InterjectSource for SaysOnce {
         fn take(&self) -> Vec<String> {
             self.0.lock().unwrap().take().into_iter().collect()
         }
@@ -1232,7 +1228,7 @@ mod tests {
     /// client. Nothing else in komo surfaces the model's mid-turn reasoning.
     #[tokio::test]
     async fn narration_alongside_tool_calls_reaches_the_event_sink() {
-        use crate::domain::events::ToolEventSink;
+        use komo_core::domain::events::ToolEventSink;
 
         #[derive(Default)]
         struct Captured(Mutex<Vec<TurnEvent>>);

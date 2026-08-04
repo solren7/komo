@@ -187,11 +187,13 @@ komo-infra     persistence · memory · skills · logs · workday ·
 komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
                skill_registry · cron_actions ·
                diff/patch/search/file_mutation                (→ core, config)
-komo-tools     every tool but `delegate`             (→ core, infra, services)
-komo (bin)     agent · tui · cli, plus what reaches upward: `infra/llm.rs`,
-               `infra/messaging/`, `infra/gateway_client`,
-               `services/operator_control`, `tools/delegate` — each of those
-               `mod.rs` files says why it stayed
+komo-tools     every tool                           (→ core, infra, services)
+komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
+               policy_approver · reviewer · llm · delegate
+                                            (→ core, config, provider, infra, services)
+komo (bin)     cli · tui · `infra/messaging` (channels) · `infra/gateway_client` ·
+               `services/operator_control` — the wiring layer, plus what needs
+               the agent above it; each `mod.rs` says why it stayed
 ```
 
 Test-only constructors a dependent crate's tests need — `persistence::reset_test_db`,
@@ -207,7 +209,7 @@ call the same functions, which is what keeps validation from forking.
 
 - `domain/` — pure traits + value types, no I/O, no external crates
   (`Tool`, `LlmClient`/`TurnDriver`, repositories, policy engine, pairing).
-- `agent/runtime.rs` — session lifecycle + the tool loop; loads only a recent
+- `komo-agent`'s `runtime` — session lifecycle + the tool loop; loads only a recent
   transcript window per turn (`find_windowed`); wraps each turn in a ledger
   `Run` (all ledger writes best-effort, never fail the turn).
 - `crates/komo-provider` — komo's own provider layer, its own crate because it
@@ -221,7 +223,7 @@ call the same functions, which is what keeps validation from forking.
   `Retry-After` beats any local backoff. Every request streams; a stream that
   ends without its terminal frame is a retryable failure, never a short answer.
   A new provider is a base URL + auth mode, not new code.
-- `infra/llm.rs` — `ProviderLlm` over that layer; `assemble` builds the tiered
+- `komo-agent`'s `llm` — `ProviderLlm` over that layer; `assemble` builds the tiered
   system prompt once per turn (stable tier incl. `~/.komo/USER.md` and the
   machine-wide instruction file, then memory
   prefix from `MemoryEnricher` — main agent only). `RoutingLlm` = cross-provider
@@ -249,13 +251,12 @@ call the same functions, which is what keeps validation from forking.
   `skill`, `cron`, `ask_user` (clarify), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`).
-- `tools/delegate.rs` (in the bin — it holds an `AgentRuntime`) — sub-agent as a
-  real agent turn on a `delegate:<uuid>`
+- `komo-agent`'s `delegate` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
   run. The unattended cron runtime gets no `delegate`.
-- `domain/policy.rs` + `agent/policy_approver.rs` — permission policy. Ladder,
+- `domain/policy.rs` + `komo-agent`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
   only by `PolicyApprover`) never cover `Risk::Dangerous` and are never read
@@ -285,7 +286,7 @@ call the same functions, which is what keeps validation from forking.
   exception that lands active. `protected` skills refuse even proposals.
   `SkillRegistry` re-scans dirs on every query (no restart needed); only the
   capped prompt catalog is a startup snapshot (cache stability).
-- `agent/daemon.rs` — `Maintenance` sweeps under `supervise` (circuit breaker
+- `komo-agent`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures): `ReviewSweep` (via the shared `ReviewCoordinator`, which
   also serves the post-turn trigger — watermark + in-flight guard prevent
   duplicate reviews), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
@@ -293,7 +294,7 @@ call the same functions, which is what keeps validation from forking.
   runtime with read-only tools + deny-all unattended approver; degrades to
   tool-less `complete` on error), `DreamSweep`. `WorkdayGated` decorator gates
   a sweep to Chinese working days (`komo-infra`'s `workday`, cached per-year).
-- `agent/gateway.rs` + `agent/interaction.rs` — gateway hosts channels +
+- `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). Chat commands: `/new` (rotate
   session, clear todos + approval state), `/approve [session|always]`,
@@ -338,14 +339,14 @@ call the same functions, which is what keeps validation from forking.
 - **Add a tool**: implement `Tool` in `crates/komo-tools/src/`, register in `cli/wiring.rs`
   (and add it to `tool_execution::policy_scope` if it should be policy-filterable).
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`), construct in
-  `build_llm`.
+  `komo-agent`'s `llm::build_llm`.
 - **Swap persistence**: implement the repository traits; `agent/`/`domain/`
   need no changes.
 - **Add a provider**: an entry in `Provider` plus its base URL / auth / wire in
   `infra/llm.rs` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
   format* — only if it speaks neither Responses nor Messages — is a module in
   `crates/komo-provider` and a `Wire` variant.
-- **Agent-loop control**: add round-level control points in `run_agent_loop`;
+- **Agent-loop control**: add round-level control points in `komo-agent`'s `run_agent_loop`;
   extend `TurnDriver`/`Step`. Clarify (`tools/ask_user.rs` +
   `services/clarify.rs`) is the sentinel-tool reference.
 - **Scheduled action**: implement `Maintenance`, construct in `cli/gateway.rs`.

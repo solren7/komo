@@ -1,9 +1,7 @@
-mod agent;
 mod cli;
 mod domain;
 mod infra;
 mod services;
-mod tools;
 mod tui;
 
 // Global allocator: mimalloc — installed by turso's default `mimalloc`

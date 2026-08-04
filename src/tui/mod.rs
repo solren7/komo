@@ -29,6 +29,7 @@ mod markdown;
 mod paste;
 mod ui;
 
+use komo_agent::runtime::AgentRuntime;
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, with_session};
@@ -46,7 +47,6 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    agent::runtime::AgentRuntime,
     cli::wiring,
     domain::{
         approval::Approver,

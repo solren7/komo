@@ -6,6 +6,7 @@
 //! transport — the api handlers and the direct adapter both call these, so the
 //! business result can't fork between the two paths.
 
+use komo_core::domain::session::is_subagent_session;
 use komo_services::cron_actions;
 /// Re-exported so every operator-control caller keeps naming one place for
 /// the unknown-job message, wherever the implementation lives.
@@ -248,15 +249,6 @@ pub async fn resolve_resume(runs: &dyn RunRepository, id: &str) -> anyhow::Resul
     Ok(ResumeTarget::Ready { run, steps, input })
 }
 
-/// Session-id prefix for a sub-agent turn spawned by the `delegate` tool.
-/// Kept next to the projection that filters it so the two can't drift.
-pub const SUBAGENT_SESSION_PREFIX: &str = "delegate:";
-
-/// Is this a sub-agent's scratch session rather than a real conversation?
-pub fn is_subagent_session(id: &str) -> bool {
-    id.starts_with(SUBAGENT_SESSION_PREFIX)
-}
-
 /// Summaries only — a list view never dumps full transcripts.
 pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
     sessions
@@ -373,15 +365,6 @@ mod tests {
         ]);
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["api:real", "api:archived"]);
-    }
-
-    #[test]
-    fn only_the_subagent_prefix_is_filtered() {
-        // Don't over-match: a user conversation may legitimately mention the word.
-        assert!(is_subagent_session("delegate:abc"));
-        assert!(!is_subagent_session("api:delegate-notes"));
-        assert!(!is_subagent_session("telegram:12345"));
-        assert!(!is_subagent_session("cron:nightly:1785228839"));
     }
 
     #[test]

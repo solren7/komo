@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agent::runtime::AgentRuntime;
-use crate::domain::{
+use crate::runtime::AgentRuntime;
+use komo_config::ModelEntry;
+use komo_core::domain::{
     context::ToolContext,
     repository::SessionRepository,
     session::Session,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
-use komo_config::ModelEntry;
 
 #[derive(Deserialize)]
 struct DelegateArgs {
@@ -159,7 +159,7 @@ impl Tool for DelegateTool {
         // mechanism a chat session uses — no separate plumbing for sub-agents.
         let session_id = format!(
             "{}{}",
-            crate::services::operator_control::actions::SUBAGENT_SESSION_PREFIX,
+            komo_core::domain::session::SUBAGENT_SESSION_PREFIX,
             uuid::Uuid::now_v7()
         );
         let mut session = Session::new(&session_id);

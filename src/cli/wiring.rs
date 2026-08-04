@@ -5,6 +5,12 @@
 //! that differs is the `Approver` — interactive at a TTY vs. auto-deny in the
 //! unattended gateway — so it is passed in.
 
+use komo_agent::delegate::DelegateTool;
+use komo_agent::llm::{PreambleFn, build_llm};
+use komo_agent::review_coordinator::ReviewCoordinator;
+use komo_agent::reviewer::ReflectiveReviewer;
+use komo_agent::runtime::AgentRuntime;
+use komo_agent::system_prompt::SystemPromptBuilder;
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -36,17 +42,9 @@ use komo_tools::web_search::WebSearchTool;
 use komo_tools::write::WriteTool;
 use std::sync::Arc;
 
-use crate::{
-    agent::{
-        review_coordinator::ReviewCoordinator, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
-        system_prompt::SystemPromptBuilder,
-    },
-    domain::{
-        approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
-        repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
-    },
-    infra::llm::{PreambleFn, build_llm},
-    tools::delegate::DelegateTool,
+use crate::domain::{
+    approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
+    repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
 };
 use komo_config::ConfigSnapshot;
 
@@ -119,7 +117,7 @@ pub async fn build(
     // (roadmap §3): the policy auto-allows / hard-denies per `[policy]` rules and
     // only escalates to `approver` when it says "ask". With no `[policy]` table
     // this is the empty policy — identical to the bare interactive approver.
-    let approver = crate::agent::policy_approver::PolicyApprover::wrap_with_store(
+    let approver = komo_agent::policy_approver::PolicyApprover::wrap_with_store(
         interactive_policy,
         approver,
         permissions.clone(),
@@ -411,7 +409,7 @@ pub async fn build(
     // interactively and must not leak into an unattended context, where only an
     // explicit `unattended = true` config rule may grant. (The engine enforces
     // this again for a channel-less decision — two floors, on purpose.)
-    let cron_approver = crate::agent::policy_approver::PolicyApprover::wrap(
+    let cron_approver = komo_agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );
@@ -462,7 +460,7 @@ pub async fn build(
     // Sharing the run ledger (`runs: db`) makes every briefing execution
     // auditable via `komo run list`.
     // No saved grants here either — see the cron approver above.
-    let briefing_approver = crate::agent::policy_approver::PolicyApprover::wrap(
+    let briefing_approver = komo_agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );

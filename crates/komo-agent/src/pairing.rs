@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::domain::pairing::{
+use komo_core::domain::pairing::{
     MAX_PENDING_PER_PLATFORM, PAIRING_RATE_LIMIT_SECS, PairingRepository, PairingRequest,
     PairingStatus,
 };
@@ -145,8 +145,8 @@ fn cap_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::pairing::{ApproveOutcome, PAIRING_CODE_TTL_SECS, verify_code};
     use async_trait::async_trait;
+    use komo_core::domain::pairing::{ApproveOutcome, PAIRING_CODE_TTL_SECS, verify_code};
     use std::sync::Mutex;
 
     #[derive(Default)]

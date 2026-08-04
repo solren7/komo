@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::domain::{
+use komo_core::domain::{
     llm::LlmClient,
     memory::{
         Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository, MemoryStatus,
@@ -328,7 +328,7 @@ fn should_skip(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::skill::Skill;
+    use komo_core::domain::skill::Skill;
     use std::sync::Mutex;
 
     // ── fakes ─────────────────────────────────────────────────────────────────
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(rows[0].confidence, MemoryConfidence::Extracted);
         assert_eq!(
             rows[0].scope,
-            crate::domain::memory::MemoryScope::Channel {
+            komo_core::domain::memory::MemoryScope::Channel {
                 platform: "telegram".into(),
                 chat_id: "42".into()
             }
@@ -573,7 +573,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
-        existing.scope = crate::domain::memory::MemoryScope::Channel {
+        existing.scope = komo_core::domain::memory::MemoryScope::Channel {
             platform: "telegram".into(),
             chat_id: "42".into(),
         };
@@ -602,7 +602,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
-        existing.scope = crate::domain::memory::MemoryScope::Channel {
+        existing.scope = komo_core::domain::memory::MemoryScope::Channel {
             platform: "feishu".into(),
             chat_id: "oc_x".into(),
         };

@@ -8,12 +8,12 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::domain::{
+use komo_config::{ModelConfig, Provider, split_model_id};
+use komo_core::domain::{
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
     message::{Message, Role},
     session::Session,
 };
-use komo_config::{ModelConfig, Provider, split_model_id};
 use komo_provider::{
     AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind, ProviderClient,
     ToolSchema, Turn, UserBlock, Wire,
@@ -835,7 +835,7 @@ fn blocks_to_step(blocks: &[AssistantBlock]) -> Step {
 ///
 /// `preamble` is a factory (see [`PreambleFn`]) invoked once per turn to
 /// (re)assemble the system prompt — typically wrapping a
-/// [`crate::agent::system_prompt::SystemPromptBuilder`]. `enricher` is the
+/// [`crate::system_prompt::SystemPromptBuilder`]. `enricher` is the
 /// optional per-turn memory enrichment — `Some` only for the main agent, `None`
 /// for aux/delegate sub-agents (they must not be fed the user's memory library).
 pub fn build_llm(

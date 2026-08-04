@@ -18,6 +18,8 @@
 //! `HASS_TOKEN`); only the event-filter behavior lives in
 //! `[channels.homeassistant]`.
 
+use komo_agent::gateway::Channel;
+use komo_agent::interaction::GatewayDispatcher;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -31,10 +33,7 @@ use tokio::{net::TcpStream, sync::watch};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-use crate::{
-    agent::{gateway::Channel, interaction::GatewayDispatcher},
-    infra::messaging::home_notifier::TextSender,
-};
+use crate::infra::messaging::home_notifier::TextSender;
 use komo_config::HomeAssistantChannelConfig;
 
 /// One continuous session for all HA events (mirrors hermes' `ha_events`).

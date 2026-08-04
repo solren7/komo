@@ -84,3 +84,27 @@ impl Session {
             .count()
     }
 }
+
+/// Session-id prefix for a sub-agent turn spawned by the `delegate` tool. In
+/// `domain` because both ends need it and neither owns the other: the tool mints
+/// these ids, and the operator-facing session list filters them back out.
+pub const SUBAGENT_SESSION_PREFIX: &str = "delegate:";
+
+/// Is this a sub-agent's scratch session rather than a real conversation?
+pub fn is_subagent_session(id: &str) -> bool {
+    id.starts_with(SUBAGENT_SESSION_PREFIX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_subagent_prefix_is_filtered() {
+        // Don't over-match: a user conversation may legitimately mention the word.
+        assert!(is_subagent_session("delegate:abc"));
+        assert!(!is_subagent_session("api:delegate-notes"));
+        assert!(!is_subagent_session("telegram:12345"));
+        assert!(!is_subagent_session("cron:nightly:1785228839"));
+    }
+}

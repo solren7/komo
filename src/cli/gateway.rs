@@ -1,17 +1,15 @@
+use komo_agent::daemon::{
+    BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep,
+    ReviewSweep, Schedule, TaskSweep, WorkdayGated,
+};
+use komo_agent::gateway::{Gateway, MaintenanceService};
+use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher};
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use komo_infra::workday::HolidayCalendar;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
-    agent::{
-        daemon::{
-            BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep,
-            ReminderSweep, ReviewSweep, Schedule, TaskSweep, WorkdayGated,
-        },
-        gateway::{Gateway, MaintenanceService},
-        interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
-    },
     cli::wiring,
     domain::{
         approval::Approver,

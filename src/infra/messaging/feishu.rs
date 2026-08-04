@@ -14,6 +14,9 @@
 //! chats (DMs always bypass), and an optional `home_chat` that receives
 //! proactive output (reminders) via the shared `HomeNotifier`.
 
+use komo_agent::gateway::Channel;
+use komo_agent::interaction::GatewayDispatcher;
+use komo_agent::pairing::PairingGuard;
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -31,7 +34,6 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::{
-    agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
     domain::{gateway::ReplySink, pairing::PairingRepository},
     infra::messaging::reconnect_backoff,
 };

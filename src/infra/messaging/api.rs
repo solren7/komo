@@ -29,6 +29,9 @@
 //! the bearer-key middleware. Only loopback origins are allowed and credentials
 //! are off, so the bearer key remains the sole thing that grants access.
 
+use komo_agent::daemon::DreamSweep;
+use komo_agent::gateway::Channel;
+use komo_agent::interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher};
 use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, with_session};
 use std::path::PathBuf;
@@ -61,11 +64,6 @@ use tower_http::{
 use tracing::{info, warn};
 
 use crate::{
-    agent::{
-        daemon::DreamSweep,
-        gateway::Channel,
-        interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher},
-    },
     domain::{
         cancel::{CANCELLED_REPLY, is_cancelled},
         cron::CronJobSpec,

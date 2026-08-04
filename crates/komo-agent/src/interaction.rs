@@ -31,7 +31,7 @@ use futures_util::FutureExt;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use crate::domain::{
+use komo_core::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
     cancel::CancelSignal,
     gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
@@ -343,7 +343,7 @@ impl Approver for ChatApprover {
             return Decision::Allow;
         }
 
-        let channel = crate::domain::policy::channel_of(&ctx.session_id);
+        let channel = komo_core::domain::policy::channel_of(&ctx.session_id);
         if let Err(error) = ctx.sink.send(&prompt(request, &channel)).await {
             warn!(%error, "failed to send approval prompt; denying");
             return Decision::deny();
@@ -402,7 +402,7 @@ fn prompt(request: &ApprovalRequest, channel: &str) -> String {
         && let Some(rule) = request
             .action
             .as_ref()
-            .and_then(|a| crate::domain::policy::Rule::narrowest_for(a, channel))
+            .and_then(|a| komo_core::domain::policy::Rule::narrowest_for(a, channel))
     {
         s.push_str(&format!(
             "\n· /approve always 以后都允许，将保存规则：{}",
@@ -1084,7 +1084,7 @@ mod tests {
 
     // --- GatewayDispatcher turn queue / panic recovery -----------------------
 
-    use crate::domain::{
+    use komo_core::domain::{
         pairing::PairingRequest, repository::SessionRepository, session::Session, todo::TodoItem,
     };
     use tokio::sync::{Semaphore, mpsc};

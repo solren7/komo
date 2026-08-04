@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
-use crate::domain::{
+use komo_core::domain::{
     cron::{CronAction, CronJob, CronJobRepository, CronRunStatus, next_occurrence_local},
     gateway::MessageHandler,
     llm::LlmClient,
@@ -109,7 +109,7 @@ pub struct ReviewSweep {
     /// The shared coordinator (same instance as the runtime's post-turn
     /// trigger, so the per-session in-flight guard spans both paths). Cadence,
     /// candidate scanning, full-loads, and the watermark all live there.
-    pub review: Arc<crate::agent::review_coordinator::ReviewCoordinator>,
+    pub review: Arc<crate::review_coordinator::ReviewCoordinator>,
 }
 
 #[async_trait]
@@ -117,7 +117,7 @@ impl Maintenance for ReviewSweep {
     async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
         let report = self
             .review
-            .run(crate::agent::review_coordinator::ReviewTrigger::Scheduled)
+            .run(crate::review_coordinator::ReviewTrigger::Scheduled)
             .await?;
         Ok(MaintenanceSummary {
             sessions_reviewed: report.sessions_reviewed,
@@ -154,7 +154,9 @@ impl DreamSweep {
     /// pinning (which requires confirmed/user-written). Per-memory failures are
     /// logged and skipped, never aborting the cycle.
     pub async fn apply(&self) -> anyhow::Result<MaintenanceSummary> {
-        use crate::domain::memory::{DreamVerdict, MemoryConfidence, MemoryStatus, dream_verdict};
+        use komo_core::domain::memory::{
+            DreamVerdict, MemoryConfidence, MemoryStatus, dream_verdict,
+        };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut summary = MaintenanceSummary::default();
         for mut memory in self.memories.list().await? {
@@ -867,7 +869,7 @@ fn agentic_briefing_prompt(digest_prompt: &str) -> String {
 /// workday's run.
 pub struct WorkdayGated {
     pub inner: Arc<dyn Maintenance>,
-    pub calendar: Arc<dyn crate::domain::workday::WorkdayCalendar>,
+    pub calendar: Arc<dyn komo_core::domain::workday::WorkdayCalendar>,
 }
 
 #[async_trait]
@@ -1090,9 +1092,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::reminder::{Reminder, ReminderStatus};
-    use crate::domain::task::{Task, TaskStatus};
     use chrono::{Datelike, TimeZone, Timelike};
+    use komo_core::domain::reminder::{Reminder, ReminderStatus};
+    use komo_core::domain::task::{Task, TaskStatus};
     use std::sync::Mutex;
 
     // ── MemoryMonitorSweep ────────────────────────────────────────────────────
@@ -1782,7 +1784,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::domain::task::TaskRepository for FakeTasks {
+    impl komo_core::domain::task::TaskRepository for FakeTasks {
         async fn save(&self, task: &Task) -> anyhow::Result<()> {
             self.tasks.lock().unwrap().push(task.clone());
             Ok(())
@@ -1836,7 +1838,7 @@ mod tests {
         });
         let notifier = Arc::new(FakeNotifier::default());
         let sweep = TaskSweep {
-            tasks: repo.clone() as Arc<dyn crate::domain::task::TaskRepository>,
+            tasks: repo.clone() as Arc<dyn komo_core::domain::task::TaskRepository>,
             notifier: notifier.clone() as Arc<dyn Notifier>,
         };
         (sweep, repo, notifier)
@@ -1927,7 +1929,7 @@ mod tests {
 
     // ── BriefingSweep ─────────────────────────────────────────────────────────
 
-    use crate::domain::memory::{Memory, MemoryKind, MemoryRepository};
+    use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
 
     struct FixedLlm(String);
 
@@ -1977,7 +1979,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::domain::gateway::MessageHandler for FakeHandler {
+    impl komo_core::domain::gateway::MessageHandler for FakeHandler {
         async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
             self.calls.lock().unwrap().push(input);
             match &self.reply {
@@ -2091,7 +2093,7 @@ mod tests {
 
     // ── DreamSweep ────────────────────────────────────────────────────────────
 
-    use crate::domain::memory::{
+    use komo_core::domain::memory::{
         DREAM_FORGET_AGE_DAYS, DREAM_MIN_RECALL_COUNT, MemoryConfidence, MemoryStatus,
     };
 
@@ -2174,7 +2176,7 @@ mod tests {
         .unwrap();
         let mems = repo.0.lock().unwrap();
         let promoted = mems.iter().find(|m| m.id == id).unwrap();
-        let ctx = crate::domain::memory::MemoryContext::from_session("cli");
+        let ctx = komo_core::domain::memory::MemoryContext::from_session("cli");
         assert!(
             !promoted.is_pinnable(&ctx, now),
             "auto-promoted memory must not be pinnable"
@@ -2202,7 +2204,7 @@ mod tests {
     struct FixedCalendar(bool);
 
     #[async_trait]
-    impl crate::domain::workday::WorkdayCalendar for FixedCalendar {
+    impl komo_core::domain::workday::WorkdayCalendar for FixedCalendar {
         async fn is_workday(&self, _date: chrono::NaiveDate) -> bool {
             self.0
         }

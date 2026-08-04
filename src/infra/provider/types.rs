@@ -41,6 +41,8 @@ impl Turn {
         }
     }
 
+    // The orphan-stripping rewrite in `reclaim_context` left this test-only.
+    #[cfg(test)]
     pub fn is_assistant(&self) -> bool {
         matches!(self, Turn::Assistant { .. })
     }

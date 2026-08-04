@@ -206,6 +206,22 @@ impl SseStream {
         }
     }
 
+    /// A stream over a canned SSE body, for codec tests: what a codec folds out
+    /// of a sequence of frames (which one ends the round, which id it keeps) is
+    /// only observable through a real stream.
+    #[cfg(test)]
+    pub(super) fn from_body(body: &str) -> Self {
+        Self {
+            inner: Box::new(futures_util::stream::iter(vec![Ok(bytes::Bytes::from(
+                body.to_string(),
+            ))])),
+            buffer: String::new(),
+            data: Vec::new(),
+            ready: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+
     /// The next frame's payload, or `None` once the stream ends.
     ///
     /// Ending is *not* success on its own: a stream that stops before its

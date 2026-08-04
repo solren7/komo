@@ -340,15 +340,23 @@ pub async fn collect(
     while let Some(frame) = stream.next().await? {
         match event(&frame) {
             Event::ItemDone(item) => {
+                // The *message item's* id, not the response id: this is what
+                // `input_items` echoes back as the item's `id` next round, and
+                // the API validates the prefix there ("Invalid 'input[n].id':
+                // 'resp_…'. Expected an ID that begins with 'msg'").
+                if id.is_none() && item.get("type").and_then(Value::as_str) == Some("message") {
+                    id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                }
                 if let Some(block) = item_to_block(&item) {
                     blocks.push(block);
                 }
             }
+            // The response id in this frame is deliberately dropped: `store:
+            // false` means nothing correlates on it, and it is not a valid
+            // input-item id.
             Event::Completed {
-                id: response_id,
-                usage: reported,
+                usage: reported, ..
             } => {
-                id = response_id;
                 usage = reported;
                 completed = true;
                 // The provider may keep the connection open briefly after the
@@ -694,6 +702,43 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// The regression behind `Invalid 'input[2].id': 'resp_…'. Expected an ID
+    /// that begins with 'msg'`: the assistant turn's id is echoed back as the
+    /// message item's own `id` next round, so it has to come from the message
+    /// item — never from `response.completed`, whose id names the response.
+    #[tokio::test]
+    async fn the_kept_id_is_the_message_items_own_not_the_responses() {
+        let frames = [
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [{ "type": "output_text", "text": "hi" }],
+                },
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp_1", "usage": { "input_tokens": 1, "output_tokens": 1 } },
+            }),
+        ];
+        let body = frames
+            .iter()
+            .map(|f| format!("data: {f}\n\n"))
+            .collect::<String>();
+        let mut stream = SseStream::from_body(&body);
+        let completion = collect(&mut stream, None).await.unwrap();
+        assert_eq!(completion.id.as_deref(), Some("msg_1"));
+
+        // And the round-trip the API actually validates.
+        let history = vec![Turn::Assistant {
+            id: completion.id,
+            blocks: completion.blocks,
+        }];
+        let body = request("m", "s", &history, &[], None);
+        assert_eq!(body["input"][0]["id"], "msg_1");
     }
 
     #[test]

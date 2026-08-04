@@ -64,7 +64,6 @@ use crate::{
         gateway::Channel,
         interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher},
     },
-    config::{ApiConfig, ModelEntry},
     domain::{
         cancel::{CANCELLED_REPLY, is_cancelled},
         cron::CronJobSpec,
@@ -86,6 +85,7 @@ use crate::{
         tool_execution::{SessionContext, with_session},
     },
 };
+use komo_config::{ApiConfig, ModelEntry};
 use std::net::SocketAddr;
 
 /// What the HTTP transport itself needs, cheaply cloned per request (all
@@ -146,7 +146,7 @@ pub struct ModelMenu {
 }
 
 impl ModelMenu {
-    pub fn from_config(config: &crate::config::ModelConfig) -> Self {
+    pub fn from_config(config: &komo_config::ModelConfig) -> Self {
         Self {
             provider: config.provider.name().to_string(),
             default_model: config.model.clone(),
@@ -1760,19 +1760,19 @@ mod tests {
         vec![
             ModelEntry {
                 id: "gpt-5.5".into(),
-                provider: crate::config::Provider::Codex,
+                provider: komo_config::Provider::Codex,
                 model: "gpt-5.5".into(),
                 efforts: &["low", "medium", "high"],
             },
             ModelEntry {
                 id: "gpt-5.4-mini".into(),
-                provider: crate::config::Provider::Codex,
+                provider: komo_config::Provider::Codex,
                 model: "gpt-5.4-mini".into(),
                 efforts: &["low", "medium", "high"],
             },
             ModelEntry {
                 id: "deepseek:deepseek-chat".into(),
-                provider: crate::config::Provider::DeepSeek,
+                provider: komo_config::Provider::DeepSeek,
                 model: "deepseek-chat".into(),
                 efforts: &[],
             },

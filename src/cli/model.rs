@@ -6,10 +6,8 @@
 //! provider. `set` persists a new selection into `~/.komo/config.toml`.
 //! Neither touches the database or requires the API key to be present.
 
-use crate::{
-    config::{ConfigReport, ConfigSnapshot, Origin, Provider, write_model_selection},
-    infra::codex::{self, CodexAuth},
-};
+use crate::infra::codex::{self, CodexAuth};
+use komo_config::{ConfigReport, ConfigSnapshot, Origin, Provider, write_model_selection};
 
 fn auth_present(provider: Provider, report: &ConfigReport) -> bool {
     match provider {

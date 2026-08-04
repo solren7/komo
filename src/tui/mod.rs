@@ -45,7 +45,6 @@ use tokio::sync::mpsc;
 use crate::{
     agent::runtime::AgentRuntime,
     cli::wiring,
-    config::ConfigSnapshot,
     domain::{
         approval::Approver,
         events::{ToolEventSink, TurnEvent},
@@ -63,6 +62,7 @@ use crate::{
         tool_execution::{SessionContext, with_session},
     },
 };
+use komo_config::ConfigSnapshot;
 
 use app::{Action, App, Role};
 use approver::{ApprovalPrompt, TuiApprover};

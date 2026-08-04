@@ -33,9 +33,9 @@ use tracing::{info, warn};
 
 use crate::{
     agent::{gateway::Channel, interaction::GatewayDispatcher},
-    config::HomeAssistantChannelConfig,
     infra::messaging::home_notifier::TextSender,
 };
+use komo_config::HomeAssistantChannelConfig;
 
 /// One continuous session for all HA events (mirrors hermes' `ha_events`).
 const SESSION_ID: &str = "homeassistant:events";

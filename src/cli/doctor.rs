@@ -15,9 +15,9 @@
 //! CLI read path: a reachable gateway → `GET /api/*` (it holds the exclusive
 //! db lock); none → open the db directly.
 
-use crate::config::{ChannelState, ConfigSnapshot, IssueSeverity, wechat_cred_path};
 use crate::infra::rendezvous;
 use crate::services::operator_control::{OperatorControl, OperatorQuery, OperatorQueryResult};
+use komo_config::{ChannelState, ConfigSnapshot, IssueSeverity, wechat_cred_path};
 
 /// Status glyph for a channel/credential line.
 const OK: &str = "✓";

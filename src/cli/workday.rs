@@ -14,7 +14,7 @@ pub async fn check(date: Option<String>) -> anyhow::Result<()> {
         None => chrono::Local::now().date_naive(),
     };
 
-    let calendar = HolidayCalendar::new(crate::config::workday_cache_dir());
+    let calendar = HolidayCalendar::new(komo_config::workday_cache_dir());
     let workday = calendar.is_workday(date).await;
     let weekday = date.format("%A");
     println!(

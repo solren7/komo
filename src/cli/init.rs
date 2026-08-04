@@ -143,7 +143,7 @@ const USER_TEMPLATE: &str = r#"# USER.md — 用户画像（komo 每轮读入主
 "#;
 
 pub fn run() -> anyhow::Result<()> {
-    let home = crate::config::ensure_komo_home();
+    let home = komo_config::ensure_komo_home();
     let created = init_at(&home)?;
     report("config.toml", &home, created.config);
     report(".env", &home, created.env);

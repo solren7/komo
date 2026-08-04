@@ -460,7 +460,7 @@ pub async fn run() -> anyhow::Result<()> {
     // KOMO_* env, .env secrets) is read exactly once. All paths live under the
     // config home; use KOMO_HOME to point at a different one (e.g. for tests
     // or a second instance).
-    let config = crate::config::ConfigSnapshot::load();
+    let config = komo_config::ConfigSnapshot::load();
     match cli.command {
         // The interactive chat is komo's primary surface. Keep `chat` as an
         // explicit, script-friendly spelling, but make a bare `komo` open it.
@@ -639,7 +639,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// Resolve one operator backend for this invocation: the gateway is probed
 /// exactly once, and every read/write the command performs reuses it.
 async fn operator(
-    config: &crate::config::ConfigSnapshot,
+    config: &komo_config::ConfigSnapshot,
 ) -> anyhow::Result<crate::services::operator_control::OperatorControl> {
     crate::services::operator_control::OperatorControl::connect(
         crate::services::operator_control::StoreUrls::from_config(&config.runtime),

@@ -9,6 +9,8 @@ komo-core = { path = "crates/komo-core" }
 # it references nothing else in komo — the `Wire`-per-format bet made it a
 # self-contained unit, so it compiles in parallel with everything above it.
 komo-provider = { path = "crates/komo-provider" }
+# Config resolution (config.toml + .env + KOMO_* env into one snapshot).
+komo-config = { path = "crates/komo-config" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -26,8 +28,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 dotenvy = "0.15"
-envy = "0.4"
-toml = "1.1.4+spec-1.1.0"
+envy = { workspace = true }
+toml = { workspace = true }
 dirs = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
@@ -96,7 +98,7 @@ tokio = { version = "1.52.0", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [workspace]
-members = ["crates/komo-core", "crates/komo-provider"]
+members = ["crates/komo-core", "crates/komo-config", "crates/komo-provider"]
 resolver = "3"
 
 # Dev builds keep file/line backtraces but skip full variable debuginfo —
@@ -127,6 +129,8 @@ uuid = { version = "1.24.0", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"
 futures-util = "0.3.33"
+toml = "1.1.4+spec-1.1.0"
+envy = "0.4"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "charset",

@@ -169,17 +169,17 @@ impl KomoEnv {
 #[derive(Deserialize, Default)]
 pub struct Secrets {
     // Provider API keys (their env vars are unprefixed).
-    pub(in crate::config) deepseek_api_key: Option<String>,
-    pub(in crate::config) openai_api_key: Option<String>,
-    pub(in crate::config) anthropic_api_key: Option<String>,
-    pub(in crate::config) openrouter_api_key: Option<String>,
+    pub(crate) deepseek_api_key: Option<String>,
+    pub(crate) openai_api_key: Option<String>,
+    pub(crate) anthropic_api_key: Option<String>,
+    pub(crate) openrouter_api_key: Option<String>,
     // Channel credentials (formerly the per-channel `*Env` structs).
-    pub(in crate::config) feishu_app_id: Option<String>,
-    pub(in crate::config) feishu_app_secret: Option<String>,
-    pub(in crate::config) telegram_bot_token: Option<String>,
-    pub(in crate::config) api_server_key: Option<String>,
-    pub(in crate::config) hass_token: Option<String>,
-    pub(in crate::config) hass_url: Option<String>,
+    pub(crate) feishu_app_id: Option<String>,
+    pub(crate) feishu_app_secret: Option<String>,
+    pub(crate) telegram_bot_token: Option<String>,
+    pub(crate) api_server_key: Option<String>,
+    pub(crate) hass_token: Option<String>,
+    pub(crate) hass_url: Option<String>,
 }
 
 /// Never leak credential values through debug formatting — only presence.

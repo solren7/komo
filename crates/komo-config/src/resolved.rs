@@ -388,7 +388,7 @@ impl ModelConfig {
 
 /// The resolved policy plus load diagnostics (for `komo policy list` / doctor).
 pub struct PolicyReport {
-    pub policy: crate::domain::policy::Policy,
+    pub policy: komo_core::domain::policy::Policy,
     /// Config indices (0-based `[[policy.rule]]` order) of ignored invalid rules.
     pub invalid: Vec<usize>,
     /// Whether a `[policy]` table was present at all.
@@ -447,7 +447,7 @@ pub struct ApiConfig {
     /// key-gated). `None` = no static serving.
     pub web_dir: Option<String>,
     /// Allow keyed remote callers to use interactive turns + resolve
-    /// approval/clarify (see [`crate::config::sources::ApiFileConfig`]).
+    /// approval/clarify (see [`crate::sources::ApiFileConfig`]).
     pub remote_interactive: bool,
 }
 
@@ -860,7 +860,7 @@ fn skills_dirs(env: &KomoEnv) -> Vec<PathBuf> {
 }
 
 fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyReport {
-    use crate::domain::policy::{Policy, Verdict};
+    use komo_core::domain::policy::{Policy, Verdict};
 
     let default_normal = cfg
         .default_normal
@@ -893,7 +893,7 @@ fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyR
 #[cfg(test)]
 mod policy_rule_tests {
     use super::*;
-    use crate::domain::policy::{Access, Category, Matcher};
+    use komo_core::domain::policy::{Access, Category, Matcher};
 
     fn rule(category: &str, matcher: &str, value: &str) -> PolicyRuleFileConfig {
         PolicyRuleFileConfig {
@@ -933,8 +933,8 @@ mod policy_rule_tests {
     }
 }
 
-fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {
-    use crate::domain::policy::{Access, Category, Effect, Matcher, Rule};
+fn build_rule(r: PolicyRuleFileConfig) -> Option<komo_core::domain::policy::Rule> {
+    use komo_core::domain::policy::{Access, Category, Effect, Matcher, Rule};
 
     // No `match` and no `value` is the wildcard form — "this whole category" —
     // which is what lets a `category = "shell", effect = "deny"` rule take the

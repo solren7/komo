@@ -43,13 +43,13 @@ use wechatbot::{BotOptions, WeChatBot};
 
 use crate::{
     agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
-    config::WeChatConfig,
     domain::{
         gateway::{ReplySink, WeChatLogin},
         pairing::PairingRepository,
     },
     infra::messaging::home_notifier::TextSender,
 };
+use komo_config::WeChatConfig;
 
 /// Backoff between poll-loop restarts (e.g. after a login or session error).
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);

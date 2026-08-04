@@ -27,10 +27,10 @@ use tracing::{info, warn};
 
 use crate::{
     agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
-    config::TelegramConfig,
     domain::{gateway::ReplySink, pairing::PairingRepository},
     infra::messaging::reconnect_backoff,
 };
+use komo_config::TelegramConfig;
 
 const TELEGRAM_BASE_URL: &str = "https://api.telegram.org";
 /// Long-poll wait passed to `getUpdates`.

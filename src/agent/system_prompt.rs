@@ -36,7 +36,7 @@ use std::time::SystemTime;
 
 use chrono::Local;
 
-use crate::config::{ModelConfig, komo_home};
+use komo_config::{ModelConfig, komo_home};
 
 /// Base persona, used when no `~/.komo/SOUL.md` override is present.
 const IDENTITY: &str = "You are Komo, a concise and helpful personal agent. \
@@ -522,7 +522,7 @@ fn cap(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_MAX_TURNS, Provider};
+    use komo_config::{DEFAULT_MAX_TURNS, Provider};
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -534,12 +534,12 @@ mod tests {
             base_url: None,
             aux_model: None,
             max_turns: DEFAULT_MAX_TURNS,
-            max_tool_result_bytes: crate::config::DEFAULT_MAX_TOOL_RESULT_BYTES,
-            max_turn_result_bytes: crate::config::DEFAULT_MAX_TURN_RESULT_BYTES,
-            tool_timeout_secs: crate::config::DEFAULT_TOOL_TIMEOUT_SECS,
-            max_history_messages: crate::config::DEFAULT_MAX_HISTORY_MESSAGES,
-            max_history_bytes: crate::config::DEFAULT_MAX_HISTORY_BYTES,
-            llm_timeout_secs: crate::config::DEFAULT_LLM_TIMEOUT_SECS,
+            max_tool_result_bytes: komo_config::DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_turn_result_bytes: komo_config::DEFAULT_MAX_TURN_RESULT_BYTES,
+            tool_timeout_secs: komo_config::DEFAULT_TOOL_TIMEOUT_SECS,
+            max_history_messages: komo_config::DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: komo_config::DEFAULT_MAX_HISTORY_BYTES,
+            llm_timeout_secs: komo_config::DEFAULT_LLM_TIMEOUT_SECS,
         }
     }
 

@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use crate::{
     cli::{approver::CliApprover, wiring},
-    config::ConfigSnapshot,
     domain::approval::Approver,
     infra::persistence::cron::CronDb,
     services::operator_control::OperatorControl,
 };
+use komo_config::ConfigSnapshot;
 
 /// Resume an interrupted run in its original session. `id = None` picks the
 /// most recent recoverable run.

@@ -2344,6 +2344,7 @@ dependencies = [
  "http",
  "ignore",
  "image",
+ "komo-config",
  "komo-core",
  "komo-provider",
  "libc",
@@ -2373,6 +2374,19 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "wechatbot",
+]
+
+[[package]]
+name = "komo-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "envy",
+ "komo-core",
+ "serde",
+ "serde_json",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

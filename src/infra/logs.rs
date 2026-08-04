@@ -22,7 +22,7 @@ use std::{
 static ACTIVE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn dir() -> PathBuf {
-    crate::config::komo_home().join("logs")
+    komo_config::komo_home().join("logs")
 }
 
 /// The chat TUI's append-mode log (`~/.komo/logs/chat-tui.log`).

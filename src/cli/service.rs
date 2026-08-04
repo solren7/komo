@@ -227,7 +227,7 @@ mod launchd {
         }
 
         let exe = std::env::current_exe()?;
-        let komo_home = crate::config::ensure_komo_home();
+        let komo_home = komo_config::ensure_komo_home();
         let log_dir = komo_home.join("logs");
         std::fs::create_dir_all(&log_dir)?;
 

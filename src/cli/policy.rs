@@ -9,10 +9,10 @@
 
 use std::path::PathBuf;
 
-use crate::config::{ConfigSnapshot, PolicyReport};
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
 use crate::domain::policy::{Category, Policy, Rule, Verdict};
 use crate::infra::permissions_store::PermissionsStore;
+use komo_config::{ConfigSnapshot, PolicyReport};
 
 /// Rendering lives on the rule itself, so `policy list`, `saved list`, and the
 /// approval prompt can't describe the same rule three different ways.

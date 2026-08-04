@@ -70,7 +70,7 @@ impl FsSkillStore {
 
     /// The komo-owned skills home: `~/.komo/skills`.
     pub fn default_root() -> PathBuf {
-        crate::config::komo_home().join("skills")
+        komo_config::komo_home().join("skills")
     }
 
     pub fn root(&self) -> &Path {

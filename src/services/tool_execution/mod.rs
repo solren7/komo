@@ -119,12 +119,10 @@ pub struct ToolExecutionConfig {
 impl Default for ToolExecutionConfig {
     fn default() -> Self {
         Self {
-            max_result_bytes: crate::config::DEFAULT_MAX_TOOL_RESULT_BYTES,
-            max_turn_result_bytes: crate::config::DEFAULT_MAX_TURN_RESULT_BYTES,
+            max_result_bytes: komo_config::DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_turn_result_bytes: komo_config::DEFAULT_MAX_TURN_RESULT_BYTES,
             max_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
-            max_call_duration: Some(Duration::from_secs(
-                crate::config::DEFAULT_TOOL_TIMEOUT_SECS,
-            )),
+            max_call_duration: Some(Duration::from_secs(komo_config::DEFAULT_TOOL_TIMEOUT_SECS)),
         }
     }
 }

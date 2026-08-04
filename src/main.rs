@@ -1,6 +1,5 @@
 mod agent;
 mod cli;
-mod config;
 mod domain;
 mod infra;
 mod services;
@@ -22,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     // cwd .env first (developer override), then ~/.komo/.env.
     // dotenvy never overwrites an already-set variable, so the first loader wins.
     let _ = dotenvy::dotenv();
-    let _ = dotenvy::from_path(config::ensure_komo_home().join(".env"));
+    let _ = dotenvy::from_path(komo_config::ensure_komo_home().join(".env"));
     init_tracing();
     cli::run().await
 }
@@ -101,7 +100,7 @@ fn init_tracing() {
 /// older files itself. `None` (e.g. unwritable dir) degrades to stderr-only.
 fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> {
     const KEEP_DAYS: usize = 30;
-    let dir = config::ensure_komo_home().join("logs");
+    let dir = komo_config::ensure_komo_home().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -129,7 +128,7 @@ fn will_run_tui() -> bool {
 
 /// Append-mode log file for TUI sessions (`~/.komo/logs/chat-tui.log`).
 fn open_tui_log() -> Option<std::fs::File> {
-    let dir = config::ensure_komo_home().join("logs");
+    let dir = komo_config::ensure_komo_home().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("chat-tui.log");
     let file = std::fs::OpenOptions::new()

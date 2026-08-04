@@ -22,10 +22,10 @@ use std::sync::Arc;
 
 pub use request::*;
 
-use crate::config::RuntimeConfig;
 use crate::domain::run::RunRepository;
 use crate::infra::gateway_client::GatewayClient;
 use crate::infra::persistence::{db::Db, kanban::KanbanDb};
+use komo_config::RuntimeConfig;
 
 use direct::DirectOperatorAdapter;
 use gateway::GatewayOperatorAdapter;

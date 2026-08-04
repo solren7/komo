@@ -5,13 +5,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::runtime::AgentRuntime;
-use crate::config::ModelEntry;
 use crate::domain::{
     context::ToolContext,
     repository::SessionRepository,
     session::Session,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
+use komo_config::ModelEntry;
 
 #[derive(Deserialize)]
 struct DelegateArgs {
@@ -176,7 +176,7 @@ impl Tool for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Provider;
+    use komo_config::Provider;
 
     fn menu() -> Vec<ModelEntry> {
         vec![

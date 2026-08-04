@@ -13,10 +13,8 @@ use std::{
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{
-    config::{ApiConfig, ChannelState, ConfigSnapshot},
-    infra::gateway_client::GatewayClient,
-};
+use crate::infra::gateway_client::GatewayClient;
+use komo_config::{ApiConfig, ChannelState, ConfigSnapshot};
 
 #[cfg(unix)]
 struct EchoGuard {
@@ -201,19 +199,19 @@ fn setup_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
     println!("Feishu setup — create an app, then enter its App ID and App Secret.");
     let app_id = prompt("FEISHU_APP_ID: ", true)?;
     let app_secret = prompt_secret("FEISHU_APP_SECRET: ")?;
-    crate::config::validate_channel_config(
+    komo_config::validate_channel_config(
         &config.runtime.home,
         "feishu",
         [("enabled", toml::Value::Boolean(true))],
     )?;
-    let env_path = crate::config::write_env_values(
+    let env_path = komo_config::write_env_values(
         &config.runtime.home,
         &[
             ("FEISHU_APP_ID", &app_id),
             ("FEISHU_APP_SECRET", &app_secret),
         ],
     )?;
-    let config_path = crate::config::write_channel_config(
+    let config_path = komo_config::write_channel_config(
         &config.runtime.home,
         "feishu",
         [("enabled", toml::Value::Boolean(true))],
@@ -225,14 +223,14 @@ fn setup_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
 fn setup_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
     println!("Telegram setup — create a bot with BotFather, then enter its token.");
     let token = prompt_secret("TELEGRAM_BOT_TOKEN: ")?;
-    crate::config::validate_channel_config(
+    komo_config::validate_channel_config(
         &config.runtime.home,
         "telegram",
         [("enabled", toml::Value::Boolean(true))],
     )?;
     let env_path =
-        crate::config::write_env_values(&config.runtime.home, &[("TELEGRAM_BOT_TOKEN", &token)])?;
-    let config_path = crate::config::write_channel_config(
+        komo_config::write_env_values(&config.runtime.home, &[("TELEGRAM_BOT_TOKEN", &token)])?;
+    let config_path = komo_config::write_channel_config(
         &config.runtime.home,
         "telegram",
         [("enabled", toml::Value::Boolean(true))],
@@ -243,13 +241,13 @@ fn setup_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
 
 async fn setup_wechat(config: &ConfigSnapshot) -> anyhow::Result<()> {
     println!("WeChat setup — scan the QR code and confirm on your phone.");
-    crate::config::validate_channel_config(
+    komo_config::validate_channel_config(
         &config.runtime.home,
         "wechat",
         [("enabled", toml::Value::Boolean(true))],
     )?;
     crate::cli::wechat::login().await?;
-    let config_path = crate::config::write_channel_config(
+    let config_path = komo_config::write_channel_config(
         &config.runtime.home,
         "wechat",
         [("enabled", toml::Value::Boolean(true))],
@@ -291,14 +289,14 @@ fn setup_homeassistant(config: &ConfigSnapshot) -> anyhow::Result<()> {
         ("watch_domains", csv(domains)),
         ("watch_entities", csv(entities)),
     ];
-    crate::config::validate_channel_config(
+    komo_config::validate_channel_config(
         &config.runtime.home,
         "homeassistant",
         channel_values.clone(),
     )?;
-    let env_path = crate::config::write_env_values(&config.runtime.home, &env_values)?;
+    let env_path = komo_config::write_env_values(&config.runtime.home, &env_values)?;
     let config_path =
-        crate::config::write_channel_config(&config.runtime.home, "homeassistant", channel_values)?;
+        komo_config::write_channel_config(&config.runtime.home, "homeassistant", channel_values)?;
     report_setup(&config_path, Some(&env_path));
     Ok(())
 }
@@ -372,7 +370,7 @@ async fn probe_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
 
 fn probe_wechat(config: &ConfigSnapshot) -> anyhow::Result<()> {
     require_ready("wechat", &config.runtime.wechat)?;
-    let path = crate::config::wechat_cred_path();
+    let path = komo_config::wechat_cred_path();
     if !path.exists() {
         anyhow::bail!("WeChat is enabled but not logged in; run `komo channel wechat login`");
     }
@@ -478,9 +476,9 @@ fn state_status<T>(state: &ChannelState<T>) -> (String, Option<String>) {
     }
 }
 
-fn wechat_status(state: &ChannelState<crate::config::WeChatConfig>) -> (String, Option<String>) {
+fn wechat_status(state: &ChannelState<komo_config::WeChatConfig>) -> (String, Option<String>) {
     match state {
-        ChannelState::Ready(_) if !crate::config::wechat_cred_path().exists() => (
+        ChannelState::Ready(_) if !komo_config::wechat_cred_path().exists() => (
             "login required".to_string(),
             Some("run `komo channel wechat login` or `komo channel setup wechat`".to_string()),
         ),

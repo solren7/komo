@@ -32,10 +32,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
-    config::FeishuConfig,
     domain::{gateway::ReplySink, pairing::PairingRepository},
     infra::messaging::reconnect_backoff,
 };
+use komo_config::FeishuConfig;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 /// Refresh the tenant token this long before Feishu's reported expiry.

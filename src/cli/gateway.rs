@@ -11,7 +11,6 @@ use crate::{
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
     },
     cli::wiring,
-    config::{ConfigSnapshot, IssueSeverity},
     domain::{
         approval::Approver,
         cron::CronJobRepository,
@@ -40,6 +39,7 @@ use crate::{
     },
     services::operator_control::actions::OperatorActions,
 };
+use komo_config::{ConfigSnapshot, IssueSeverity};
 
 /// Run the always-on gateway: a persistent process hosting the maintenance
 /// scheduler and the config-declared ingress channels. Runs until Ctrl-C.
@@ -125,7 +125,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // WeChat shares one bot instance between its sender and channel so the
     // channel's poll loop populates the context-token map the sender reads.
     let wechat = rt.wechat.ready();
-    let wechat_cred_path = crate::config::wechat_cred_path();
+    let wechat_cred_path = komo_config::wechat_cred_path();
     // HTTP API channel (OpenAI-compatible + dashboard); always on.
     let api = rt
         .api
@@ -254,7 +254,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         // 调休-adjusted weekends respected). The calendar is built only when
         // gating is on, so the holiday API is never touched otherwise.
         if rt.briefing_workdays_only {
-            let calendar = Arc::new(HolidayCalendar::new(crate::config::workday_cache_dir()));
+            let calendar = Arc::new(HolidayCalendar::new(komo_config::workday_cache_dir()));
             briefing_sweep = Arc::new(WorkdayGated {
                 inner: briefing_sweep,
                 calendar,
@@ -422,9 +422,9 @@ fn schedule_or_default(expr: &str) -> (Schedule, String) {
     match Schedule::parse(expr) {
         Ok(schedule) => (schedule, expr.to_string()),
         Err(error) => {
-            tracing::warn!(%error, default = crate::config::DEFAULT_MAINTENANCE_SCHEDULE,
+            tracing::warn!(%error, default = komo_config::DEFAULT_MAINTENANCE_SCHEDULE,
                 "invalid maintenance schedule; falling back to the default");
-            let default = crate::config::DEFAULT_MAINTENANCE_SCHEDULE;
+            let default = komo_config::DEFAULT_MAINTENANCE_SCHEDULE;
             (
                 Schedule::parse(default).expect("built-in default cron is valid"),
                 default.to_string(),
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn maintenance_schedule_typo_degrades_to_default() {
         let (_, expr) = schedule_or_default("not a cron");
-        assert_eq!(expr, crate::config::DEFAULT_MAINTENANCE_SCHEDULE);
+        assert_eq!(expr, komo_config::DEFAULT_MAINTENANCE_SCHEDULE);
         let (_, expr) = schedule_or_default("*/5 * * * *");
         assert_eq!(expr, "*/5 * * * *");
     }

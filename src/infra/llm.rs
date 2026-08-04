@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::{
-    config::{ModelConfig, Provider, split_model_id},
     domain::{
         llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
         message::{Message, Role},
@@ -16,6 +15,7 @@ use crate::{
     infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers},
     services::memory_enrichment::MemoryEnricher,
 };
+use komo_config::{ModelConfig, Provider, split_model_id};
 use komo_provider::{
     AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind, ProviderClient,
     ToolSchema, Turn, UserBlock, Wire,

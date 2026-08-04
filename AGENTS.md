@@ -118,7 +118,7 @@ fork — add new operator actions there, not in the CLI or api handlers.
 `~/.komo/.env` = credentials only. Precedence: defaults < config.toml <
 `KOMO_*` env. `KOMO_HOME` relocates the directory.
 
-Resolution happens **once** in `src/config/` into a `ConfigSnapshot`; problems
+Resolution happens **once** in `crates/komo-config` into a `ConfigSnapshot`; problems
 become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
 `validate_gateway`. Two deliberate warnings, not fatals: missing model API key
 (boots with `UnconfiguredLlm` that errors per call) and HA channel without

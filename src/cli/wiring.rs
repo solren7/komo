@@ -12,7 +12,6 @@ use crate::{
         review_coordinator::ReviewCoordinator, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
         system_prompt::SystemPromptBuilder,
     },
-    config::ConfigSnapshot,
     domain::{
         approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
         repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
@@ -39,6 +38,7 @@ use crate::{
         todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteTool,
     },
 };
+use komo_config::ConfigSnapshot;
 
 /// A wired agent plus the handles background work needs (sessions for sweeping,
 /// the reviewer the sweep invokes).

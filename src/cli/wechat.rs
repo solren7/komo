@@ -25,7 +25,7 @@ fn render_qr(content: &str) {
 }
 
 pub async fn login() -> anyhow::Result<()> {
-    let cred_path = crate::config::wechat_cred_path();
+    let cred_path = komo_config::wechat_cred_path();
     let bot = WeChatBot::new(BotOptions {
         cred_path: Some(cred_path.to_string_lossy().into_owned()),
         on_qr_url: Some(Box::new(render_qr)),

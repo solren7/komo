@@ -24,15 +24,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         if (!open) onClose();
       }}
     >
-      <DialogContent className="flex h-[600px] max-h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[620px]">
-        <DialogHeader className="px-5 pt-4">
-          <DialogTitle>设置</DialogTitle>
+      <DialogContent className="flex h-[620px] max-h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[680px]">
+        <DialogHeader className="border-b border-border px-6 py-5">
+          <DialogTitle className="text-base font-semibold tracking-tight">设置</DialogTitle>
         </DialogHeader>
 
         <Tabs defaultValue="general" className="mt-3 flex min-h-0 flex-col gap-0">
           <TabsList
             variant="line"
-            className="h-auto w-full justify-start rounded-none border-b border-border px-5"
+            className="h-auto w-full justify-start rounded-none border-b border-border px-6"
           >
             {TABS.map((tab) => (
               <TabsTrigger key={tab.value} value={tab.value} className="flex-none">
@@ -41,7 +41,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             ))}
           </TabsList>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
             {TABS.map(({ value, Panel, needsGateway }) => (
               <TabsContent key={value} value={value}>
                 {needsGateway && !connected ? (

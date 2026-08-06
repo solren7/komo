@@ -5,8 +5,8 @@ import { ToolCallGroup, ToolCallView } from "./ToolCalls";
 
 export function UserMessage() {
   return (
-    <MessagePrimitive.Root className="flex justify-end">
-      <div className="max-w-[80%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2 leading-relaxed break-words whitespace-pre-wrap text-primary-foreground">
+    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl justify-end">
+      <div className="max-w-[78%] rounded-xl rounded-br-sm bg-primary px-3.5 py-2.5 leading-relaxed break-words whitespace-pre-wrap text-primary-foreground shadow-sm">
         <MessagePrimitive.Parts />
       </div>
     </MessagePrimitive.Root>
@@ -20,8 +20,8 @@ const groupToolCalls = groupPartByType({ "tool-call": ["group-tool"] });
 
 export function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="flex justify-start">
-      <div className="max-w-[80%] rounded-2xl rounded-bl-md border border-border bg-card px-3.5 py-2 leading-relaxed break-words text-card-foreground">
+    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl justify-start">
+      <div className="max-w-[86%] rounded-xl rounded-bl-sm border border-border bg-card px-3.5 py-2.5 leading-relaxed break-words text-card-foreground shadow-xs">
         {/* `indicator="never"`: the thread already says "Thinking…" below the
             transcript, and a reply arrives whole (the stream carries tool frames
             only), so there is nothing for a per-message indicator to show. */}

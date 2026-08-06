@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { MoonIcon, SunIcon } from "lucide-react";
+import { FolderIcon, MoonIcon, PanelLeftIcon, SunIcon } from "lucide-react";
 
 import { useConnection } from "@/shared/api/use-connection";
 import { useAppStore, useTheme } from "@/shared/store";
@@ -15,6 +15,7 @@ export function App() {
   const theme = useTheme();
   const toggleTheme = useAppStore((s) => s.toggleTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   // Visited sessions and the workspace each runs in, keyed by session id.
   //
   // Keyed by id alone — *not* id+workspace — because an unstarted session's
@@ -34,10 +35,31 @@ export function App() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
-      <SessionList onOpenSettings={() => setSettingsOpen(true)} />
+      <SessionList
+        mobileOpen={mobileNavOpen}
+        onMobileOpenChange={setMobileNavOpen}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
 
-      <section className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
+      <section className="komo-workspace flex min-w-0 flex-1 flex-col">
+        <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border/80 bg-background/75 px-5">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="sm:hidden"
+            title="打开会话列表"
+            onClick={() => setMobileNavOpen(true)}
+          >
+            <PanelLeftIcon />
+          </Button>
+          <div className="flex min-w-0 items-center gap-2 text-sm">
+            <span className="font-semibold tracking-tight">对话</span>
+            <span className="h-3.5 w-px bg-border" aria-hidden="true" />
+            <FolderIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            <span className="truncate text-xs text-muted-foreground" title={workspace}>
+              {workspace}
+            </span>
+          </div>
           <div className="flex-1" />
           <Button
             variant="ghost"
@@ -58,7 +80,10 @@ export function App() {
         {/* Keep visited runtimes mounted. assistant-ui aborts a request when its
             runtime unmounts, so navigation must only hide a running thread. */}
         {Object.entries(openThreads).map(([id, threadWorkspace]) => (
-          <div key={id} className={id === session ? "flex min-h-0 min-w-0 flex-1" : "hidden"}>
+          <div
+            key={id}
+            className={id === session ? "komo-thread flex min-h-0 min-w-0 flex-1" : "hidden"}
+          >
             <ChatView session={id} workspace={threadWorkspace} />
           </div>
         ))}

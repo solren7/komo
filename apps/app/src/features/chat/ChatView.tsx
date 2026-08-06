@@ -16,6 +16,7 @@ import { useConnection } from "@/shared/api/use-connection";
 import { pushStream } from "@/shared/lib/async";
 import { useMode, useModelChoice } from "@/shared/store";
 import type { PendingApproval } from "@/shared/types";
+import { KomoLogo } from "@/shared/ui/komo-logo";
 import { Loading } from "@/shared/ui/loading";
 import { KomorebiSpinner } from "@/shared/ui/komorebi-spinner";
 import { ErrorLine } from "@/shared/ui/error-line";
@@ -160,10 +161,14 @@ function ChatThread({
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <ThreadPrimitive.Root className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <ThreadPrimitive.Viewport className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-5">
+          <ThreadPrimitive.Viewport className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-5 py-6 sm:px-8">
             <AuiIf condition={(s) => s.thread.isEmpty}>
-              <div className="flex flex-1 items-center justify-center py-10 text-muted-foreground">
-                开始和 komo 对话…
+              <div className="mx-auto flex w-full max-w-xl flex-1 flex-col justify-center py-10">
+                <KomoLogo className="mb-5 size-10" />
+                <h1 className="text-2xl font-semibold tracking-tight">从一件要紧的事开始</h1>
+                <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+                  让 komo 处理问题、整理上下文，或把下一步变成可执行的行动。
+                </p>
               </div>
             </AuiIf>
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />

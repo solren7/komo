@@ -180,104 +180,110 @@ export function Composer({
   };
 
   return (
-    <ComposerPrimitive.Root className="px-4 py-3">
-      <div className="mb-1.5 flex min-w-0 items-center gap-2">
-        <WorkspacePicker workspace={workspace} onWorkspaceChange={setWorkspace} locked={started} />
-        <ComposerPrimitive.AddAttachment className={TOOL} title="添加文本附件">
-          <PlusIcon className="size-4" />
-        </ComposerPrimitive.AddAttachment>
-      </div>
-
-      <div className="relative">
-        <ComposerPrimitive.Input
-          {...history}
-          data-slot="komo-composer"
-          className="block max-h-40 min-h-11 w-full resize-none rounded-xl border border-input bg-background py-3 pr-12 pl-3.5 font-[inherit] text-foreground outline-none transition-[color,box-shadow] focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-          placeholder="给 komo 发消息…（Enter 发送 · Shift+Enter 换行 · ↑ 召回历史）"
-        />
-        <div className="absolute right-2 bottom-2">
-          <AuiIf condition={(s) => !s.thread.isRunning}>
-            <ComposerPrimitive.Send className={SEND} title="发送（Enter）">
-              <CornerDownLeftIcon className="size-3.5" />
-            </ComposerPrimitive.Send>
-          </AuiIf>
-          <AuiIf condition={(s) => s.thread.isRunning}>
-            <ComposerPrimitive.Cancel className={STOP} title="中断回复">
-              {/* Small but filled: a solid square is the universal stop glyph,
-                  and at this size it reads without weighing the corner down. */}
-              <SquareIcon className="size-3" />
-            </ComposerPrimitive.Cancel>
-          </AuiIf>
+    <ComposerPrimitive.Root className="komo-composer border-t border-border/80 bg-background/90 px-5 py-3 sm:px-8">
+      <div className="mx-auto max-w-3xl">
+        <div className="mb-2 flex min-w-0 items-center gap-2">
+          <WorkspacePicker
+            workspace={workspace}
+            onWorkspaceChange={setWorkspace}
+            locked={started}
+          />
+          <ComposerPrimitive.AddAttachment className={TOOL} title="添加文本附件">
+            <PlusIcon className="size-4" />
+          </ComposerPrimitive.AddAttachment>
         </div>
-      </div>
 
-      <ComposerPrimitive.Attachments components={{ Attachment: ComposerAttachment }} />
+        <div className="relative">
+          <ComposerPrimitive.Input
+            {...history}
+            data-slot="komo-composer"
+            className="block max-h-40 min-h-12 w-full resize-none rounded-lg border border-input bg-card py-3 pr-12 pl-3.5 font-[inherit] text-foreground shadow-xs outline-none transition-[color,box-shadow] focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            placeholder="给 komo 发消息…（Enter 发送 · Shift+Enter 换行 · ↑ 召回历史）"
+          />
+          <div className="absolute right-2 bottom-2">
+            <AuiIf condition={(s) => !s.thread.isRunning}>
+              <ComposerPrimitive.Send className={SEND} title="发送（Enter）">
+                <CornerDownLeftIcon className="size-3.5" />
+              </ComposerPrimitive.Send>
+            </AuiIf>
+            <AuiIf condition={(s) => s.thread.isRunning}>
+              <ComposerPrimitive.Cancel className={STOP} title="中断回复">
+                {/* Small but filled: a solid square is the universal stop glyph,
+                  and at this size it reads without weighing the corner down. */}
+                <SquareIcon className="size-3" />
+              </ComposerPrimitive.Cancel>
+            </AuiIf>
+          </div>
+        </div>
 
-      <div className="mt-2 flex min-w-0 items-center gap-1">
-        <Popover>
-          <PopoverTrigger className={TOOL}>
-            {mode === "trusted" ? (
-              <ShieldCheckIcon className="size-3.5" />
-            ) : (
-              <ShieldIcon className="size-3.5" />
-            )}
-            {mode === "trusted" ? "信任模式" : "交互模式"}
-          </PopoverTrigger>
-          <PopoverContent align="start" className="w-64 gap-2 p-3">
-            <PopoverTitle>信任模式</PopoverTitle>
-            <p className="text-xs text-muted-foreground">
-              交互模式会在有副作用的操作前请求确认；信任模式将自动批准。
-            </p>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                className={cn(TOOL, mode === "interactive" && "bg-muted text-foreground")}
-                onClick={() => setMode(workspace, "interactive")}
-              >
-                交互
-              </button>
-              <button
-                type="button"
-                className={cn(TOOL, mode === "trusted" && "bg-muted text-foreground")}
-                onClick={() => setMode(workspace, "trusted")}
-              >
-                信任
-              </button>
-            </div>
-          </PopoverContent>
-        </Popover>
+        <ComposerPrimitive.Attachments components={{ Attachment: ComposerAttachment }} />
 
-        <button type="button" className={TOOL} title="插入 @" onClick={insertMention}>
-          <AtSignIcon className="size-4" />
-        </button>
+        <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1.5">
+          <Popover>
+            <PopoverTrigger className={TOOL}>
+              {mode === "trusted" ? (
+                <ShieldCheckIcon className="size-3.5" />
+              ) : (
+                <ShieldIcon className="size-3.5" />
+              )}
+              {mode === "trusted" ? "信任模式" : "交互模式"}
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 gap-2 p-3">
+              <PopoverTitle>信任模式</PopoverTitle>
+              <p className="text-xs text-muted-foreground">
+                交互模式会在有副作用的操作前请求确认；信任模式将自动批准。
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className={cn(TOOL, mode === "interactive" && "bg-muted text-foreground")}
+                  onClick={() => setMode(workspace, "interactive")}
+                >
+                  交互
+                </button>
+                <button
+                  type="button"
+                  className={cn(TOOL, mode === "trusted" && "bg-muted text-foreground")}
+                  onClick={() => setMode(workspace, "trusted")}
+                >
+                  信任
+                </button>
+              </div>
+            </PopoverContent>
+          </Popover>
 
-        <span className="flex-1" />
-        <ModelSelect
-          menu={menu.data}
-          model={choice.model}
-          // Switching provider can invalidate the effort level (deepseek has no
-          // scale at all), so drop one the new model doesn't offer. The gateway
-          // does the same server-side; doing it here too keeps the control from
-          // showing a level that isn't in force.
-          onModelChange={(model) => {
-            const levels = selectedOption(menu.data, model)?.efforts ?? [];
-            const effort = levels.includes(choice.effort) ? choice.effort : "";
-            setModelChoice(session, { model, effort });
-          }}
-        />
-        <EffortSelect
-          menu={menu.data}
-          model={choice.model}
-          effort={choice.effort}
-          onEffortChange={(effort) => setModelChoice(session, { ...choice, effort })}
-        />
-        {/* Capacity follows the session's own model, not the gateway default —
+          <button type="button" className={TOOL} title="插入 @" onClick={insertMention}>
+            <AtSignIcon className="size-4" />
+          </button>
+
+          <span className="flex-1 max-sm:hidden" />
+          <ModelSelect
+            menu={menu.data}
+            model={choice.model}
+            // Switching provider can invalidate the effort level (deepseek has no
+            // scale at all), so drop one the new model doesn't offer. The gateway
+            // does the same server-side; doing it here too keeps the control from
+            // showing a level that isn't in force.
+            onModelChange={(model) => {
+              const levels = selectedOption(menu.data, model)?.efforts ?? [];
+              const effort = levels.includes(choice.effort) ? choice.effort : "";
+              setModelChoice(session, { model, effort });
+            }}
+          />
+          <EffortSelect
+            menu={menu.data}
+            model={choice.model}
+            effort={choice.effort}
+            onEffortChange={(effort) => setModelChoice(session, { ...choice, effort })}
+          />
+          {/* Capacity follows the session's own model, not the gateway default —
             otherwise switching to a smaller model would keep showing the big
             model's window. Usage still comes from /api/status. */}
-        <ContextProgress
-          capacity={selectedContextWindow(menu.data, choice.model) ?? status.data?.context_window}
-          used={status.data?.token_usage}
-        />
+          <ContextProgress
+            capacity={selectedContextWindow(menu.data, choice.model) ?? status.data?.context_window}
+            used={status.data?.token_usage}
+          />
+        </div>
       </div>
     </ComposerPrimitive.Root>
   );

@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
+import { KomoLogo } from "@/shared/ui/komo-logo";
 import { storeGateway, storedBase } from "./gateway-storage";
 
 /** Gate the browser build behind a key: without one there is nothing to
@@ -20,13 +21,16 @@ export function ConnectGate({ onSaved }: { onSaved: () => void }) {
   };
 
   return (
-    <div className="grid h-screen w-screen place-items-center bg-background text-foreground">
-      <div className="flex w-[min(92vw,420px)] flex-col gap-3 rounded-2xl border border-border bg-card p-6">
-        <div className="flex items-center gap-2.5">
-          <span className="size-7 shrink-0 rounded-lg bg-primary" />
-          <div className="text-lg font-bold tracking-wide">连接 komo</div>
+    <div className="komo-workspace grid h-screen w-screen place-items-center overflow-x-hidden bg-background p-5 text-foreground">
+      <div className="flex w-full max-w-[440px] min-w-0 flex-col gap-5 rounded-xl border border-border bg-card p-6 shadow-lg shadow-primary/5 sm:p-8">
+        <div className="flex items-center gap-3">
+          <KomoLogo className="size-9 shrink-0" />
+          <div>
+            <div className="text-lg font-semibold tracking-tight">连接 komo</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">本地个人 Agent 工作台</div>
+          </div>
         </div>
-        <p className="text-sm text-muted-foreground">
+        <p className="-mt-1 break-words text-sm leading-6 text-muted-foreground">
           输入 gateway 的访问密钥（见 <code>~/.komo/gateway.json</code> 的 <code>key</code>）。 留空
           base 表示与本页同源。
         </p>
@@ -50,7 +54,12 @@ export function ConnectGate({ onSaved }: { onSaved: () => void }) {
             }}
           />
         </label>
-        <Button size="lg" disabled={!key.trim()} onClick={save}>
+        <Button
+          size="lg"
+          className="disabled:bg-muted disabled:text-muted-foreground"
+          disabled={!key.trim()}
+          onClick={save}
+        >
           连接
         </Button>
       </div>

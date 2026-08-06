@@ -30,9 +30,17 @@ import { DEFAULT_WORKSPACE, groupByWorkspace } from "./grouping";
 import { sessionLabel } from "./labels";
 import { fetchWorkspaces } from "@/features/workspaces/api";
 
-const ROW = "group flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 transition-colors";
+const ROW = "group flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 transition-colors";
 
-export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function SessionList({
+  mobileOpen,
+  onMobileOpenChange,
+  onOpenSettings,
+}: {
+  mobileOpen: boolean;
+  onMobileOpenChange: (open: boolean) => void;
+  onOpenSettings: () => void;
+}) {
   const { connected } = useConnection();
   const session = useSession();
   const openSession = useAppStore((s) => s.openSession);
@@ -146,7 +154,10 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
           <button
             type="button"
             className="min-w-0 flex-1 text-left"
-            onClick={() => openSession(item.id, item.workspace ?? DEFAULT_WORKSPACE)}
+            onClick={() => {
+              openSession(item.id, item.workspace ?? DEFAULT_WORKSPACE);
+              onMobileOpenChange(false);
+            }}
             title={item.id}
           >
             <span className="block truncate text-sm">{label}</span>
@@ -191,18 +202,26 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
   return (
     <aside
       className={cn(
-        "relative flex min-h-0 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-200",
+        "relative flex min-h-0 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-200 max-sm:absolute max-sm:z-40 max-sm:h-full max-sm:shadow-xl max-sm:transition-transform",
         collapsed ? "w-14" : "w-[264px]",
+        mobileOpen ? "max-sm:translate-x-0" : "max-sm:-translate-x-full",
       )}
     >
       <div
         className={cn(
-          "flex h-12 shrink-0 items-center",
+          "flex h-14 shrink-0 items-center border-b border-sidebar-border/75",
           collapsed ? "justify-center px-2" : "gap-2.5 px-4",
         )}
       >
         <KomoLogo className="size-7 shrink-0" />
-        {!collapsed && <span className="font-bold tracking-wide">komo</span>}
+        {!collapsed && (
+          <div className="flex min-w-0 flex-col leading-none">
+            <span className="font-semibold tracking-tight">komo</span>
+            <span className="mt-1 text-[10px] font-medium tracking-wide text-muted-foreground">
+              PERSONAL AGENT
+            </span>
+          </div>
+        )}
         {!collapsed && <span className="flex-1" />}
         {!collapsed && (
           <span
@@ -224,13 +243,21 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
         </Button>
       </div>
 
-      <div className={cn("flex flex-col gap-1 pb-2", collapsed ? "items-center px-2" : "px-3")}>
+      <div
+        className={cn(
+          "flex flex-col gap-1.5 border-b border-sidebar-border/75 py-3",
+          collapsed ? "items-center px-2" : "px-3",
+        )}
+      >
         {/* New session only switches the active id — it does NOT add a row. Its
             workspace is chosen in the composer (above the input, while the
             conversation is still empty) and persisted with the first message. */}
         <Button
-          className={collapsed ? "size-9 px-0" : "w-full"}
-          onClick={startNewSession}
+          className={collapsed ? "size-9 px-0" : "w-full justify-start shadow-sm"}
+          onClick={() => {
+            startNewSession();
+            onMobileOpenChange(false);
+          }}
           title="新建会话"
         >
           <PlusIcon />
@@ -278,7 +305,7 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
       </div>
 
       {!collapsed && (
-        <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2">
+        <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 py-3">
           {!connected ? (
             <div className="px-3 py-3 text-sm text-muted-foreground">未连接</div>
           ) : query.isPending ? (
@@ -287,9 +314,9 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
             <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
           ) : (
             groupedSessions.map((group) => (
-              <section key={group.workspace} className="pt-3 first:pt-0">
+              <section key={group.workspace} className="pt-4 first:pt-0">
                 <h2
-                  className="flex items-center gap-1.5 px-3 pb-1 text-xs font-medium text-muted-foreground"
+                  className="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground"
                   title={group.label}
                 >
                   <FolderIcon className="size-3 shrink-0" />
@@ -312,7 +339,10 @@ export function SessionList({ onOpenSettings }: { onOpenSettings: () => void }) 
         <Button
           variant="ghost"
           className={collapsed ? "size-9 px-0" : "w-full justify-start"}
-          onClick={onOpenSettings}
+          onClick={() => {
+            onOpenSettings();
+            onMobileOpenChange(false);
+          }}
           title="设置"
         >
           <SettingsIcon />

@@ -8,36 +8,54 @@ web
 
 ## Users
 
-重视本地数据、需要跨聊天渠道和日常事务自动化的个人技术用户。他们需要由一个长期运行的助手承接对话、记忆、任务与提醒。
+作者本人是首要用户（personal agent，单操作者/host operator 形态），设计决策以其偏好与真实使用场景为准。同时公开发布是认真的：面向愿意自己配 API key、跑 gateway 的技术型自托管用户，界面与流程不能对陌生新用户不友好。
 
 ## Product Purpose
 
-Komo 是个人 Agent 框架：把交互式对话、本地工具、长期记忆、持久任务、定时提醒和常驻渠道网关整合为一个可长期使用的个人助手。成功意味着用户能可靠地把日常事务交给它，同时保持对数据与副作用的控制。
+komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊天、本地工具、持久任务与记忆、定时提醒，以及一个 always-on gateway 承载聊天渠道（飞书/Telegram/微信/Home Assistant）和主动后台工作。所有状态本地存于 `~/.komo`。
+
+成功的定义（用户确认）：**长期记忆越用越懂我** —— 记忆系统随时间积累出真实价值，agent 越来越了解它的主人，这是与其他 agent 框架的根本差异。日常依赖与工程品质服务于这个目标。
 
 ## Positioning
 
-本地优先、可治理的个人 Agent：本地持久化记忆和任务，跨渠道持续运行，并以权限策略、审计记录和人工批准约束副作用；其价值不只是对话能力，而是长期、可靠地完成事务。
+以「记忆随时间积累」为核心机制的个人 agent：三层记忆面（pinned / memory tool / lexical recall）+ 夜间 dream 巩固 + 使用信号驱动的候选晋升，配合本地优先（一切数据在 `~/.komo`）、单二进制、always-on gateway。邻近产品（通用 chatbot、无状态 agent 框架）无法如实复制这一「越用越懂你」的主张。
 
 ## Operating Context
 
-用户通过终端、桌面端、Web 或已配置的聊天渠道使用 Komo；网关持续处理渠道消息、提醒、任务通知和后台维护。
+- 主形态是聊天助理：终端 TUI（`komo chat`）、Electron 桌面壳与 Web SPA（共享 React 渲染层）、以及飞书/Telegram/微信/HA 等渠道内的对话。
+- gateway 作为常驻进程运行（macOS launchd 托管），承担 sweeps、reminder、cron、briefing 等主动输出；主动消息经 home chat 送达。
+- 操作者通过 CLI 管理记忆、技能、cron、run ledger、权限策略等；副作用工具走审批流（chat 内 `/approve`）。
+- 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。
 
 ## Capabilities and Constraints
 
-已确认功能包括交互式聊天、本地工具调用、长期记忆、持久任务、提醒与定时任务、跨渠道接入及常驻网关。状态默认存储在用户本机的 `~/.komo`；副作用受权限策略、审计和人工批准约束。
+- 前端：bun workspace（`apps/`），`apps/app` 为共享 React 渲染层，由 Electron（`apps/desktop`）与 Web SPA（`apps/web`）挂载；shadcn 组件 + 语义主题 token，`bun run lint` 禁止裸色值；react-query 管服务端状态、zustand 管客户端状态；对 gateway 仅走 HTTP（`HttpKomoClient`）。
+- 多 LLM provider（DeepSeek/Anthropic/OpenAI/Codex/OpenRouter），模型菜单按会话切换；无 key 也能启动（回复配置指引）。
+- 领域术语（`CONTEXT.md` 是术语表）：Turn / Tool Note / Turn Trace / Run Ledger / History Window / Cancel 等，界面文案应与之一致。
+- 平台判定为 web：Electron 桌面壳复用同一 web 渲染层，不引入原生设计语言。
 
 ## Brand Commitments
 
-名称为 Komo，源自日语 *komorebi*（木漏れ日）。已存在的品牌意象是温暖、清晰、安静而不打扰的陪伴；候选标语为“记住每一缕光”、“陪你把日子攒成光”和 “Light through your days”。
+**绑定约束（用户确认，照此执行）**，出处 `README.md` Brand 段：
+
+- 名称 **Komo**，源自日语 *komorebi*（木漏れ日）：树叶间洒落的阳光——温暖清晰，小片刻积累成恒久之物，呼应记忆随时间积累的产品核心。
+- 视觉语言：软绿、米白、阳光黄；dappled-light（叶隙光斑）形状意象。
+- 人格：树荫下安静的朋友——温暖而不打扰，专注倾听，记得被托付的细节。
+- 候选 slogan：「记住每一缕光」/「陪你把日子攒成光」/ *Light through your days*。
+- 现有资产：`docs/images/komo_logo.png`（吉祥物 + 字标 + slogan）。
 
 ## Evidence on Hand
 
-已有 README、命令行、Rust 核心、React/Electron/Web 客户端与 `docs/images/komo_logo.png`。没有经确认可对外使用的客户、效果指标、案例或定价材料；未来内容不得虚构这些证据。
+- 真实可运行的产品：CLI、TUI、gateway、桌面/Web 客户端均已实现；`README.md` 的功能描述有代码背书。
+- 无测评、无用户案例、无第三方评价——未来对外表述不得虚构这些。
 
 ## Product Principles
 
-- 用户对数据和副作用保持控制。
-- 长期记忆与持续运行必须可信、可审计。
-- 跨渠道体验不应削弱同一位用户与同一助手的连续性。
-- 价值体现在可靠完成事务，而非单次对话的花哨表现。
+1. **记忆是产品的心脏**：功能与界面取舍优先服务「越用越懂我」——让记忆的积累、回忆与巩固可见、可信、可管理。
+2. **作者优先，新人不受阻**：以首要用户的真实工作流为准绳做深，同时首次上手路径（init → 配 key → chat）必须对陌生自托管用户顺畅。
+3. **本地与安静**：数据留在本地，主动性有节制——温暖而不打扰是人格也是行为准则（审批流、quiet 渠道行为都体现这一点）。
+4. **一个世界，多个入口**：TUI、桌面、Web、聊天渠道是同一个 agent 的不同入口；术语、行为与人格跨入口一致。
 
+## Accessibility & Inclusion
+
+无产品级特殊要求（未确立专门标准）；界面文案中英双语并存是现状（CLI/文档英文为主，品牌与用户沟通含中文）。

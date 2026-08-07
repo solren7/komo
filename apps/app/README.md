@@ -85,11 +85,11 @@ Hard rules, enforced by `bun run lint` (`apps/scripts/check-tokens.mjs`):
   a palette variable. Changing a color means editing `main.css`, one place.
 - **Sizes come from the scale** — `text-sm`/`text-xs`, `rounded-md`/`lg`/`xl`.
   No `text-[13px]`, no `rounded-[12px]`.
-- The theme has no success/warning token, so status colors are the **one**
-  sanctioned use of a Tailwind ramp: the `ok` / `warn` variants in
-  `shared/ui/badge.tsx` and the connection dot in
-  `features/sessions/SessionList.tsx`. Everywhere else a failure uses
-  `text-destructive` and success gets no color at all.
+- Status colors are tokens too: `--success` (lit leaf-green) and `--warning`
+  (sunlight yellow), both theme-aware, used by the `ok` / `warn` badge variants
+  and the sidebar connection dot. There is no sanctioned Tailwind ramp anymore —
+  a failure uses `text-destructive`, and nothing reaches for `emerald-*` /
+  `amber-*`. See `DESIGN.md` for the palette and the komorebi material.
 
 `components.json` lives here (not in a host), with aliases pointing at
 `@/shared/ui` and `@/shared/lib/utils`, so `bunx shadcn add <component>` writes

@@ -40,6 +40,10 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -61,6 +65,17 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* Motion character: a quiet friend moves without startling you. Everything
+     decelerates hard from an already-visible state — no bounce, no overshoot,
+     nothing that asks to be watched. `settle` is the long tail reserved for
+     light itself (dapple drift, afterglow); `quick` is for controls answering
+     a pointer. Components pick a token instead of inventing a curve. */
+  --ease-komo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-komo-soft: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-quick: 120ms;
+  --duration-base: 220ms;
+  --duration-settle: 480ms;
 
   /* Collapsible open/close, used by the vendored assistant-ui tool components
      (shared/ui/tool-group.tsx, tool-fallback.tsx) via `animate-collapsible-*`.
@@ -109,6 +124,12 @@
   --accent: oklch(0.95 0.024 117.041);
   --accent-foreground: oklch(0.375 0.038 127.995);
   --destructive: oklch(0.577 0.245 27.325);
+  /* Komorebi's own status pair, replacing the emerald/amber ramp the theme used
+     to borrow: a lit leaf-green for alive, sunlight yellow for attention. */
+  --success: oklch(0.6 0.115 133.5);
+  --success-foreground: oklch(0.4 0.082 133.5);
+  --warning: oklch(0.845 0.142 104.073);
+  --warning-foreground: oklch(0.46 0.093 84);
   --border: oklch(0.912 0.025 121.934);
   --input: oklch(0.868 0.036 122.715);
   --ring: oklch(0.663 0.087 126.649);
@@ -145,6 +166,12 @@
   --accent: oklch(0.334 0.033 131.641);
   --accent-foreground: oklch(0.955 0.015 123.043);
   --destructive: oklch(0.704 0.191 22.216);
+  /* Under shade both statuses lift toward the light they stand for, so they read
+     against the forest ground without turning neon. */
+  --success: oklch(0.79 0.105 133.5);
+  --success-foreground: oklch(0.86 0.09 133.5);
+  --warning: oklch(0.87 0.13 100);
+  --warning-foreground: oklch(0.9 0.105 100);
   --border: oklch(0.833 0.068 122.563 / 14%);
   --input: oklch(0.833 0.068 122.563 / 20%);
   --ring: oklch(0.663 0.087 126.649);
@@ -287,5 +314,134 @@
 @media (prefers-reduced-motion: reduce) {
   .komorebi-spinner-orbit {
     animation: none;
+  }
+}
+
+/* Komorebi dapple — the brand's one material: sunlight falling through leaves.
+   Overlapping soft pools of leaf-green and sunlight yellow, drifting on a very
+   long cycle the way light does when the branches move.
+
+   Rules that keep it a material rather than decoration: it lives on a ::before
+   at negative z-index, and its pools are low-alpha mixes into `transparent`, so
+   the ground shifts a few percent and text contrast is untouched. It belongs to
+   low-density regions only — empty states, the memory canopy — where a few words
+   sit in a lot of space. Never behind a transcript, a form, or a control: light
+   through leaves is what you look at while waiting, not what you read through. */
+.komorebi-dapple {
+  position: relative;
+  isolation: isolate;
+}
+
+.komorebi-dapple::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  /* Many small pools rather than a few large ones: light through leaves is
+     scattered and irregular, and four big soft blobs read as a blurred image
+     instead. Sizes stay under ~14% of the box and alphas under ~14%, so the
+     ground is textured, never clouded. */
+  background:
+    radial-gradient(
+      9% 7% at 16% 22%,
+      color-mix(in oklch, var(--warning) 14%, transparent),
+      transparent 68%
+    ),
+    radial-gradient(
+      6% 5% at 27% 12%,
+      color-mix(in oklch, var(--warning) 11%, transparent),
+      transparent 66%
+    ),
+    radial-gradient(
+      11% 8% at 38% 31%,
+      color-mix(in oklch, var(--primary) 9%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      5% 4% at 47% 9%,
+      color-mix(in oklch, var(--warning) 12%, transparent),
+      transparent 64%
+    ),
+    radial-gradient(
+      8% 7% at 62% 24%,
+      color-mix(in oklch, var(--warning) 10%, transparent),
+      transparent 68%
+    ),
+    radial-gradient(
+      7% 6% at 74% 14%,
+      color-mix(in oklch, var(--primary) 8%, transparent),
+      transparent 66%
+    ),
+    radial-gradient(
+      10% 8% at 85% 34%,
+      color-mix(in oklch, var(--warning) 9%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      6% 5% at 22% 52%,
+      color-mix(in oklch, var(--primary) 7%, transparent),
+      transparent 66%
+    ),
+    radial-gradient(
+      9% 7% at 57% 62%,
+      color-mix(in oklch, var(--warning) 8%, transparent),
+      transparent 68%
+    ),
+    radial-gradient(
+      7% 6% at 79% 72%,
+      color-mix(in oklch, var(--primary) 7%, transparent),
+      transparent 68%
+    );
+  /* Also set statically, so the reduced-motion path (animation: none) still
+     picks up the theme's light level. */
+  opacity: var(--dapple-peak, 1);
+  animation: komorebi-drift 42s var(--ease-komo-soft) infinite alternate;
+  content: "";
+  pointer-events: none;
+}
+
+/* Under shade the same pools carry much further against a dark ground, so they
+   are dimmed rather than re-tuned — one material, two light levels. The peak
+   travels through a variable because the drift animation owns `opacity`, and a
+   static override would simply lose to it. */
+.dark .komorebi-dapple::before {
+  --dapple-peak: 0.45;
+}
+
+/* The branches shift a little; the pools slide and breathe, never travel. */
+@keyframes komorebi-drift {
+  from {
+    opacity: calc(var(--dapple-peak, 1) * 0.8);
+    transform: translate3d(-0.8%, -0.6%, 0) scale(1.01);
+  }
+  to {
+    opacity: var(--dapple-peak, 1);
+    transform: translate3d(0.8%, 0.6%, 0) scale(1.04);
+  }
+}
+
+/* Afterglow — how a change announces itself here. A row that just changed holds
+   a warm light and lets it fade, instead of flashing: you can look away and
+   still find what moved when you look back. */
+.komorebi-afterglow {
+  animation: komorebi-afterglow 2.4s var(--ease-komo) 1;
+}
+
+@keyframes komorebi-afterglow {
+  0% {
+    background-color: color-mix(in oklch, var(--warning) 26%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--warning) 34%, transparent);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 1px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .komorebi-dapple::before {
+    animation: none;
+  }
+  .komorebi-afterglow {
+    animation-duration: 1ms;
   }
 }

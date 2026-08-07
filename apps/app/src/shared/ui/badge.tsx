@@ -16,11 +16,11 @@ const badgeVariants = cva(
         outline: "border-border text-foreground [a]:hover:bg-muted [a]:hover:text-muted-foreground",
         ghost: "hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50",
         link: "text-primary underline-offset-4 hover:underline",
-        // Status variants (komo addition — the theme has no success/warning
-        // token, so these are the only place a Tailwind ramp color is used
-        // directly. See apps/app/README.md.
-        ok: "bg-emerald-500/10 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400",
-        warn: "bg-amber-500/10 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400",
+        // Status variants over komo's own success/warning tokens — leaf-green
+        // for alive, sunlight yellow for attention. Both are theme-aware, so
+        // no Tailwind ramp color appears here.
+        ok: "bg-success/12 text-success-foreground dark:bg-success/15",
+        warn: "bg-warning/15 text-warning-foreground dark:bg-warning/15",
       },
     },
     defaultVariants: {

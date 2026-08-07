@@ -52,6 +52,48 @@ struct MemoryRecord {
     // Comma-separated distinct query fingerprints (hex, so commas never occur
     // inside a value); domain type is `Vec<String>`.
     recall_query_hashes: String,
+    // Base64 of the L2-normalized embedding's little-endian f32 bytes; empty
+    // when not embedded. Base64 rather than a JSON array because a 1024-dim
+    // vector is ~5.5 KB encoded against ~12 KB as text, and `list()` loads
+    // every row on every turn.
+    embedding: String,
+    // Model that produced `embedding`; empty when not embedded.
+    embedding_model: String,
+}
+
+/// Encode an embedding for storage: little-endian f32 bytes, base64. Empty
+/// vector → empty string, so "not embedded" needs no sentinel.
+fn encode_embedding(vector: &[f32]) -> String {
+    use base64::Engine;
+    if vector.is_empty() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode a stored embedding. Anything malformed — bad base64, a length that is
+/// not a whole number of f32s — reads as *not embedded* rather than failing the
+/// load: a corrupt vector must cost recall quality, never access to the memory
+/// itself.
+fn decode_embedding(encoded: &str) -> Vec<f32> {
+    use base64::Engine;
+    if encoded.is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return Vec::new();
+    };
+    if bytes.len() % 4 != 0 {
+        return Vec::new();
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Connection to the memory database. Holds only `MemoryRecord`.
@@ -170,6 +212,8 @@ fn record_from_memory(memory: &Memory) -> MemoryRecord {
         last_used_at: memory.last_used_at.unwrap_or(0),
         recall_count: memory.recall_count,
         recall_query_hashes: memory.recall_query_hashes.join(","),
+        embedding: encode_embedding(&memory.embedding),
+        embedding_model: memory.embedding_model.clone(),
     }
 }
 
@@ -197,6 +241,8 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect(),
+        embedding: decode_embedding(&record.embedding),
+        embedding_model: record.embedding_model,
     }
 }
 
@@ -228,6 +274,8 @@ impl MemoryRepository for MemoryDb {
                     .last_used_at(r.last_used_at)
                     .recall_count(r.recall_count)
                     .recall_query_hashes(r.recall_query_hashes)
+                    .embedding(r.embedding)
+                    .embedding_model(r.embedding_model)
                     .exec(&mut conn)
                     .await?;
                 return Ok(());
@@ -250,6 +298,8 @@ impl MemoryRepository for MemoryDb {
                 last_used_at: r.last_used_at,
                 recall_count: r.recall_count,
                 recall_query_hashes: r.recall_query_hashes,
+                embedding: r.embedding,
+                embedding_model: r.embedding_model,
             })
             .exec(&mut conn)
             .await?;
@@ -296,6 +346,11 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
         (
             "recall_query_hashes",
             "\"recall_query_hashes\" text NOT NULL DEFAULT ''",
+        ),
+        ("embedding", "\"embedding\" text NOT NULL DEFAULT ''"),
+        (
+            "embedding_model",
+            "\"embedding_model\" text NOT NULL DEFAULT ''",
         ),
     ];
     crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await
@@ -367,6 +422,8 @@ mod tests {
                     last_used_at: r.last_used_at,
                     recall_count: r.recall_count,
                     recall_query_hashes: r.recall_query_hashes,
+                    embedding: r.embedding,
+                    embedding_model: r.embedding_model,
                 })
                 .exec(&mut conn)
                 .await

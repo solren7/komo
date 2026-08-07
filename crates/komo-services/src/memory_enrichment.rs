@@ -16,10 +16,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::llm::LlmClient;
 use komo_core::domain::memory::{
-    Memory, MemoryContext, MemoryRepository, ScoredMemory, recall_query_hash, select_pinned,
-    select_recall,
+    Memory, MemoryContext, MemoryRepository, RecallQuery, ScoredMemory, recall_query_hash,
+    select_pinned, select_recall,
 };
 use komo_core::domain::message::Message;
 use komo_core::domain::session::Session;
@@ -70,6 +71,16 @@ pub struct MemoryEnrichmentConfig {
     /// Aux screening runs on the reply's critical path, so past this we fall
     /// back to the lexical top hits.
     pub aux_timeout: Duration,
+    /// Budget for embedding the turn's message. Also on the reply's critical
+    /// path, so past this recall proceeds lexical-only. Generous enough to
+    /// absorb an Ollama model reload (a warm one answers in ~100ms); a turn
+    /// that pays it once leaves the model warm for the rest of the
+    /// conversation.
+    pub embed_timeout: Duration,
+    /// Memories embedded per background backfill pass. Bounds one batch's work
+    /// and payload; a large library converges over several turns instead of
+    /// blocking one on a giant request.
+    pub backfill_batch: usize,
 }
 
 impl Default for MemoryEnrichmentConfig {
@@ -78,6 +89,8 @@ impl Default for MemoryEnrichmentConfig {
             recall_limit: 5,
             recall_fetch: 15,
             aux_timeout: Duration::from_secs(4),
+            embed_timeout: Duration::from_secs(3),
+            backfill_batch: 32,
         }
     }
 }
@@ -92,24 +105,35 @@ const AUX_RECALL_LINE_MAX: usize = 200;
 pub struct MemoryEnricher {
     memories: Arc<dyn MemoryRepository>,
     aux: Option<Arc<dyn LlmClient>>,
+    /// Optional semantic arm for recall. `None` (or any failure) leaves recall
+    /// exactly as lexical as it was before embeddings existed.
+    embedder: Option<Arc<dyn EmbeddingClient>>,
     config: MemoryEnrichmentConfig,
 }
 
 impl MemoryEnricher {
     pub fn new(memories: Arc<dyn MemoryRepository>, aux: Option<Arc<dyn LlmClient>>) -> Self {
-        Self::with_config(memories, aux, MemoryEnrichmentConfig::default())
+        Self::with_config(memories, aux, None, MemoryEnrichmentConfig::default())
     }
 
     pub fn with_config(
         memories: Arc<dyn MemoryRepository>,
         aux: Option<Arc<dyn LlmClient>>,
+        embedder: Option<Arc<dyn EmbeddingClient>>,
         config: MemoryEnrichmentConfig,
     ) -> Self {
         Self {
             memories,
             aux,
+            embedder,
             config,
         }
+    }
+
+    /// Attach an embedding backend, giving recall its cross-language arm.
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingClient>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Produce this turn's memory blocks, or `None` when nothing qualifies (so
@@ -145,7 +169,8 @@ impl MemoryEnricher {
         // `recall_limit` survivors the aux recall agent screens them (lexical
         // CJK-bigram overlap has real false positives), otherwise the top
         // `recall_limit` inject directly with zero added latency.
-        let mut hits = select_recall(&all, &ctx, user_message, self.config.recall_fetch, now);
+        let query = self.build_query(user_message).await;
+        let mut hits = select_recall(&all, &ctx, &query, self.config.recall_fetch, now);
         hits.retain(|h| !pinned_ids.contains(h.memory.id.as_str()));
         let hits = match &self.aux {
             Some(aux) if hits.len() > self.config.recall_limit => {
@@ -176,6 +201,14 @@ impl MemoryEnricher {
             });
         }
 
+        // Keep the vector index converging, off the reply path. Doing this here
+        // rather than on each write is deliberate: `enrich` already holds the
+        // whole library, and one implementation then covers *every* way a
+        // memory is created (reviewer, `memory` tool, CLI, api) plus memories
+        // that predate embeddings entirely — instead of a write path each
+        // caller could forget.
+        self.spawn_backfill(&all);
+
         if pinned_block.is_none() && recall_block.is_none() {
             return None;
         }
@@ -183,6 +216,78 @@ impl MemoryEnricher {
             pinned: pinned_block,
             recall: recall_block,
         })
+    }
+
+    /// Build this turn's recall query, embedding the message when a backend is
+    /// configured. Any failure — no backend, error, timeout — yields the
+    /// lexical query, so recall degrades rather than breaks.
+    async fn build_query(&self, user_message: &str) -> RecallQuery {
+        let Some(embedder) = &self.embedder else {
+            return RecallQuery::lexical(user_message);
+        };
+        let batch = [user_message.to_string()];
+        match tokio::time::timeout(self.config.embed_timeout, embedder.embed(&batch)).await {
+            Ok(Ok(mut vectors)) if !vectors.is_empty() => {
+                RecallQuery::semantic(user_message, vectors.remove(0), embedder.model_id())
+            }
+            Ok(Ok(_)) => {
+                tracing::warn!("embedding backend returned no vector — recall stays lexical");
+                RecallQuery::lexical(user_message)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "embedding the turn's message failed — recall stays lexical");
+                RecallQuery::lexical(user_message)
+            }
+            Err(_) => {
+                tracing::warn!("embedding the turn's message timed out — recall stays lexical");
+                RecallQuery::lexical(user_message)
+            }
+        }
+    }
+
+    /// Embed up to `backfill_batch` memories that lack a vector for the current
+    /// model, in the background. Best-effort in every direction: no backend,
+    /// nothing missing, or a failed call all leave the store untouched and the
+    /// affected memories lexical-only until a later turn retries.
+    fn spawn_backfill(&self, all: &[Memory]) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        let model = embedder.model_id().to_string();
+        let stale: Vec<Memory> = all
+            .iter()
+            .filter(|m| m.embedding_for(&model).is_none())
+            .take(self.config.backfill_batch)
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let repo = self.memories.clone();
+        tokio::spawn(async move {
+            let texts: Vec<String> = stale.iter().map(|m| m.content.clone()).collect();
+            let vectors = match embedder.embed(&texts).await {
+                Ok(vectors) => vectors,
+                Err(error) => {
+                    tracing::warn!(%error, "memory embedding backfill failed");
+                    return;
+                }
+            };
+            let mut written = 0usize;
+            for (mut memory, vector) in stale.into_iter().zip(vectors) {
+                memory.embedding = vector;
+                memory.embedding_model = model.clone();
+                // `updated_at` is deliberately untouched: embedding is an index
+                // rebuild, not an edit, and bumping it would reset the
+                // recency-decay signal for the whole library at once.
+                if let Err(error) = repo.save(&memory).await {
+                    tracing::warn!(%error, id = %memory.id, "failed to store memory embedding");
+                    continue;
+                }
+                written += 1;
+            }
+            tracing::debug!(written, model = %model, "memory embedding backfill");
+        });
     }
 
     /// Screen recall candidates through the aux sub-agent: keep the genuinely
@@ -444,6 +549,8 @@ mod tests {
         memories: Vec<Memory>,
         fail_list: bool,
         used: Arc<Mutex<UsedCalls>>,
+        /// Memories handed to `save` — how the backfill's writes are observed.
+        saved: Arc<Mutex<Vec<Memory>>>,
     }
 
     impl FakeStore {
@@ -452,13 +559,15 @@ mod tests {
                 memories,
                 fail_list: false,
                 used: Arc::new(Mutex::new(Vec::new())),
+                saved: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
 
     #[async_trait]
     impl MemoryRepository for FakeStore {
-        async fn save(&self, _memory: &Memory) -> anyhow::Result<()> {
+        async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
+            self.saved.lock().unwrap().push(memory.clone());
             Ok(())
         }
         async fn list(&self) -> anyhow::Result<Vec<Memory>> {
@@ -534,6 +643,152 @@ mod tests {
 
     fn enricher(store: FakeStore, aux: Option<Arc<dyn LlmClient>>) -> MemoryEnricher {
         MemoryEnricher::new(Arc::new(store), aux)
+    }
+
+    /// An embedding backend that returns a fixed vector, or fails/hangs on
+    /// demand — the three ways the real one can let the turn down.
+    struct FakeEmbedder {
+        vector: Vec<f32>,
+        fail: bool,
+        hang: bool,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl FakeEmbedder {
+        fn new(vector: Vec<f32>) -> Self {
+            Self {
+                vector,
+                fail: false,
+                hang: false,
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            *self.calls.lock().unwrap() += 1;
+            if self.hang {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if self.fail {
+                anyhow::bail!("embedding backend down");
+            }
+            Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+        fn model_id(&self) -> &str {
+            "fake-model"
+        }
+    }
+
+    /// A memory carrying a vector for the fake backend's model.
+    fn embedded_fact(id: &str, content: &str, vector: Vec<f32>) -> Memory {
+        let mut m = active_fact(id, content);
+        m.embedding = vector;
+        m.embedding_model = "fake-model".into();
+        m
+    }
+
+    /// The end-to-end fix: a message sharing no lexical term with the memory
+    /// still recalls it, through the embedding backend.
+    #[tokio::test]
+    async fn semantic_recall_injects_a_memory_with_no_shared_terms() {
+        let store = FakeStore::new(vec![embedded_fact(
+            "m-zh",
+            "User communicates in Chinese.",
+            vec![1.0, 0.0],
+        )]);
+        let e = enricher(store, None).with_embedder(Arc::new(FakeEmbedder::new(vec![1.0, 0.0])));
+        let injection = e
+            .enrich("api:conv-1", "我平时用什么语言跟你说话")
+            .await
+            .expect("the semantic arm recalls it");
+        assert!(
+            injection
+                .recall
+                .as_deref()
+                .unwrap()
+                .contains("communicates in Chinese")
+        );
+    }
+
+    /// Every way the backend can fail must leave recall exactly as lexical as
+    /// it was before embeddings existed — never worse, never an error.
+    #[tokio::test]
+    async fn embedding_failure_falls_back_to_lexical_recall() {
+        for (fail, hang) in [(true, false), (false, true)] {
+            let store = FakeStore::new(vec![active_fact(
+                "m-1",
+                "durable kanban tasks live in kanban.db",
+            )]);
+            let mut embedder = FakeEmbedder::new(vec![1.0, 0.0]);
+            embedder.fail = fail;
+            embedder.hang = hang;
+            let config = MemoryEnrichmentConfig {
+                embed_timeout: Duration::from_millis(20),
+                ..Default::default()
+            };
+            let e = MemoryEnricher::with_config(
+                Arc::new(store),
+                None,
+                Some(Arc::new(embedder)),
+                config,
+            );
+            let injection = e
+                .enrich("api:conv-1", "where do kanban tasks live?")
+                .await
+                .expect("lexical recall still works");
+            assert!(injection.recall.as_deref().unwrap().contains("kanban.db"));
+        }
+    }
+
+    /// Memories without a current-model vector get embedded in the background,
+    /// off the reply path — the self-healing index.
+    #[tokio::test]
+    async fn missing_embeddings_are_backfilled_in_the_background() {
+        let store = FakeStore::new(vec![active_fact("m-1", "kanban tasks live in kanban.db")]);
+        let saved = store.saved.clone();
+        let embedder = Arc::new(FakeEmbedder::new(vec![0.0, 1.0]));
+        let e = enricher(store, None).with_embedder(embedder);
+        e.enrich("api:conv-1", "kanban tasks?").await;
+
+        for _ in 0..50 {
+            if !saved.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let saved = saved.lock().unwrap();
+        let stored = saved
+            .first()
+            .expect("the memory was re-saved with a vector");
+        assert_eq!(stored.embedding, vec![0.0, 1.0]);
+        assert_eq!(stored.embedding_model, "fake-model");
+    }
+
+    /// A memory already embedded by the current model is not re-embedded — the
+    /// backfill converges instead of re-running every turn.
+    #[tokio::test]
+    async fn backfill_skips_memories_already_embedded_for_this_model() {
+        let store = FakeStore::new(vec![embedded_fact(
+            "m-1",
+            "kanban tasks live in kanban.db",
+            vec![0.0, 1.0],
+        )]);
+        let saved = store.saved.clone();
+        let embedder = Arc::new(FakeEmbedder::new(vec![0.0, 1.0]));
+        let calls = embedder.calls.clone();
+        let e = enricher(store, None).with_embedder(embedder);
+        e.enrich("api:conv-1", "kanban tasks?").await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(saved.lock().unwrap().is_empty(), "nothing to re-save");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "only the query embed — no backfill batch"
+        );
     }
 
     #[tokio::test]

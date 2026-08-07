@@ -284,6 +284,9 @@ pub struct FileConfig {
     pub channels: Option<ChannelsFileConfig>,
     /// Configurable permission policy (`[policy]` + `[[policy.rule]]`).
     pub policy: Option<PolicyFileConfig>,
+    /// Long-term memory knobs (`[memory]`) — currently the embedding backend
+    /// that gives L3 recall its cross-language arm.
+    pub memory: Option<MemoryFileConfig>,
 }
 
 impl FileConfig {
@@ -314,6 +317,24 @@ impl FileConfig {
             }
         }
     }
+}
+
+/// `[memory]` table: long-term memory behavior.
+///
+/// The embedding backend is what lets L3 recall cross a language boundary —
+/// purely lexical recall cannot match a Chinese question against an English
+/// memory, because the two tokenize into disjoint term sets. Off by default:
+/// it depends on a local Ollama daemon, and recall degrades to its
+/// lexical-only behavior when absent.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct MemoryFileConfig {
+    /// Ollama model serving embeddings (e.g. `qwen3-embedding:0.6b`). Unset or
+    /// empty = embeddings off, recall stays lexical-only. Pick a *multilingual*
+    /// model — an English-only one reintroduces the very gap this closes.
+    pub embedding_model: Option<String>,
+    /// Ollama base URL (default `http://127.0.0.1:11434`).
+    pub embedding_url: Option<String>,
 }
 
 /// `[policy]` table: the configurable permission layer (roadmap §3). Parsed into

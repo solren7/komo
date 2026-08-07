@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 /// and scoped (where they may surface) so the agent can be injected with a
 /// conservative profile (L1), recall relevant facts (L3), and let the user
 /// curate the full library (L2). See `docs/personal-agent-roadmap.md`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `embedding` is `Vec<f32>`, and float equality is not an
+/// equivalence relation. Nothing keys a collection on a whole `Memory` — `id`
+/// is the identity — so `PartialEq` (assertions, dedup checks) is enough.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
     pub kind: MemoryKind,
@@ -60,6 +64,22 @@ pub struct Memory {
     /// `#[serde(default)]` so a payload from an older gateway still parses.
     #[serde(default)]
     pub recall_query_hashes: Vec<String>,
+
+    /// L2-normalized semantic vector of [`content`](Self::content), or empty
+    /// when none has been computed yet (no embedding backend configured, or the
+    /// backfill has not reached this memory). This is what lets a Chinese
+    /// question recall an English memory — see [`super::embedding`].
+    ///
+    /// Filled in the background, never on the write path: a memory is always
+    /// usable lexically the moment it is saved.
+    #[serde(default)]
+    pub embedding: Vec<f32>,
+    /// Which model produced [`embedding`](Self::embedding). Vectors from
+    /// different models live in incomparable spaces, so recall only uses an
+    /// embedding whose model matches the *current* backend; a mismatch is
+    /// treated as "not embedded yet" and re-embedded by the backfill.
+    #[serde(default)]
+    pub embedding_model: String,
 }
 
 /// Default ranking weight for a new memory.
@@ -88,7 +108,17 @@ impl Memory {
             last_used_at: None,
             recall_count: 0,
             recall_query_hashes: Vec::new(),
+            embedding: Vec::new(),
+            embedding_model: String::new(),
         }
+    }
+
+    /// This memory's vector, but only if it was produced by `model` — vectors
+    /// from another model are not comparable, so they read as absent. `None`
+    /// also when nothing has been embedded yet.
+    pub fn embedding_for<'a>(&'a self, model: &str) -> Option<&'a [f32]> {
+        (!self.embedding.is_empty() && self.embedding_model == model)
+            .then_some(self.embedding.as_slice())
     }
 
     /// Whether this memory has expired as of `now` (a unix timestamp).
@@ -306,6 +336,25 @@ impl MemoryScope {
     }
 }
 
+/// Whether a platform's `chat_id` identifies a **durable conversation partner**
+/// (a person or a group that persists across conversations) rather than a
+/// single conversation.
+///
+/// This is what makes `Channel` scope meaningful: it keeps a fact disclosed in
+/// one person's DM from surfacing in someone else's chat, while still letting
+/// that person's own memories follow them across sessions.
+///
+/// The `api` platform breaks that assumption. Its `chat_id` is a per-conversation
+/// uuid (`api:<uuid>`, and `gui-desktop-<uuid>` from the desktop app), so
+/// `Channel` there is a synonym for `Session` — an automated write would be
+/// unrecallable from the very next conversation. Every local surface (TUI,
+/// desktop, web) runs over that one channel and belongs to the single host
+/// operator, so there is no cross-tenant leak to guard against: those writes
+/// belong in `Global`.
+pub fn is_durable_channel(platform: &str) -> bool {
+    platform != "api"
+}
+
 /// The scopes a memory may be drawn from for the current turn, derived from the
 /// session id. `Global` is always allowed; chat sessions add their `Channel`
 /// and `Session` scopes. Scope is decided here, before any query, so a query
@@ -334,10 +383,18 @@ impl MemoryContext {
     /// The scope an automated write from this context should carry: the channel
     /// for a chat session, else global. (Never `Session`, which would make a
     /// memory unrecallable outside the exact session.)
+    ///
+    /// Only a **durable** channel is used — see [`is_durable_channel`]. On the
+    /// `api` platform the channel *is* the session, so channel-scoping a write
+    /// there is exactly the "unrecallable outside the exact session" failure
+    /// this method exists to avoid.
     pub fn write_scope(&self) -> MemoryScope {
         self.allowed_scopes
             .iter()
-            .find(|s| matches!(s, MemoryScope::Channel { .. }))
+            .find(|s| match s {
+                MemoryScope::Channel { platform, .. } => is_durable_channel(platform),
+                _ => false,
+            })
             .cloned()
             .unwrap_or(MemoryScope::Global)
     }
@@ -530,23 +587,116 @@ pub fn recall_query_hash(text: &str) -> String {
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Score a memory for L3 recall against the query's extracted terms. Returns
-/// `None` when there is no lexical overlap (the memory is excluded); otherwise a
-/// positive score: shared-term count plus the same importance/confidence/recency
-/// signals as [`rerank_score`]. Scope/status are filtered before this is called.
-pub fn recall_score(memory: &Memory, query_terms: &HashSet<String>, now: i64) -> Option<f64> {
-    if query_terms.is_empty() {
+/// Minimum cosine similarity for a memory to be *admitted* to recall on
+/// semantic grounds alone.
+///
+/// Calibrated against a real memory library with the multilingual embedding
+/// model komo ships against: cross-language paraphrases of a stored fact score
+/// 0.54–0.83, while the best match for an unrelated question tops out around
+/// 0.43. The floor sits below the true positives and above that noise.
+///
+/// Deliberately permissive rather than precise. This gate decides *candidate
+/// generation*, not what reaches the prompt — candidates past `recall_limit`
+/// are screened by the aux relevance pass and capped before injection, so a
+/// false positive costs one screening slot while a false negative is the
+/// cross-language miss this whole layer exists to fix.
+pub const RECALL_SEMANTIC_FLOOR: f32 = 0.45;
+
+/// What a semantic match at full similarity contributes to the recall score,
+/// in units of "shared lexical terms". A 0.78-similarity hit scores about two
+/// shared terms; a hit just past the floor scores near zero, so lexical
+/// evidence still leads when both are present.
+const RECALL_SEMANTIC_WEIGHT: f64 = 3.0;
+
+/// One turn's recall query: the lexical terms, plus optionally the embedding
+/// that lets it match memories written in another language.
+///
+/// The embedding is optional at every step — no backend configured, a failed or
+/// slow call, or a memory embedded by a different model all degrade to the
+/// lexical behavior that predates this struct, never to worse.
+#[derive(Debug, Clone)]
+pub struct RecallQuery {
+    terms: HashSet<String>,
+    embedding: Vec<f32>,
+    /// Model that produced `embedding`; only memories carrying the same model's
+    /// vector are comparable to it.
+    model: String,
+}
+
+impl RecallQuery {
+    /// Terms only — the lexical-only path.
+    pub fn lexical(text: &str) -> Self {
+        Self {
+            terms: recall_terms(text),
+            embedding: Vec::new(),
+            model: String::new(),
+        }
+    }
+
+    /// Terms plus an L2-normalized query vector from `model`.
+    pub fn semantic(text: &str, embedding: Vec<f32>, model: impl Into<String>) -> Self {
+        Self {
+            terms: recall_terms(text),
+            embedding,
+            model: model.into(),
+        }
+    }
+
+    /// Nothing to match on: no terms *and* no vector. (Terms alone being empty
+    /// is not enough — a query of pure punctuation can still match
+    /// semantically.)
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.embedding.is_empty()
+    }
+
+    /// Cosine similarity to `memory`, or 0.0 when either side lacks a
+    /// comparable vector.
+    fn similarity(&self, memory: &Memory) -> f32 {
+        if self.embedding.is_empty() {
+            return 0.0;
+        }
+        match memory.embedding_for(&self.model) {
+            Some(vector) => super::embedding::cosine(&self.embedding, vector),
+            None => 0.0,
+        }
+    }
+
+    #[cfg(test)]
+    fn terms(&self) -> &HashSet<String> {
+        &self.terms
+    }
+}
+
+/// Score a memory for L3 recall. Returns `None` when the memory matches
+/// neither lexically nor semantically (it is excluded); otherwise a positive
+/// score combining shared-term count, the semantic bonus, and the same
+/// importance/confidence/recency signals as [`rerank_score`]. Scope/status are
+/// filtered before this is called.
+pub fn recall_score(memory: &Memory, query: &RecallQuery, now: i64) -> Option<f64> {
+    if query.is_empty() {
         return None;
     }
     let mem_terms = recall_terms(&memory.content);
-    let overlap = query_terms
+    let overlap = query
+        .terms
         .iter()
         .filter(|t| mem_terms.contains(*t))
         .count();
-    if overlap == 0 {
+    let similarity = query.similarity(memory);
+
+    // Admission: either kind of evidence is enough. This union is the fix for
+    // cross-language recall — a Chinese question has zero term overlap with an
+    // English memory by construction (CJK bigrams and ASCII words can never be
+    // equal), so without the semantic arm it could never be admitted at all.
+    if overlap == 0 && similarity < RECALL_SEMANTIC_FLOOR {
         return None;
     }
+
     let mut score = overlap as f64; // each shared term = 1.0
+    if similarity >= RECALL_SEMANTIC_FLOOR {
+        let above_floor = (similarity - RECALL_SEMANTIC_FLOOR) / (1.0 - RECALL_SEMANTIC_FLOOR);
+        score += RECALL_SEMANTIC_WEIGHT * above_floor as f64;
+    }
     score += signal_bonus(memory, now);
     Some(score)
 }
@@ -570,18 +720,17 @@ pub fn select_pinned(memories: &[Memory], ctx: &MemoryContext, now: i64) -> Vec<
     pinned
 }
 
-/// Rank an already-loaded memory set for L3 recall against `text`, top `limit`
+/// Rank an already-loaded memory set for L3 recall against `query`, top `limit`
 /// (`0` = no cap). Same filter/score/sort as [`MemoryRepository::recall`], split
 /// out for the single-load turn path (see [`select_pinned`]).
 pub fn select_recall(
     memories: &[Memory],
     ctx: &MemoryContext,
-    text: &str,
+    query: &RecallQuery,
     limit: usize,
     now: i64,
 ) -> Vec<ScoredMemory> {
-    let query_terms = recall_terms(text);
-    if query_terms.is_empty() {
+    if query.is_empty() {
         return Vec::new();
     }
     let mut scored: Vec<ScoredMemory> = memories
@@ -589,7 +738,7 @@ pub fn select_recall(
         .filter(|m| matches!(m.status, MemoryStatus::Active | MemoryStatus::Candidate))
         .filter(|m| ctx.allows(&m.scope))
         .filter_map(|m| {
-            recall_score(m, &query_terms, now).map(|score| ScoredMemory {
+            recall_score(m, query, now).map(|score| ScoredMemory {
                 memory: m.clone(),
                 score,
             })
@@ -682,7 +831,8 @@ pub trait MemoryRepository: Send + Sync {
     /// The per-turn hot path in `infra/llm.rs` uses [`select_recall`] over a
     /// single shared `list()` instead (see [`select_pinned`]); this method is
     /// the standalone entry point retained for the memory store's query surface
-    /// and its integration tests.
+    /// and its integration tests. Lexical-only: a store holds no embedding
+    /// backend, so the semantic arm belongs to the turn path, which does.
     #[allow(dead_code)]
     async fn recall(
         &self,
@@ -691,7 +841,8 @@ pub trait MemoryRepository: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<ScoredMemory>> {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Ok(select_recall(&self.list().await?, ctx, text, limit, now))
+        let query = RecallQuery::lexical(text);
+        Ok(select_recall(&self.list().await?, ctx, &query, limit, now))
     }
 
     /// Record that memories surfaced in recall: bump `recall_count`, stamp
@@ -914,13 +1065,142 @@ mod tests {
         let now = 1_000;
         let m = Memory::new(MemoryKind::Project, "the project is written in Rust");
         // Overlapping term "rust" → scored.
-        let hit = recall_terms("what language is the rust project in");
+        let hit = RecallQuery::lexical("what language is the rust project in");
         assert!(recall_score(&m, &hit, now).is_some());
         // No overlap → excluded.
-        let miss = recall_terms("当前天气如何");
+        let miss = RecallQuery::lexical("当前天气如何");
         assert!(recall_score(&m, &miss, now).is_none());
         // Empty query → excluded.
-        assert!(recall_score(&m, &HashSet::new(), now).is_none());
+        assert!(recall_score(&m, &RecallQuery::lexical(""), now).is_none());
+    }
+
+    /// The defect this whole layer exists for: a Chinese question and an
+    /// English memory tokenize into disjoint sets, so lexical recall can never
+    /// admit one for the other.
+    #[test]
+    fn lexical_terms_never_cross_the_script_boundary() {
+        let zh = recall_terms("我平时用什么语言跟你说话");
+        let en = recall_terms("User communicates in Chinese.");
+        assert!(
+            zh.intersection(&en).next().is_none(),
+            "CJK bigrams and ASCII words are structurally incapable of overlapping"
+        );
+    }
+
+    /// …and the fix: with a query vector close to the memory's, the same pair
+    /// is admitted and scored, purely on the semantic arm.
+    #[test]
+    fn semantic_similarity_recalls_across_languages() {
+        let now = 1_000;
+        let mut memory = Memory::new(MemoryKind::Profile, "User communicates in Chinese.");
+        memory.embedding = vec![0.6, 0.8]; // unit length
+        memory.embedding_model = "test-model".into();
+
+        let zh = "我平时用什么语言跟你说话";
+        assert!(
+            recall_score(&memory, &RecallQuery::lexical(zh), now).is_none(),
+            "lexically this pair cannot match"
+        );
+
+        // A near-parallel query vector (cosine ≈ 0.999) — well past the floor.
+        let query = RecallQuery::semantic(zh, vec![0.62, 0.78], "test-model");
+        assert!(
+            recall_score(&memory, &query, now).is_some(),
+            "the semantic arm admits what the lexical arm cannot"
+        );
+    }
+
+    /// A vector from another model is not comparable, so it must read as
+    /// "not embedded" rather than scoring against an unrelated space.
+    #[test]
+    fn embedding_from_another_model_is_ignored() {
+        let now = 1_000;
+        let mut memory = Memory::new(MemoryKind::Fact, "User communicates in Chinese.");
+        memory.embedding = vec![1.0, 0.0];
+        memory.embedding_model = "old-model".into();
+
+        let query = RecallQuery::semantic("我说什么语言", vec![1.0, 0.0], "new-model");
+        assert!(recall_score(&memory, &query, now).is_none());
+        assert!(memory.embedding_for("new-model").is_none());
+        assert!(memory.embedding_for("old-model").is_some());
+    }
+
+    /// An unrelated question must stay below the floor even with embeddings on
+    /// — the semantic arm widens recall, it does not disable it.
+    #[test]
+    fn weak_similarity_stays_below_the_floor() {
+        let now = 1_000;
+        let mut memory = Memory::new(MemoryKind::Fact, "User communicates in Chinese.");
+        memory.embedding = vec![1.0, 0.0];
+        memory.embedding_model = "test-model".into();
+
+        // cosine = 0.3, under RECALL_SEMANTIC_FLOOR.
+        let mut weak = vec![0.3, (1.0f32 - 0.09).sqrt()];
+        super::super::embedding::normalize(&mut weak);
+        let query = RecallQuery::semantic("今天午饭吃什么", weak, "test-model");
+        assert!(recall_score(&memory, &query, now).is_none());
+    }
+
+    /// Lexical evidence must keep working with embeddings configured — a
+    /// memory the query overlaps is admitted even with no vector at all.
+    #[test]
+    fn lexical_hits_survive_when_the_memory_has_no_vector() {
+        let now = 1_000;
+        let memory = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
+        let query = RecallQuery::semantic("rust toolchain", vec![1.0, 0.0], "test-model");
+        assert!(recall_score(&memory, &query, now).is_some());
+    }
+
+    /// A query with no lexical terms is still a real query when it carries a
+    /// vector — otherwise `select_recall` would bail before scoring anything.
+    #[test]
+    fn a_query_is_empty_only_without_terms_and_vector() {
+        assert!(RecallQuery::lexical("").is_empty());
+        assert!(RecallQuery::lexical("!!!").is_empty());
+        assert!(!RecallQuery::semantic("!!!", vec![1.0], "m").is_empty());
+        assert!(!RecallQuery::lexical("rust").terms().is_empty());
+    }
+
+    /// The api channel mints a chat id per conversation, so channel-scoping an
+    /// automated write there would make it unrecallable from the next turn —
+    /// the reason no memory in a real library had ever been recalled.
+    #[test]
+    fn api_sessions_write_global_scope_but_chat_channels_keep_theirs() {
+        assert_eq!(
+            MemoryContext::from_session("api:019fb0ce-9f7a-7c23-a87d-dab9df9216d8").write_scope(),
+            MemoryScope::Global,
+            "an api chat id names one conversation, not a partner"
+        );
+        assert_eq!(
+            MemoryContext::from_session("api:gui-desktop-a92b9d36").write_scope(),
+            MemoryScope::Global,
+        );
+        assert_eq!(
+            MemoryContext::from_session("feishu:ou_445299e2").write_scope(),
+            MemoryScope::Channel {
+                platform: "feishu".into(),
+                chat_id: "ou_445299e2".into(),
+            },
+            "a real chat channel's scope is a privacy boundary and must survive"
+        );
+        assert_eq!(
+            MemoryContext::from_session("cli-uuid").write_scope(),
+            MemoryScope::Global,
+        );
+    }
+
+    /// A global memory written from one api conversation must be recallable
+    /// from the next — the end-to-end shape of the scope fix.
+    #[test]
+    fn a_memory_written_in_one_api_conversation_is_recallable_in_the_next() {
+        let now = 1_000;
+        let write_ctx = MemoryContext::from_session("api:conversation-one");
+        let mut memory = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
+        memory.scope = write_ctx.write_scope();
+
+        let read_ctx = MemoryContext::from_session("api:conversation-two");
+        let query = RecallQuery::lexical("rust toolchain");
+        assert_eq!(select_recall(&[memory], &read_ctx, &query, 5, now).len(), 1,);
     }
 
     #[test]
@@ -946,7 +1226,8 @@ mod tests {
         let mut hit = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
         hit.updated_at = now;
         let miss = Memory::new(MemoryKind::Fact, "unrelated weather note");
-        let scored = select_recall(&[hit.clone(), miss], &ctx, "rust toolchain", 5, now);
+        let query = RecallQuery::lexical("rust toolchain");
+        let scored = select_recall(&[hit.clone(), miss], &ctx, &query, 5, now);
         assert_eq!(
             scored.len(),
             1,
@@ -954,7 +1235,7 @@ mod tests {
         );
         assert_eq!(scored[0].memory.id, hit.id);
         // limit is honoured.
-        assert!(select_recall(&[hit], &ctx, "rust toolchain", 0, now).len() <= 1);
+        assert!(select_recall(&[hit], &ctx, &query, 0, now).len() <= 1);
     }
 
     #[test]
@@ -964,7 +1245,7 @@ mod tests {
         more.updated_at = now;
         let mut fewer = Memory::new(MemoryKind::Fact, "rust crate");
         fewer.updated_at = now;
-        let q = recall_terms("rust async tokio");
+        let q = RecallQuery::lexical("rust async tokio");
         let s_more = recall_score(&more, &q, now).unwrap();
         let s_fewer = recall_score(&fewer, &q, now).unwrap();
         assert!(s_more > s_fewer, "more overlapping terms must score higher");

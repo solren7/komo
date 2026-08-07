@@ -178,6 +178,10 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
         // Legacy markdown predates query fingerprints; counts imported without
         // provenance start diversity from zero (the conservative default).
         recall_query_hashes: Vec::new(),
+        // Markdown carries no vector. Left empty so the backfill embeds it on
+        // its own terms rather than importing a stale or foreign one.
+        embedding: Vec::new(),
+        embedding_model: String::new(),
     })
 }
 

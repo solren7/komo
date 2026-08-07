@@ -16,7 +16,8 @@ use std::sync::Arc;
 use crate::domain::cron::{CronJob, CronJobRepository, CronJobSpec};
 use crate::domain::home::HomeRepository;
 use crate::domain::memory::{
-    DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+    DreamVerdict, Memory, MemoryRepository, MemoryScope, MemoryStatus, dream_score, dream_verdict,
+    is_durable_channel,
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
@@ -77,6 +78,11 @@ impl OperatorActions {
         action: MemoryTransitionAction,
     ) -> anyhow::Result<TransitionOutcome> {
         apply_memory_transition(self.memories.as_ref(), id, action, now()).await
+    }
+
+    /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
+    pub async fn repair_memory_scopes(&self) -> anyhow::Result<usize> {
+        repair_memory_scopes(self.memories.as_ref()).await
     }
 
     pub async fn runs(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
@@ -219,6 +225,39 @@ pub async fn apply_memory_transition(
     Ok(TransitionOutcome::Applied(Box::new(memory)))
 }
 
+/// Widen every memory stuck in an ephemeral `api` channel scope to `Global`,
+/// returning how many were moved.
+///
+/// A one-shot repair for memories written before `MemoryContext::write_scope`
+/// learned that `api` chat ids are per-conversation (see
+/// `komo_core::domain::memory::is_durable_channel`). Those memories name a
+/// conversation that has ended, so no later turn can ever recall them — they
+/// are invisible rather than private, and widening them to `Global` restores
+/// exactly the reach they were meant to have.
+///
+/// Deliberately operator-invoked rather than run at startup: this rewrites
+/// durable personal data, so it is the operator's call, not a silent migration.
+/// Idempotent — a second run finds nothing left to move. Only `api` scopes are
+/// touched; a real chat channel's scope is a privacy boundary and stays put.
+pub async fn repair_memory_scopes(memories: &dyn MemoryRepository) -> anyhow::Result<usize> {
+    let mut repaired = 0usize;
+    for mut memory in memories.list().await? {
+        let MemoryScope::Channel { platform, .. } = &memory.scope else {
+            continue;
+        };
+        if is_durable_channel(platform) {
+            continue;
+        }
+        memory.scope = MemoryScope::Global;
+        // `updated_at` untouched: this corrects where a memory is visible, not
+        // what it says, and the recency signal should keep reflecting the last
+        // real edit.
+        memories.save(&memory).await?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// An explicit-id resume request's eligibility, plus the priming input when
 /// it is resumable. Shared by the gateway's resume endpoint and the direct
 /// in-process path, so eligibility rules and the digest never fork.
@@ -352,6 +391,61 @@ mod tests {
         let mut s = Session::new(id);
         s.status = status.to_string();
         s
+    }
+
+    /// The repair widens only the ephemeral `api` scopes, leaves a real chat
+    /// channel's privacy boundary alone, and is safe to run twice.
+    #[tokio::test]
+    async fn repairing_scopes_widens_only_ephemeral_api_channels() {
+        use std::sync::Mutex;
+
+        struct Store(Mutex<Vec<Memory>>);
+        #[async_trait::async_trait]
+        impl MemoryRepository for Store {
+            async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
+                let mut rows = self.0.lock().unwrap();
+                if let Some(slot) = rows.iter_mut().find(|m| m.id == memory.id) {
+                    *slot = memory.clone();
+                }
+                Ok(())
+            }
+            async fn list(&self) -> anyhow::Result<Vec<Memory>> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+
+        let scoped = |scope: MemoryScope| {
+            let mut m = Memory::new(MemoryKind::Fact, "a fact");
+            m.scope = scope;
+            m
+        };
+        let store = Store(Mutex::new(vec![
+            scoped(MemoryScope::Channel {
+                platform: "api".into(),
+                chat_id: "019fb0ce-9f7a-7c23".into(),
+            }),
+            scoped(MemoryScope::Channel {
+                platform: "feishu".into(),
+                chat_id: "ou_445299e2".into(),
+            }),
+            scoped(MemoryScope::Global),
+        ]));
+
+        assert_eq!(repair_memory_scopes(&store).await.unwrap(), 1);
+        let rows = store.list().await.unwrap();
+        assert_eq!(rows[0].scope, MemoryScope::Global, "api scope widened");
+        assert_eq!(
+            rows[1].scope,
+            MemoryScope::Channel {
+                platform: "feishu".into(),
+                chat_id: "ou_445299e2".into(),
+            },
+            "a chat channel's scope is a privacy boundary and must survive"
+        );
+        assert_eq!(rows[2].scope, MemoryScope::Global);
+
+        // Idempotent: a second run finds nothing left to move.
+        assert_eq!(repair_memory_scopes(&store).await.unwrap(), 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! stayed in the binary; they are wiring, not infrastructure.
 
 pub mod codex;
+pub mod embedding;
 pub mod logs;
 pub mod memory;
 pub mod permissions_store;

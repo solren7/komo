@@ -196,6 +196,9 @@ impl DirectOperatorAdapter {
                     archived: summary.memories_archived,
                 }
             }
+            OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
+                repaired: actions::repair_memory_scopes(self.memory().await?.as_ref()).await?,
+            },
             OperatorCommand::CronAdd { spec } => OperatorCommandResult::CronAdded(Box::new(
                 cron_actions::add_cron_job(self.cron().await?.as_ref(), spec, now()).await?,
             )),

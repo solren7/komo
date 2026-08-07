@@ -11,6 +11,8 @@ use komo_agent::review_coordinator::ReviewCoordinator;
 use komo_agent::reviewer::ReflectiveReviewer;
 use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
+use komo_core::domain::embedding::EmbeddingClient;
+use komo_infra::embedding::OllamaEmbedder;
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -78,6 +80,38 @@ pub struct Wiring {
     /// hourly on its own, and this is deliberately not a cron schedule: expiring
     /// a scratch file does not need to happen on the minute.
     pub output_store: Arc<ToolOutputStore>,
+}
+
+/// Construct the memory embedding backend, or `None` when it is unconfigured
+/// or unreachable.
+///
+/// Probed once here rather than trusted, because the failure is otherwise
+/// invisible: an unreachable daemon would silently drop recall back to lexical
+/// matching every turn, which looks exactly like "memory just doesn't work".
+/// A warning, never a fatal — the same call komo makes for a missing model key
+/// or a token-less HA channel. Recall keeps working without it.
+async fn build_embedder(
+    config: Option<&komo_config::EmbeddingConfig>,
+) -> Option<Arc<dyn EmbeddingClient>> {
+    let config = config?;
+    let embedder = match OllamaEmbedder::new(&config.url, &config.model) {
+        Ok(embedder) => embedder,
+        Err(error) => {
+            tracing::warn!(%error, "memory embedding backend unusable — recall stays lexical");
+            return None;
+        }
+    };
+    if let Err(error) = embedder.probe().await {
+        tracing::warn!(
+            %error,
+            url = %config.url,
+            model = %config.model,
+            "memory embedding backend unreachable — recall stays lexical"
+        );
+        return None;
+    }
+    tracing::info!(model = %config.model, "memory embedding backend ready");
+    Some(Arc::new(embedder))
 }
 
 /// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
@@ -360,10 +394,11 @@ pub async fn build(
     // Hand the same tool instances to the LLM so the model can call them, plus
     // the memory enricher (main agent only): the memory store for pinned/recall
     // selection and the aux agent for recall screening, behind one interface.
-    let enricher = Arc::new(MemoryEnricher::new(
-        memory_repo.clone(),
-        Some(aux_llm.clone()),
-    ));
+    let mut enricher = MemoryEnricher::new(memory_repo.clone(), Some(aux_llm.clone()));
+    if let Some(embedder) = build_embedder(config.runtime.embedding.as_ref()).await {
+        enricher = enricher.with_embedder(embedder);
+    }
+    let enricher = Arc::new(enricher);
     let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher), None)?;
     let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(

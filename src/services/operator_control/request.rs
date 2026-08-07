@@ -84,6 +84,8 @@ pub enum OperatorCommand {
     PairRevoke { id: String },
     /// Run one dreaming consolidation cycle.
     DreamApply,
+    /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
+    MemoryRepairScopes,
     /// Create a scheduled cron job (validated; duplicate names refused).
     CronAdd { spec: CronJobSpec },
     /// Delete a cron job by name.
@@ -116,6 +118,10 @@ pub enum OperatorCommandResult {
     DreamApplied {
         promoted: usize,
         archived: usize,
+    },
+    /// How many memories were widened to `Global`.
+    MemoryScopesRepaired {
+        repaired: usize,
     },
     /// The created job (with its computed `next_run_at`).
     CronAdded(Box<CronJob>),

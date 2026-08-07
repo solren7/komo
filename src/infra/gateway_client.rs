@@ -483,6 +483,17 @@ impl GatewayClient {
         Ok((promoted, archived))
     }
 
+    /// Widen memories stranded in an ephemeral `api` channel scope to `Global`
+    /// server-side; returns how many moved.
+    pub async fn memory_repair_scopes(&self) -> anyhow::Result<usize> {
+        let mut map = self
+            .post_json("/api/memories/repair-scopes", json!({}))
+            .await?;
+        Ok(serde_json::from_value(
+            map.remove("repaired").unwrap_or(Value::from(0)),
+        )?)
+    }
+
     /// Run one chat turn server-side and return the reply. Sends the stable
     /// session id (so history threads) and the trusted marker (so the gateway
     /// auto-approves side-effecting tools — it is gated to loopback callers).

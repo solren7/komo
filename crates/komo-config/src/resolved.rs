@@ -130,6 +130,9 @@ pub struct RuntimeConfig {
     pub briefing_workdays_only: bool,
     /// Dreaming sweep cron; `None` = explicitly disabled (default is on).
     pub dream_schedule: Option<String>,
+    /// Embedding backend for cross-language memory recall; `None` = off, recall
+    /// stays lexical-only.
+    pub embedding: Option<EmbeddingConfig>,
     /// The permission policy plus its load diagnostics.
     pub policy: PolicyReport,
     /// Extra skill directories from `KOMO_SKILLS_PATH` (colon-separated),
@@ -150,6 +153,16 @@ pub struct RuntimeConfig {
     /// through it), so this is never `Disabled` — only `Ready` (loopback or
     /// external) or `Misconfigured` (external without a key).
     pub api: ChannelState<ApiConfig>,
+}
+
+/// Resolved embedding backend for L3 memory recall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingConfig {
+    /// Ollama model id; also stored on each memory so vectors from a different
+    /// model are never compared against each other.
+    pub model: String,
+    /// Ollama base URL.
+    pub url: String,
 }
 
 /// One ingress channel's resolved state.
@@ -738,6 +751,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .or(file.briefing_workdays_only)
             .unwrap_or(false),
         dream_schedule: resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
+        embedding: resolve_embedding(file.memory),
         policy,
         skills_path,
         readable_roots,
@@ -755,6 +769,29 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         provider_key_present,
     };
     (runtime, report)
+}
+
+/// Default Ollama endpoint — the daemon's own default bind.
+const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:11434";
+
+/// Resolve the `[memory]` embedding backend. The model name is the switch: no
+/// `[memory]` table, or an empty/absent `embedding_model`, means embeddings are
+/// off and recall stays lexical-only.
+fn resolve_embedding(memory: Option<crate::sources::MemoryFileConfig>) -> Option<EmbeddingConfig> {
+    let memory = memory?;
+    let model = memory.embedding_model?;
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some(EmbeddingConfig {
+        model: model.to_string(),
+        url: memory
+            .embedding_url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_URL.to_string()),
+    })
 }
 
 fn resolve_readable_roots(

@@ -23,7 +23,7 @@ komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
-komo memory list|search|promote|reject|pin|triage|report
+komo memory list|search|promote|reject|pin|triage|report|repair-scopes
 komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
@@ -114,7 +114,9 @@ fork — add new operator actions there, not in the CLI or api handlers.
 
 `~/.komo/config.toml` = runtime settings (provider/model/`models`/aux_model,
 `schedule`, `briefing_schedule` + `briefing_workdays_only`, `dream_schedule`
-(default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`).
+(default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
+`[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
+cross-language recall; no model = lexical-only).
 `~/.komo/.env` = credentials only. Precedence: defaults < config.toml <
 `KOMO_*` env. `KOMO_HOME` relocates the directory.
 
@@ -267,11 +269,26 @@ call the same functions, which is what keeps validation from forking.
   short-circuit inside the tool.
 - `domain/memory.rs` + `services/memory_enrichment.rs` — three surfaces:
   L1 pinned block (manual `pin` only), L2 `memory` tool + operator CLI,
-  L3 recall (lexical token overlap; fetch 15, inject ≤5, aux-screened above 5;
+  L3 recall (fetch 15, inject ≤5, aux-screened above 5;
   injected hits get `recall_count`/`last_used_at`/query-hash stamped —
   dreaming's signals). Nightly `DreamSweep` promotes candidates recalled ≥3
   times by ≥2 distinct queries, archives 30-day-cold ones; only candidates are
   touched. Reviewer extractions are always `candidate`, never pinned/active.
+  L3 matching is **lexical ∪ semantic** (`RecallQuery`): shared terms, or
+  cosine ≥ `RECALL_SEMANTIC_FLOOR` against the memory's embedding. The semantic
+  arm is not optional polish — CJK bigrams and ASCII words can never be equal,
+  so lexical-only recall structurally cannot match a Chinese question to an
+  English memory. Embeddings come from `[memory] embedding_model` via
+  `komo-infra`'s `embedding` (Ollama; a *multilingual* model, or the gap
+  returns), are stored per memory with the model that produced them
+  (`embedding_for` rejects a foreign vector), and are backfilled in the
+  background by `enrich` — so every write path is covered by one implementation.
+  Every embedding failure degrades to lexical, never to worse.
+  **Scope**: `write_scope()` only channel-scopes a *durable* channel
+  (`is_durable_channel`). The `api` platform's chat id is per-conversation
+  (TUI/desktop/web all ride it), so channel-scoping there makes a memory
+  unrecallable from the next turn — those writes go `Global`. Memories written
+  before this are repaired by `komo memory repair-scopes`.
 - `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never

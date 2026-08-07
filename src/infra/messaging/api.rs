@@ -325,6 +325,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
+        .route("/api/memories/repair-scopes", post(memory_repair_scopes))
         .route("/api/cron/add", post(cron_add))
         .route("/api/cron/{name}/remove", post(cron_remove))
         .route("/api/cron/{name}/enable", post(cron_enable))
@@ -1321,6 +1322,13 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
         "archived": summary.memories_archived,
     }))
     .into_response())
+}
+
+/// Widen memories stranded in an ephemeral `api` channel scope to `Global`
+/// (backs `komo memory repair-scopes`).
+async fn memory_repair_scopes(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let repaired = state.actions.repair_memory_scopes().await?;
+    Ok(Json(json!({ "repaired": repaired })).into_response())
 }
 
 // ---- control-plane read endpoints (CLI ↔ gateway) --------------------------

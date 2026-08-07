@@ -2,6 +2,7 @@ pub mod approval;
 pub mod cancel;
 pub mod context;
 pub mod cron;
+pub mod embedding;
 pub mod events;
 pub mod gateway;
 pub mod home;

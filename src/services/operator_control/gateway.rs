@@ -83,6 +83,9 @@ impl GatewayOperatorAdapter {
                 let (promoted, archived) = self.client.dream_apply().await?;
                 OperatorCommandResult::DreamApplied { promoted, archived }
             }
+            OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
+                repaired: self.client.memory_repair_scopes().await?,
+            },
             OperatorCommand::CronAdd { spec } => {
                 OperatorCommandResult::CronAdded(Box::new(self.client.cron_add(&spec).await?))
             }

@@ -340,6 +340,10 @@ enum MemoryAction {
     Triage,
     /// Quality report: counts by status/confidence + piles needing triage
     Report,
+    /// Widen memories stranded in a per-conversation `api` scope to global, so
+    /// recall can reach them again. Safe to re-run; chat-channel scopes are
+    /// left alone.
+    RepairScopes,
 }
 
 #[derive(Subcommand)]
@@ -562,6 +566,7 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Pin { id } => memory::pin(&control, &id).await,
                 MemoryAction::Triage => memory::triage(&control).await,
                 MemoryAction::Report => memory::report(&control).await,
+                MemoryAction::RepairScopes => memory::repair_scopes(&control).await,
             }
         }
         Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,

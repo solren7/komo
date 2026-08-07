@@ -8,7 +8,8 @@
 
 use crate::domain::memory::{Memory, MemoryConfidence, MemoryStatus};
 use crate::services::operator_control::{
-    MemoryTransitionAction, OperatorCommand, OperatorControl, OperatorQuery, OperatorQueryResult,
+    MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery,
+    OperatorQueryResult,
 };
 
 /// Load every memory through the operator surface. The CLI's list/search/report
@@ -329,6 +330,26 @@ fn line(m: &Memory) -> String {
         s.push_str(&format!("  (from {})", m.source));
     }
     s
+}
+
+/// Widen memories stranded in a per-conversation `api` scope to global.
+///
+/// The `api` channel (TUI, desktop, web) mints a fresh chat id per
+/// conversation, so a memory scoped to one is unreachable from every later
+/// turn. This repairs the ones written before that was fixed; real chat
+/// channels keep their scope, which is a privacy boundary rather than an
+/// accident.
+pub async fn repair_scopes(control: &OperatorControl) -> anyhow::Result<()> {
+    match control.command(OperatorCommand::MemoryRepairScopes).await? {
+        OperatorCommandResult::MemoryScopesRepaired { repaired: 0 } => {
+            println!("no memories needed repair");
+        }
+        OperatorCommandResult::MemoryScopesRepaired { repaired } => {
+            println!("widened {repaired} memories to global scope");
+        }
+        _ => unreachable!("MemoryRepairScopes answers with MemoryScopesRepaired"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ pub fn check(
 ) -> anyhow::Result<()> {
     let Some(cat) = Category::parse(category) else {
         anyhow::bail!(
-            "unknown category `{category}` (expected shell | file | network | homeassistant)"
+            "unknown category `{category}` (expected shell | file | network | homeassistant | mcp)"
         );
     };
 
@@ -119,6 +119,19 @@ pub fn check(
                     domain: domain.to_string(),
                     service: service.to_string(),
                 },
+                Risk::Normal,
+            )
+        }
+        Category::Mcp => {
+            let Some((server, tool)) = target.split_once('.') else {
+                anyhow::bail!("mcp target must be `server.tool` (e.g. memos.create_memo)");
+            };
+            (
+                ActionRef::Mcp {
+                    server: server.to_string(),
+                    tool: tool.to_string(),
+                },
+                // Every MCP tool asks: a remote can't declare itself read-only.
                 Risk::Normal,
             )
         }

@@ -116,7 +116,11 @@ fork — add new operator actions there, not in the CLI or api handlers.
 `schedule`, `briefing_schedule` + `briefing_workdays_only`, `dream_schedule`
 (default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
-cross-language recall; no model = lexical-only).
+cross-language recall; no model = lexical-only —
+and `[mcp.servers.<name>]` — external MCP servers: `url`, `token_env` (names
+the `.env` var, never the token), and a **required** `tools` allowlist
+(or `all_tools = true`), closed by default because every mounted tool's schema
+is re-sent every round).
 `~/.komo/.env` = credentials only. Precedence: defaults < config.toml <
 `KOMO_*` env. `KOMO_HOME` relocates the directory.
 
@@ -184,12 +188,13 @@ one 50k-line crate). Depend downward only:
 komo-core      traits + value types, no I/O, no runtime — the GUI client reuses it
 komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot   (→ core)
 komo-provider  wire formats + HTTP/SSE; references nothing else in komo
+komo-mcp       MCP client over rmcp (Streamable HTTP); ditto — nothing komo
 komo-infra     persistence · memory · skills · logs · workday ·
                permissions_store · codex                     (→ core, config, provider)
 komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
                skill_registry · cron_actions ·
                diff/patch/search/file_mutation                (→ core, config)
-komo-tools     every tool                           (→ core, infra, services)
+komo-tools     every tool                      (→ core, infra, mcp, services)
 komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
                policy_approver · reviewer · llm · delegate
                                             (→ core, config, provider, infra, services)
@@ -267,6 +272,20 @@ call the same functions, which is what keeps validation from forking.
   deny-only — never prompted. Wholly-denied tools are dropped from the catalog
   at wiring (`drop_policy_denied`). Policy only tightens; hardline floors
   short-circuit inside the tool.
+- `komo-mcp` + `komo-tools`' `mcp` — external MCP servers over Streamable HTTP
+  (rmcp, client features only). `[mcp.servers.*]` is connected **once at
+  wiring**: the catalog is immutable after that (`register` takes
+  `Arc::get_mut`, and its byte-stable order is what keeps the provider prompt
+  cache valid), so a server that is down at boot has no tools for the process's
+  lifetime — and an unreachable one is a warning, never a fatal. Each mounted
+  tool becomes `mcp__<server>__<tool>` (leaked to satisfy `Tool::name`'s
+  `&'static str`; built once and `Arc`-shared across every executor). **Every
+  MCP call is approval-gated** — `annotations.readOnlyHint` is server-authored,
+  and the server is the party being gated; grant specific tools with
+  `category = "mcp"`, `value = "<server>.<tool>"` rules. A `tools/call` that
+  comes back with `isError` is returned as *content*, not a `ToolError`: the
+  message is remote-controlled and the retry classifier falls back to substring
+  matching, so an echoed "connection refused" must not re-fire a mutation.
 - `domain/memory.rs` + `services/memory_enrichment.rs` — three surfaces:
   L1 pinned block (manual `pin` only), L2 `memory` tool + operator CLI,
   L3 recall (fetch 15, inject ≤5, aux-screened above 5;
@@ -355,6 +374,8 @@ call the same functions, which is what keeps validation from forking.
 
 - **Add a tool**: implement `Tool` in `crates/komo-tools/src/`, register in `cli/wiring.rs`
   (and add it to `tool_execution::policy_scope` if it should be policy-filterable).
+- **Add an MCP server**: config only — an `[mcp.servers.<name>]` table with a
+  `tools` allowlist. No code; that is the point of `komo-mcp` being generic.
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`), construct in
   `komo-agent`'s `llm::build_llm`.
 - **Swap persistence**: implement the repository traits; `agent/`/`domain/`

@@ -30,6 +30,12 @@ pub enum ActionRef {
     Network { url: String },
     /// A Home Assistant service call, matched as `domain.service`.
     Service { domain: String, service: String },
+    /// A tool call on an external MCP server, matched as `server.tool`.
+    ///
+    /// `server` is the operator's `[mcp.servers.<name>]` key, not anything the
+    /// server told us — a remote must never be able to rename itself into a
+    /// policy rule written for a different one.
+    Mcp { server: String, tool: String },
 }
 
 /// A request for the user to approve a side-effecting action.

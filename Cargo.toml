@@ -18,6 +18,8 @@ komo-infra = { path = "crates/komo-infra" }
 komo-services = { path = "crates/komo-services" }
 # Every tool but `delegate`, which needs the runtime it dispatches into.
 komo-tools = { path = "crates/komo-tools" }
+# The generic MCP client, used by wiring to mount `[mcp.servers.*]` tools.
+komo-mcp = { path = "crates/komo-mcp" }
 # The agent: tool loop, gateway, sweeps, and the provider client it drives.
 komo-agent = { path = "crates/komo-agent" }
 clap = { version = "4.6.4", features = ["derive"] }
@@ -127,6 +129,7 @@ members = [
     "crates/komo-core",
     "crates/komo-config",
     "crates/komo-provider",
+    "crates/komo-mcp",
     "crates/komo-infra",
     "crates/komo-services",
     "crates/komo-tools",

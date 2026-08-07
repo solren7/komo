@@ -145,6 +145,10 @@ pub struct RuntimeConfig {
     /// The `homeassistant` *tool* credentials (`HASS_TOKEN`/`HASS_URL`);
     /// `None` = token unset, tool not registered.
     pub homeassistant_tool: Option<HomeAssistantConfig>,
+    /// External MCP servers to connect at startup, already filtered to the
+    /// usable ones (a server missing its url, token, or tool list is dropped
+    /// here with a warning rather than failing the boot).
+    pub mcp_servers: Vec<McpServerConfig>,
     pub feishu: ChannelState<FeishuConfig>,
     pub telegram: ChannelState<TelegramConfig>,
     pub wechat: ChannelState<WeChatConfig>,
@@ -153,6 +157,23 @@ pub struct RuntimeConfig {
     /// through it), so this is never `Disabled` — only `Ready` (loopback or
     /// external) or `Misconfigured` (external without a key).
     pub api: ChannelState<ApiConfig>,
+}
+
+/// One resolved MCP server: reachable-looking config with its token already
+/// read out of the environment.
+///
+/// No `Debug`: `token` is a credential.
+#[derive(Clone)]
+pub struct McpServerConfig {
+    /// The operator's name for the server (the `[mcp.servers.<name>]` key).
+    /// Namespaces its tools in the catalog, so it must be stable.
+    pub name: String,
+    pub url: String,
+    pub token: Option<String>,
+    /// Tools to mount; empty means "everything the server advertises"
+    /// (`all_tools = true`). Resolution rejects the empty-and-not-all case, so
+    /// an empty list here is always deliberate.
+    pub tools: Vec<String>,
 }
 
 /// Resolved embedding backend for L3 memory recall.
@@ -756,6 +777,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         skills_path,
         readable_roots,
         homeassistant_tool,
+        mcp_servers: resolve_mcp_servers(file.mcp, &mut issues),
         feishu,
         telegram,
         wechat,
@@ -769,6 +791,90 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         provider_key_present,
     };
     (runtime, report)
+}
+
+/// Resolve `[mcp.servers.*]` into the servers worth attempting a connection to.
+///
+/// Every rejection is a **warning**, never fatal: an MCP server is an optional
+/// external integration, and a typo in one table must not stop the gateway from
+/// booting (the same call komo makes for a missing model key or a token-less HA
+/// channel). The affected server's tools are simply absent.
+///
+/// This is the one place `std::env::var` is read for a *dynamically named*
+/// variable — `Secrets` is an `envy` struct over a fixed field set, and
+/// `token_env` names its variable at runtime.
+fn resolve_mcp_servers(
+    mcp: Option<crate::sources::McpFileConfig>,
+    issues: &mut Vec<ConfigIssue>,
+) -> Vec<McpServerConfig> {
+    const PATH: &str = "mcp.servers";
+    let mut warn = |message: String| {
+        issues.push(ConfigIssue {
+            path: PATH,
+            severity: IssueSeverity::Warning,
+            message,
+        });
+    };
+
+    let Some(mcp) = mcp else {
+        return Vec::new();
+    };
+    let mut resolved = Vec::new();
+    for (name, cfg) in mcp.servers {
+        if !cfg.enabled.unwrap_or(true) {
+            continue;
+        }
+        let url = cfg.url.trim().to_string();
+        if url.is_empty() {
+            warn(format!("[mcp.servers.{name}] has no `url`; server skipped"));
+            continue;
+        }
+        // Naming a `token_env` states the server needs auth. Connecting anyway
+        // would trade a clear config warning for a 401 at call time, which
+        // reads like a bad token rather than an unset one.
+        let token = match cfg
+            .token_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(var) => match std::env::var(var) {
+                Ok(value) if !value.trim().is_empty() => Some(value),
+                _ => {
+                    warn(format!(
+                        "[mcp.servers.{name}] names token_env = \"{var}\" but it is not set \
+                         (put it in ~/.komo/.env); server skipped"
+                    ));
+                    continue;
+                }
+            },
+        };
+        let tools: Vec<String> = cfg
+            .tools
+            .into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        // Closed by default, like the HA channel's event filters: a server can
+        // advertise dozens of tools, and every mounted one costs a schema on
+        // every round. Mounting them all because the operator forgot to choose
+        // is the expensive failure mode, so it must be asked for.
+        if tools.is_empty() && !cfg.all_tools {
+            warn(format!(
+                "[mcp.servers.{name}] lists no `tools`; nothing is mounted. \
+                 List the tool names, or set `all_tools = true` to mount everything."
+            ));
+            continue;
+        }
+        resolved.push(McpServerConfig {
+            name,
+            url,
+            token,
+            tools: if cfg.all_tools { Vec::new() } else { tools },
+        });
+    }
+    resolved
 }
 
 /// Default Ollama endpoint — the daemon's own default bind.
@@ -1005,8 +1111,8 @@ fn build_rule(r: PolicyRuleFileConfig) -> Option<komo_core::domain::policy::Rule
 mod tests {
     use super::super::ConfigSnapshot;
     use super::super::sources::{
-        ApiFileConfig, ChannelsFileConfig, FileConfig, HomeAssistantChannelFileConfig, Secrets,
-        TelegramFileConfig,
+        ApiFileConfig, ChannelsFileConfig, FileConfig, HomeAssistantChannelFileConfig,
+        McpFileConfig, McpServerFileConfig, Secrets, TelegramFileConfig,
     };
     use super::*;
     use std::path::PathBuf;
@@ -1491,5 +1597,128 @@ mod tests {
             "full key must not appear in Debug output"
         );
         assert!(s.contains("sk-"), "prefix should be visible");
+    }
+
+    /// One `[mcp.servers.<name>]` table plus the resolved snapshot it produces.
+    ///
+    /// Deliberately never sets an env var: `resolve_mcp_servers` reads the
+    /// process environment, which is shared by every test running in parallel.
+    fn with_mcp(name: &str, server: McpServerFileConfig) -> ConfigSnapshot {
+        let mut s = with_deepseek_key(sources());
+        s.file.mcp = Some(McpFileConfig {
+            servers: [(name.to_string(), server)].into_iter().collect(),
+        });
+        ConfigSnapshot::from_sources(s)
+    }
+
+    fn mcp_issues(snap: &ConfigSnapshot) -> Vec<&str> {
+        snap.report
+            .issues
+            .iter()
+            .filter(|i| i.path == "mcp.servers")
+            .map(|i| i.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn mcp_server_with_an_explicit_tool_list_resolves() {
+        let snap = with_mcp(
+            "memos",
+            McpServerFileConfig {
+                url: "https://memos.example.com/mcp".into(),
+                tools: vec!["create_memo".into(), "list_memos".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(snap.runtime.mcp_servers.len(), 1);
+        let server = &snap.runtime.mcp_servers[0];
+        assert_eq!(server.name, "memos");
+        assert_eq!(server.tools, ["create_memo", "list_memos"]);
+        assert!(server.token.is_none());
+        assert!(mcp_issues(&snap).is_empty());
+    }
+
+    #[test]
+    fn mcp_server_without_a_tool_list_mounts_nothing() {
+        // Closed by default, like the HA channel's event filters: a server can
+        // advertise dozens of tools and each one costs a schema every round.
+        let snap = with_mcp(
+            "memos",
+            McpServerFileConfig {
+                url: "https://memos.example.com/mcp".into(),
+                ..Default::default()
+            },
+        );
+        assert!(snap.runtime.mcp_servers.is_empty());
+        let issues = mcp_issues(&snap);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("all_tools"), "{}", issues[0]);
+        // A warning, never fatal — an optional integration must not block boot.
+        assert!(snap.validate_gateway().is_ok());
+        assert!(snap.validate_agent().is_ok());
+    }
+
+    #[test]
+    fn mcp_all_tools_opts_out_of_the_allowlist() {
+        let snap = with_mcp(
+            "memos",
+            McpServerFileConfig {
+                url: "https://memos.example.com/mcp".into(),
+                all_tools: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(snap.runtime.mcp_servers.len(), 1);
+        assert!(
+            snap.runtime.mcp_servers[0].tools.is_empty(),
+            "an empty allowlist is how wiring spells `mount everything`"
+        );
+        assert!(mcp_issues(&snap).is_empty());
+    }
+
+    #[test]
+    fn mcp_server_naming_an_unset_token_var_is_skipped_with_a_warning() {
+        // Naming token_env states the server needs auth; connecting anyway
+        // would turn a clear config warning into a 401 at call time.
+        let snap = with_mcp(
+            "memos",
+            McpServerFileConfig {
+                url: "https://memos.example.com/mcp".into(),
+                token_env: Some("KOMO_TEST_DEFINITELY_UNSET_TOKEN".into()),
+                tools: vec!["create_memo".into()],
+                ..Default::default()
+            },
+        );
+        assert!(snap.runtime.mcp_servers.is_empty());
+        let issues = mcp_issues(&snap);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].contains("KOMO_TEST_DEFINITELY_UNSET_TOKEN"),
+            "{}",
+            issues[0]
+        );
+        assert!(snap.validate_gateway().is_ok());
+    }
+
+    #[test]
+    fn disabled_mcp_server_is_skipped_silently() {
+        let snap = with_mcp(
+            "memos",
+            McpServerFileConfig {
+                enabled: Some(false),
+                url: "https://memos.example.com/mcp".into(),
+                tools: vec!["create_memo".into()],
+                ..Default::default()
+            },
+        );
+        assert!(snap.runtime.mcp_servers.is_empty());
+        assert!(mcp_issues(&snap).is_empty());
+    }
+
+    #[test]
+    fn no_mcp_table_means_no_servers_and_no_issues() {
+        let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
+        assert!(snap.runtime.mcp_servers.is_empty());
+        assert!(mcp_issues(&snap).is_empty());
     }
 }

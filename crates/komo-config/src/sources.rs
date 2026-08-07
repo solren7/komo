@@ -287,6 +287,47 @@ pub struct FileConfig {
     /// Long-term memory knobs (`[memory]`) — currently the embedding backend
     /// that gives L3 recall its cross-language arm.
     pub memory: Option<MemoryFileConfig>,
+    /// External MCP servers (`[mcp.servers.<name>]`) whose tools are mounted
+    /// into the catalog at startup.
+    pub mcp: Option<McpFileConfig>,
+}
+
+/// `[mcp]` namespace: external Model Context Protocol servers.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct McpFileConfig {
+    /// `[mcp.servers.<name>]` tables. A `BTreeMap` so the resolved order is
+    /// the operator's alphabetical order rather than the file's — tool schemas
+    /// are serialized into every request and a provider prompt cache matches on
+    /// exact bytes, so a stable order is worth having for free.
+    pub servers: std::collections::BTreeMap<String, McpServerFileConfig>,
+}
+
+/// One `[mcp.servers.<name>]` table.
+///
+/// Credentials never live here: `token_env` names the variable (in
+/// `~/.komo/.env`) that holds the personal access token.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct McpServerFileConfig {
+    /// Set `false` to keep the table but stop mounting the server. Declaring
+    /// the table at all is the opt-in, so this defaults to **true** — unlike
+    /// `[channels.*]`, which `komo init` scaffolds and which therefore has to
+    /// default off.
+    pub enabled: Option<bool>,
+    /// The server's Streamable HTTP endpoint, e.g. `https://memos.example.com/mcp`.
+    pub url: String,
+    /// Name of the env var holding the bearer token. Omit for a server that
+    /// needs no authentication.
+    pub token_env: Option<String>,
+    /// Which of the server's tools to mount. **Required** unless `all_tools`:
+    /// a server can advertise dozens, every mounted schema is re-sent on every
+    /// round, and a catalog that doubles hurts the model's tool selection.
+    /// Closed by default, like `[channels.homeassistant]`'s event filters.
+    pub tools: Vec<String>,
+    /// Mount everything the server advertises, ignoring `tools`. The escape
+    /// hatch for a small server where enumerating is just noise.
+    pub all_tools: bool,
 }
 
 impl FileConfig {

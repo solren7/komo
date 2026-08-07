@@ -21,6 +21,7 @@ pub mod grep;
 pub mod homeassistant;
 pub mod http;
 pub mod logs;
+pub mod mcp;
 pub mod memory;
 pub mod read;
 pub mod reminder;

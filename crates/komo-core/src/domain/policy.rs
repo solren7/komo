@@ -23,16 +23,20 @@ pub enum Category {
     File,
     Network,
     HomeAssistant,
+    /// Tool calls on external MCP servers, targeted as `server.tool`.
+    Mcp,
 }
 
 impl Category {
-    /// Parse a config string (`shell` / `file` / `network` / `homeassistant`).
+    /// Parse a config string (`shell` / `file` / `network` / `homeassistant` /
+    /// `mcp`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "shell" => Some(Self::Shell),
             "file" => Some(Self::File),
             "network" | "net" => Some(Self::Network),
             "homeassistant" | "ha" => Some(Self::HomeAssistant),
+            "mcp" => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -210,6 +214,12 @@ impl Rule {
                 format!("{domain}.{service}"),
                 None,
             ),
+            ActionRef::Mcp { server, tool } => (
+                Category::Mcp,
+                Matcher::Exact,
+                format!("{server}.{tool}"),
+                None,
+            ),
         };
         Some(Rule {
             channels: Some(vec![channel.to_string()]),
@@ -306,6 +316,9 @@ impl Rule {
             ActionRef::Service { domain, service } => self
                 .matcher
                 .matches(&self.value, &format!("{domain}.{service}")),
+            ActionRef::Mcp { server, tool } => self
+                .matcher
+                .matches(&self.value, &format!("{server}.{tool}")),
         }
     }
 }
@@ -546,6 +559,7 @@ pub fn category_str(c: Category) -> &'static str {
         Category::File => "file",
         Category::Network => "network",
         Category::HomeAssistant => "homeassistant",
+        Category::Mcp => "mcp",
     }
 }
 
@@ -565,6 +579,7 @@ fn category_of(action: &ActionRef) -> Category {
         ActionRef::File { .. } => Category::File,
         ActionRef::Network { .. } => Category::Network,
         ActionRef::Service { .. } => Category::HomeAssistant,
+        ActionRef::Mcp { .. } => Category::Mcp,
     }
 }
 
@@ -1138,6 +1153,88 @@ mod tests {
             p.decide(&shell("rm x", Risk::Dangerous), Some("feishu"))
                 .verdict,
             Verdict::Ask
+        );
+    }
+
+    fn mcp(server: &str, tool: &str) -> ApprovalRequest {
+        ApprovalRequest::normal(format!("call MCP tool `{server}.{tool}`")).with_action(
+            ActionRef::Mcp {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn mcp_rules_target_one_server_and_tool() {
+        let p = Policy::new(
+            vec![rule(
+                Category::Mcp,
+                Matcher::Exact,
+                "memos.list_memos",
+                Effect::Allow,
+            )],
+            Verdict::Ask,
+        );
+        assert_eq!(
+            p.decide(&mcp("memos", "list_memos"), Some("cli")).verdict,
+            Verdict::Allow
+        );
+        // A write on the same server is untouched by a read's grant…
+        assert_eq!(
+            p.decide(&mcp("memos", "create_memo"), Some("cli")).verdict,
+            Verdict::Ask
+        );
+        // …and so is the same tool name on a different server.
+        assert_eq!(
+            p.decide(&mcp("notes", "list_memos"), Some("cli")).verdict,
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn mcp_prefix_rules_can_scope_a_whole_server() {
+        let p = Policy::new(
+            vec![rule(Category::Mcp, Matcher::Prefix, "memos.", Effect::Deny)],
+            Verdict::Allow,
+        );
+        assert_eq!(
+            p.decide(&mcp("memos", "delete_memo"), Some("cli")).verdict,
+            Verdict::Deny
+        );
+        assert_eq!(
+            p.decide(&mcp("notes", "delete_memo"), Some("cli")).verdict,
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn remembering_an_mcp_approval_grants_only_that_tool() {
+        let saved = Rule::narrowest_for(
+            &ActionRef::Mcp {
+                server: "memos".into(),
+                tool: "create_memo".into(),
+            },
+            "cli",
+        )
+        .expect("an mcp action can always be generalized");
+        assert_eq!(saved.category, Category::Mcp);
+        assert_eq!(saved.matcher, Matcher::Exact);
+        assert_eq!(saved.value, "memos.create_memo");
+        assert_eq!(
+            saved.channels.as_deref(),
+            Some(["cli".to_string()].as_slice())
+        );
+
+        let p = Policy::new(vec![saved], Verdict::Ask);
+        assert_eq!(
+            p.decide(&mcp("memos", "create_memo"), Some("cli")).verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.decide(&mcp("memos", "delete_memo"), Some("cli")).verdict,
+            Verdict::Ask,
+            "approving one tool must not grant the server"
         );
     }
 }

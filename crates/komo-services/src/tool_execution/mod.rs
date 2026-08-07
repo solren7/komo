@@ -97,6 +97,10 @@ fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
         "write" | "edit" | "apply_patch" => Some((Category::File, Some(Access::Write))),
         "web_fetch" | "web_search" => Some((Category::Network, None)),
         "homeassistant" => Some((Category::HomeAssistant, None)),
+        // Every mounted MCP tool is named `mcp__<server>__<tool>`, so one
+        // prefix covers them all — a `deny mcp any` rule drops the lot from the
+        // catalog rather than paying a schema each to refuse them per call.
+        name if name.starts_with("mcp__") => Some((Category::Mcp, None)),
         _ => None,
     }
 }

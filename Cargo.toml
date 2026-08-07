@@ -85,6 +85,16 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 unicode-width = "0.2.2"
 # Markdown rendering for agent replies in the chat TUI.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Code-block syntax highlighting in the TUI (syntect + two-face's extended
+# syntax set, pure-Rust regex backend — the pairing must match on both crates).
+syntect = { version = "5.3", default-features = false, features = [
+    "parsing",
+    "regex-fancy",
+    "dump-load",
+] }
+two-face = { version = "0.4", default-features = false, features = [
+    "syntect-fancy",
+] }
 tracing-appender = "0.2.5"
 libc = "0.2.189"
 # `grep`/`glob` are built on ripgrep's own component libraries rather than

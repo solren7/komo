@@ -13,7 +13,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use super::app::{App, PasteChip, Role};
-use super::markdown::markdown_lines;
+use super::markdown::markdown_lines_cached;
 
 const SPINNER: [&str; 4] = ["⠇", "⠋", "⠙", "⠸"];
 
@@ -100,7 +100,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         // Agent replies render as markdown; everything else is plain text
         // behind a colored role prefix.
         if entry.role == Role::Agent {
-            for logical in markdown_lines(&entry.text) {
+            for logical in markdown_lines_cached(&entry.text) {
                 lines.extend(wrap_spans(logical.spans, width));
             }
             lines.push(Line::default());
@@ -485,7 +485,7 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Display width of a string (CJK double-width aware).
-fn display_width(s: &str) -> usize {
+pub(super) fn display_width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 

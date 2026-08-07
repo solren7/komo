@@ -6,6 +6,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   FolderIcon,
+  LeafIcon,
   PencilIcon,
   PlusIcon,
   SettingsIcon,
@@ -36,10 +37,15 @@ export function SessionList({
   mobileOpen,
   onMobileOpenChange,
   onOpenSettings,
+  view,
+  onViewChange,
 }: {
   mobileOpen: boolean;
   onMobileOpenChange: (open: boolean) => void;
   onOpenSettings: () => void;
+  /** Which surface the main area is showing. */
+  view: "chat" | "memory";
+  onViewChange: (view: "chat" | "memory") => void;
 }) {
   const { connected } = useConnection();
   const session = useSession();
@@ -156,6 +162,7 @@ export function SessionList({
             className="min-w-0 flex-1 text-left"
             onClick={() => {
               openSession(item.id, item.workspace ?? DEFAULT_WORKSPACE);
+              onViewChange("chat");
               onMobileOpenChange(false);
             }}
             title={item.id}
@@ -225,7 +232,12 @@ export function SessionList({
         {!collapsed && <span className="flex-1" />}
         {!collapsed && (
           <span
-            className={cn("size-2.5 rounded-full", connected ? "bg-emerald-500" : "bg-destructive")}
+            className={cn(
+              "size-2 rounded-full transition-colors duration-(--duration-base) ease-(--ease-komo)",
+              connected
+                ? "bg-success shadow-[0_0_0_3px_color-mix(in_oklch,var(--success)_18%,transparent)]"
+                : "bg-destructive",
+            )}
             title={connected ? "已连接" : "未连接"}
           />
         )}
@@ -256,6 +268,7 @@ export function SessionList({
           className={collapsed ? "size-9 px-0" : "w-full justify-start shadow-sm"}
           onClick={() => {
             startNewSession();
+            onViewChange("chat");
             onMobileOpenChange(false);
           }}
           title="新建会话"
@@ -336,18 +349,32 @@ export function SessionList({
           collapsed && "flex justify-center",
         )}
       >
-        <Button
-          variant="ghost"
-          className={collapsed ? "size-9 px-0" : "w-full justify-start"}
-          onClick={() => {
-            onOpenSettings();
-            onMobileOpenChange(false);
-          }}
-          title="设置"
-        >
-          <SettingsIcon />
-          {!collapsed && <span>设置</span>}
-        </Button>
+        <div className={cn("flex flex-col gap-0.5", collapsed && "items-center")}>
+          <Button
+            variant={view === "memory" ? "secondary" : "ghost"}
+            className={collapsed ? "size-9 px-0" : "w-full justify-start"}
+            onClick={() => {
+              onViewChange(view === "memory" ? "chat" : "memory");
+              onMobileOpenChange(false);
+            }}
+            title="记忆"
+          >
+            <LeafIcon />
+            {!collapsed && <span>记忆</span>}
+          </Button>
+          <Button
+            variant="ghost"
+            className={collapsed ? "size-9 px-0" : "w-full justify-start"}
+            onClick={() => {
+              onOpenSettings();
+              onMobileOpenChange(false);
+            }}
+            title="设置"
+          >
+            <SettingsIcon />
+            {!collapsed && <span>设置</span>}
+          </Button>
+        </div>
       </div>
     </aside>
   );

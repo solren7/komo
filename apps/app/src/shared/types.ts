@@ -25,6 +25,12 @@ export interface Task {
   created_at: number;
 }
 
+/** A long-term memory, verbatim from `GET /api/memories`.
+ *
+ *  The gateway serializes the whole domain struct, so the usage signals the
+ *  memory system runs on — how often a memory was recalled, and when it was last
+ *  pulled into a prompt — arrive with every row. They are what the canopy
+ *  encodes as light. */
 export interface Memory {
   id: string;
   kind: string;
@@ -32,6 +38,15 @@ export interface Memory {
   status: string;
   confidence: string;
   pinned: boolean;
+  importance: number;
+  /** Times this memory was injected into a prompt by recall. */
+  recall_count: number;
+  /** Unix seconds of the last recall injection; null if never recalled. */
+  last_used_at: number | null;
+  created_at: number;
+  updated_at: number;
+  /** Session id the memory was extracted from. */
+  source: string;
 }
 
 export interface Run {

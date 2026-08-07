@@ -163,12 +163,14 @@ function ChatThread({
         <ThreadPrimitive.Root className="flex min-h-0 min-w-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-5 py-6 sm:px-8">
             <AuiIf condition={(s) => s.thread.isEmpty}>
-              <div className="mx-auto flex w-full max-w-xl flex-1 flex-col justify-center py-10">
-                <KomoLogo className="mb-5 size-10" />
-                <h1 className="text-2xl font-semibold tracking-tight">从一件要紧的事开始</h1>
-                <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-                  让 komo 处理问题、整理上下文，或把下一步变成可执行的行动。
-                </p>
+              <div className="komorebi-dapple flex flex-1 flex-col justify-center">
+                <div className="mx-auto flex w-full max-w-xl flex-col py-10">
+                  <KomoLogo className="mb-5 size-10" />
+                  <h1 className="text-2xl font-semibold tracking-tight">从一件要紧的事开始</h1>
+                  <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+                    让 komo 处理问题、整理上下文，或把下一步变成可执行的行动。
+                  </p>
+                </div>
               </div>
             </AuiIf>
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
@@ -182,7 +184,7 @@ function ChatThread({
                 className="flex items-center gap-2 px-1 text-sm text-muted-foreground"
               >
                 <KomorebiSpinner />
-                <span>Thinking…</span>
+                <span>正在思考…</span>
               </div>
             </AuiIf>
           </ThreadPrimitive.Viewport>

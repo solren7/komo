@@ -10,6 +10,7 @@ export const qk = {
   models: ["models"] as const,
   tasks: ["tasks"] as const,
   memories: (status: string) => ["memories", status] as const,
+  dream: ["dream"] as const,
   runs: (limit: number) => ["runs", limit] as const,
   run: (id: string) => ["run", id] as const,
 };

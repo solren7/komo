@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { FolderIcon, MoonIcon, PanelLeftIcon, SunIcon } from "lucide-react";
+import { FolderIcon, MoonIcon, PanelLeftIcon, PlugZapIcon, SunIcon } from "lucide-react";
 
 import { useConnection } from "@/shared/api/use-connection";
 import { useAppStore, useTheme } from "@/shared/store";
 import { Button } from "@/shared/ui/button";
 import { ChatView } from "@/features/chat/ChatView";
+import { MemoryCanopy } from "@/features/memory/MemoryCanopy";
 import { SessionList } from "@/features/sessions/SessionList";
 import { SettingsModal } from "@/features/settings/SettingsModal";
 
@@ -16,6 +17,7 @@ export function App() {
   const toggleTheme = useAppStore((s) => s.toggleTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [view, setView] = useState<"chat" | "memory">("chat");
   // Visited sessions and the workspace each runs in, keyed by session id.
   //
   // Keyed by id alone — *not* id+workspace — because an unstarted session's
@@ -39,6 +41,8 @@ export function App() {
         mobileOpen={mobileNavOpen}
         onMobileOpenChange={setMobileNavOpen}
         onOpenSettings={() => setSettingsOpen(true)}
+        view={view}
+        onViewChange={setView}
       />
 
       <section className="komo-workspace flex min-w-0 flex-1 flex-col">
@@ -53,12 +57,18 @@ export function App() {
             <PanelLeftIcon />
           </Button>
           <div className="flex min-w-0 items-center gap-2 text-sm">
-            <span className="font-semibold tracking-tight">对话</span>
-            <span className="h-3.5 w-px bg-border" aria-hidden="true" />
-            <FolderIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            <span className="truncate text-xs text-muted-foreground" title={workspace}>
-              {workspace}
+            <span className="font-semibold tracking-tight">
+              {view === "memory" ? "记忆" : "对话"}
             </span>
+            {view === "chat" && (
+              <>
+                <span className="h-3.5 w-px bg-border" aria-hidden="true" />
+                <FolderIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                <span className="truncate text-xs text-muted-foreground" title={workspace}>
+                  {workspace}
+                </span>
+              </>
+            )}
           </div>
           <div className="flex-1" />
           <Button
@@ -72,21 +82,29 @@ export function App() {
         </header>
 
         {!connection.connected && (
-          <div className="shrink-0 border-b border-border bg-amber-500/10 px-4 py-1.5 text-sm text-amber-700 dark:text-amber-400">
-            {connection.error ?? "Connecting…"}
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/12 px-5 py-1.5 text-sm text-warning-foreground">
+            <PlugZapIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>{connection.error ?? "正在连接 gateway…"}</span>
           </div>
         )}
 
         {/* Keep visited runtimes mounted. assistant-ui aborts a request when its
-            runtime unmounts, so navigation must only hide a running thread. */}
+            runtime unmounts, so navigation must only hide a running thread —
+            including navigating away to the memory canopy. */}
         {Object.entries(openThreads).map(([id, threadWorkspace]) => (
           <div
             key={id}
-            className={id === session ? "komo-thread flex min-h-0 min-w-0 flex-1" : "hidden"}
+            className={
+              view === "chat" && id === session
+                ? "komo-thread flex min-h-0 min-w-0 flex-1"
+                : "hidden"
+            }
           >
             <ChatView session={id} workspace={threadWorkspace} />
           </div>
         ))}
+
+        {view === "memory" && <MemoryCanopy />}
       </section>
 
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}

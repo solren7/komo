@@ -85,7 +85,7 @@ impl OperatorActions {
         self.wiki.as_ref().context(
             "no [wiki] configured. Add a vault path to ~/.komo/config.toml:\n\n\
              [wiki]\n\
-             vault = \"~/02-note/01-note\"\n",
+             vault = \"~/notes\"\n",
         )
     }
 

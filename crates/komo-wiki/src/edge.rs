@@ -616,7 +616,7 @@ mod tests {
             .upsert(&[
                 chunk_with_text(
                     "orders.md",
-                    "订单 WMB38554 在 complete 步骤连续提交失败",
+                    "订单 ORD-A1B2C3 在 complete 步骤连续提交失败",
                     vec![1.0, 0.0],
                 ),
                 chunk_with_text(
@@ -630,7 +630,7 @@ mod tests {
 
         // Vector points at `unrelated.md`; the text names the id in `orders.md`.
         let hits = index
-            .search(&[0.0, 1.0], "WMB38554", 5, -1.0)
+            .search(&[0.0, 1.0], "ORD-A1B2C3", 5, -1.0)
             .await
             .unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.chunk.path.as_str()).collect();

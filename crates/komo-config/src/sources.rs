@@ -385,7 +385,7 @@ pub struct MemoryFileConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct WikiFileConfig {
-    /// Vault root, e.g. `~/02-note/01-note`. The switch for the whole feature.
+    /// Vault root, e.g. `~/notes`. The switch for the whole feature.
     pub vault: Option<String>,
     /// `edge` (in-process, default) or `server` (a Qdrant instance).
     pub backend: Option<String>,

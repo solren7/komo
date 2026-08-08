@@ -27,3 +27,7 @@ grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 # Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
 similar = "3.1.1"
+
+[dev-dependencies]
+# Builds throwaway vaults for the indexing tests.
+tempfile = "3"

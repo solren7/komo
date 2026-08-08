@@ -21,3 +21,4 @@ pub mod skill_registry;
 pub mod tool_execution;
 pub mod tool_output_store;
 pub mod wiki_chunking;
+pub mod wiki_indexing;

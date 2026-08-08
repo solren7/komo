@@ -332,18 +332,31 @@ pub async fn build(
     // `delegate` is passed in rather than built here because the sub-agent it
     // runs needs a tool set of its own — built by this same closure with
     // `delegate: None`, which is the structural guard against recursion.
-    // Note-vault search, only when `[wiki]` names a vault. Opened once here
-    // rather than inside the (synchronous) tool closure, and best-effort: a wiki
-    // that will not open — stale path, unreachable Qdrant — costs this one tool,
-    // never the agent, exactly like the memory embedding backend above.
+    // Note-vault search, only when `[wiki]` names a vault. The index opens
+    // lazily, so a backend that is down *right now* — a NAS still booting, a
+    // local-network permission macOS has not granted the launchd job — costs a
+    // retry on the next call rather than this tool for the life of the process
+    // (the catalog is frozen once this returns). Only a `[wiki]` that can never
+    // work, which no amount of retrying fixes, drops the tool outright.
     let mut wiki_ops: Option<crate::services::operator_control::actions::WikiOps> = None;
     let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
-        Some(wiki) => match wiki_index_and_embedder(wiki).await {
+        Some(wiki) => match wiki_handles(wiki) {
             Ok((index, embedder)) => {
-                tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
-                // The same open index backs `komo wiki` over the operator
-                // channel — the gateway holds the only handle, so the CLI has to
-                // borrow it rather than open its own.
+                // Probed once so a wrong url still shows up at boot instead of
+                // on the first search. The outcome is a diagnostic, never a
+                // decision. `{:#}` prints the whole chain: the outermost context
+                // alone says "not reachable", which hides whether the cause was
+                // the network, auth, or a permission the daemon was never given.
+                match index.get().await {
+                    Ok(_) => tracing::info!(vault = %wiki.vault.display(), "wiki_search ready"),
+                    Err(error) => tracing::warn!(
+                        error = format!("{error:#}"),
+                        "wiki index not open — wiki_search retries on each call"
+                    ),
+                }
+                // The same index backs `komo wiki` over the operator channel —
+                // the gateway holds the only handle, so the CLI has to borrow it
+                // rather than open its own.
                 wiki_ops = Some(crate::services::operator_control::actions::WikiOps {
                     index: index.clone(),
                     embedder: embedder.clone(),
@@ -360,7 +373,7 @@ pub async fn build(
                 Some(Arc::new(WikiSearchTool::new(index, embedder)))
             }
             Err(error) => {
-                tracing::warn!(%error, "wiki_search unavailable");
+                tracing::warn!(error = format!("{error:#}"), "wiki_search unavailable");
                 None
             }
         },
@@ -712,29 +725,29 @@ impl Approver for UnattendedDeny {
     }
 }
 
-/// Open the configured note-vault index and its embedding backend.
+/// Build the note-vault handles: a lazily-opened index and its embedding client.
 ///
-/// Kept apart from `build` so the failure is one `Result` the caller can log and
-/// move past: note search is an optional surface, and a vault that will not open
-/// must not stop an agent turn from running.
-async fn wiki_index_and_embedder(
+/// Neither touches the network here, so the only failures left are the ones a
+/// running process can never recover from — a backend name that does not parse,
+/// an embedding url that is not a url. Reaching the vault is deferred to
+/// [`komo_wiki::lazy::LazyWikiIndex`], which retries it per call.
+fn wiki_handles(
     wiki: &komo_config::WikiConfig,
 ) -> anyhow::Result<(
-    Arc<dyn komo_core::domain::wiki::WikiIndex>,
+    Arc<komo_wiki::lazy::LazyWikiIndex>,
     Arc<dyn komo_core::domain::embedding::EmbeddingClient>,
 )> {
-    let index = komo_wiki::build_index(&komo_wiki::WikiSettings {
+    let index = komo_wiki::lazy::LazyWikiIndex::new(komo_wiki::WikiSettings {
         backend: komo_wiki::WikiBackend::parse(&wiki.backend)?,
         data_dir: wiki.data_dir.clone(),
         url: wiki.url.clone(),
         collection: wiki.collection.clone(),
         // Credentials come from the environment, never config.toml.
         api_key: std::env::var("QDRANT_API_KEY").ok(),
-    })
-    .await?;
+    });
     let embedder = komo_infra::embedding::OllamaEmbedder::new(
         wiki.embedding.url.clone(),
         wiki.embedding.model.clone(),
     )?;
-    Ok((index, Arc::new(embedder)))
+    Ok((Arc::new(index), Arc::new(embedder)))
 }

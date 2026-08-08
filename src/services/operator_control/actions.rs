@@ -75,17 +75,25 @@ pub struct OperatorActions {
     pub pairings: Arc<dyn PairingRepository>,
     pub home: Arc<dyn HomeRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
-    /// `None` when `[wiki]` is unconfigured — wiki operations then fail with
-    /// that as the reason rather than looking like an empty vault.
+    /// `None` when `[wiki]` is missing, or present but unusable as written —
+    /// wiki operations then fail with that as the reason rather than looking
+    /// like an empty vault. A vault that is merely *unreachable* is still
+    /// `Some`: opening retries per call, so it must not read as unconfigured.
     pub wiki: Option<WikiOps>,
 }
 
 impl OperatorActions {
     fn wiki(&self) -> anyhow::Result<&WikiOps> {
+        // Both causes are named because this used to claim the first one only,
+        // which sent an operator who *had* configured a vault off to add the
+        // section they already had.
         self.wiki.as_ref().context(
-            "no [wiki] configured. Add a vault path to ~/.komo/config.toml:\n\n\
+            "wiki unavailable: ~/.komo/config.toml has no [wiki] section, or has one \
+             komo could not use.\n\n\
              [wiki]\n\
-             vault = \"~/notes\"\n",
+             vault = \"~/notes\"\n\n\
+             If it is configured, the gateway log gives the reason — `komo logs | \
+             grep wiki`.\n",
         )
     }
 

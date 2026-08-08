@@ -409,20 +409,27 @@ impl SystemPromptBuilder {
         join(parts)
     }
 
-    /// Context tier: first project instruction file found in the workspace,
-    /// head-truncated. Stable within a session, may differ session-to-session.
+    /// Context tier: the workspace root, then the first project instruction file
+    /// found in it, head-truncated. Stable within a session, may differ
+    /// session-to-session.
     fn context(&self) -> String {
         let Some(root) = &self.workspace_root else {
             return String::new();
         };
+        // Naming the directory is what lets a "found nothing" answer say *where*
+        // it looked. Unnamed, the model can only offer "the working directory",
+        // which a user reads as their project — and under launchd that directory
+        // is `~/.komo`, so the answer is true and completely misleading at once.
+        let mut parts = vec![format!("Working directory: {}", root.display())];
         for name in CONTEXT_FILES {
             if let Some(text) = read_instructions(&root.join(name)) {
-                return format!(
+                parts.push(format!(
                     "The following are project instructions from `{name}` in the working directory:\n\n{text}"
-                );
+                ));
+                break;
             }
         }
-        String::new()
+        join(parts)
     }
 
     /// Volatile tier: day-precision date + model + provider. Kept last so the
@@ -879,6 +886,22 @@ mod tests {
             .build();
         assert!(p.contains("project instructions from `AGENTS.md`"));
         assert!(p.contains("Prefer bullet points."));
+    }
+
+    /// Named even when no instruction file is there: an answer that found
+    /// nothing still has to be able to say where it looked.
+    #[test]
+    fn workspace_root_is_named_even_without_an_instruction_file() {
+        let home = tmp("wsroot_home");
+        let root = tmp("wsroot_root");
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .workspace_root(Some(root.clone()))
+            .build();
+        assert!(
+            p.contains(&format!("Working directory: {}", root.display())),
+            "prompt should name the workspace root: {p}"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
 komo memory list|search|promote|reject|pin|triage|report|repair-scopes
+komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`)
 komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
@@ -117,6 +118,10 @@ fork — add new operator actions there, not in the CLI or api handlers.
 (default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
+`[wiki]` — `vault` (the note directory; absent = no `wiki_search` tool),
+`backend` (`edge` default / `server`), `url` + `collection` for the server
+backend, and its own `embedding_model`/`embedding_url` (falling back to
+`[memory]`'s when unset); `QDRANT_API_KEY` lives in `.env` —
 and `[mcp.servers.<name>]` — external MCP servers: `url`, `token_env` (names
 the `.env` var, never the token), and a **required** `tools` allowlist
 (or `all_tools = true`), closed by default because every mounted tool's schema
@@ -189,10 +194,12 @@ komo-core      traits + value types, no I/O, no runtime — the GUI client reuse
 komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot   (→ core)
 komo-provider  wire formats + HTTP/SSE; references nothing else in komo
 komo-mcp       MCP client over rmcp (Streamable HTTP); ditto — nothing komo
+komo-wiki      note-vault vector index: edge (qdrant-edge, in-process) /
+               server (Qdrant over gRPC) / lazy                        (→ core)
 komo-infra     persistence · memory · skills · logs · workday ·
-               permissions_store · codex                     (→ core, config, provider)
+               permissions_store · codex · embedding         (→ core, config, provider)
 komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
-               skill_registry · cron_actions ·
+               skill_registry · cron_actions · wiki_indexing ·
                diff/patch/search/file_mutation                (→ core, config)
 komo-tools     every tool                      (→ core, infra, mcp, services)
 komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
@@ -308,6 +315,22 @@ call the same functions, which is what keeps validation from forking.
   (TUI/desktop/web all ride it), so channel-scoping there makes a memory
   unrecallable from the next turn — those writes go `Global`. Memories written
   before this are repaired by `komo memory repair-scopes`.
+- `domain/wiki.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
+  `komo-tools`' `wiki_search` — semantic search over the operator's note vault
+  (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
+  a vault dwarfs the memory store, so a turn that does not search pays nothing.
+  Two interchangeable backends behind `WikiIndex`, chosen by `[wiki] backend`:
+  `edge` (qdrant-edge, in-process, the default) and `server` (Qdrant over gRPC,
+  for sharing one collection across processes). They speak the same data model,
+  so an index built by one is readable by the other — but **nothing migrates**,
+  and a switch leaves the new backend empty until `komo wiki index` refills it.
+  Retrieval is hybrid (BM25 fused with dense), capped per note so one long file
+  cannot crowd out a result set. `LazyWikiIndex` opens the backend on first use
+  and retries per call: wiring is one-shot, so an eager open that failed would
+  cost `wiki_search` for the life of the process — and the usual causes (a NAS
+  still booting, a local-network permission the launchd job lacks) get fixed
+  while the gateway keeps running. The gateway holds the only handle, so
+  `komo wiki` borrows it through `operator_control` rather than opening its own.
 - `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never

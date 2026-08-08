@@ -471,10 +471,15 @@ struct ApiError(anyhow::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        warn!(error = %self.0, "api request failed");
+        // `{:#}` renders the whole context chain. The outermost line alone is
+        // the *least* specific thing known about the failure — "qdrant is not
+        // reachable" hides the "no route to host" underneath that says which
+        // kind of unreachable it was.
+        let message = format!("{:#}", self.0);
+        warn!(error = %message, "api request failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
+            Json(json!({ "error": message })),
         )
             .into_response()
     }

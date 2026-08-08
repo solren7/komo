@@ -38,6 +38,31 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// should fall back to the db fast, not hang the CLI.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Fail with the reason the gateway gave, not merely its status code.
+///
+/// `reqwest`'s `error_for_status` throws the response body away — and the body
+/// is exactly where `ApiError` puts the reason. Every gateway-side failure
+/// therefore reached the operator as a bare "500 Internal Server Error" with
+/// nothing to act on, while the real cause sat in the gateway log.
+///
+/// Callers that special-case a status (404, 409) still check it first; this only
+/// has to turn *unhandled* failures into something readable.
+async fn checked(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let reason = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+        .unwrap_or(body);
+    match reason.trim() {
+        "" => anyhow::bail!("gateway returned {status}"),
+        reason => anyhow::bail!("{reason}"),
+    }
+}
+
 /// Encode a locally chosen directory for the gateway's workspace header.
 ///
 /// The gateway accepts this form only from loopback callers, canonicalizes it,
@@ -149,15 +174,13 @@ impl GatewayClient {
 
     /// GET `path` and pull `key` out of the `{ "<key>": T }` envelope.
     async fn get_field<T: DeserializeOwned>(&self, path: &str, key: &str) -> anyhow::Result<T> {
-        let mut map: Map<String, Value> = self
+        let resp = self
             .http
             .get(self.url(path))
             .bearer_auth(&self.key)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
         let val = map
             .remove(key)
             .with_context(|| format!("gateway response missing `{key}`"))?;
@@ -194,7 +217,7 @@ impl GatewayClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let mut map: Map<String, Value> = resp.error_for_status()?.json().await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
         let run: Run = serde_json::from_value(
             map.remove("run")
                 .context("gateway response missing `run`")?,
@@ -229,7 +252,7 @@ impl GatewayClient {
             }
             _ => {}
         }
-        Ok(resp.error_for_status()?.json().await?)
+        Ok(checked(resp).await?.json().await?)
     }
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
@@ -242,15 +265,8 @@ impl GatewayClient {
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("gateway base URL cannot contain a path"))?
             .extend(["api", "sessions", id, "messages"]);
-        let mut map: Map<String, Value> = self
-            .http
-            .get(url)
-            .bearer_auth(&self.key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp = self.http.get(url).bearer_auth(&self.key).send().await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
         let messages = map
             .remove("messages")
             .context("gateway response missing `messages`")?;
@@ -280,15 +296,13 @@ impl GatewayClient {
     /// The dreaming dry-run: actionable candidate lists and the total number
     /// under observation. `candidate_count` defaults for an older gateway.
     pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
-        let mut map: Map<String, Value> = self
+        let resp = self
             .http
             .get(self.url("/api/dream"))
             .bearer_auth(&self.key)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
         let take = |map: &mut Map<String, Value>, k: &str| -> anyhow::Result<Vec<DreamItem>> {
             Ok(serde_json::from_value(
                 map.remove(k).unwrap_or_else(|| Value::Array(vec![])),
@@ -320,7 +334,7 @@ impl GatewayClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no memory with id `{id}`");
         }
-        resp.error_for_status()?;
+        checked(resp).await?;
         Ok(())
     }
 
@@ -345,7 +359,7 @@ impl GatewayClient {
                  Restart it onto the current binary (`komo gateway restart`) and retry."
             );
         }
-        Ok(resp.error_for_status()?.json().await?)
+        Ok(checked(resp).await?.json().await?)
     }
 
     /// [`post_json`], pulling one field out of the `{ "<field>": T }` envelope.
@@ -399,16 +413,14 @@ impl GatewayClient {
         &self,
         rebuild: bool,
     ) -> anyhow::Result<komo_core::operator_view::WikiIndexView> {
-        let mut map: Map<String, Value> = self
+        let resp = self
             .streaming_http
             .post(self.url("/api/wiki/index"))
             .bearer_auth(&self.key)
             .json(&json!({ "rebuild": rebuild }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
         let val = map
             .remove("outcome")
             .context("gateway reply had no `outcome`")?;
@@ -602,7 +614,7 @@ impl GatewayClient {
         } else {
             request
         };
-        let mut resp = request.json(&body).send().await?.error_for_status()?;
+        let mut resp = checked(request.json(&body).send().await?).await?;
 
         let mut reply = String::new();
         let mut buf = String::new();

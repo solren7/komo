@@ -24,6 +24,7 @@ use std::sync::Arc;
 use komo_core::domain::wiki::WikiIndex;
 
 pub mod edge;
+pub mod lazy;
 pub mod payload;
 pub mod server;
 

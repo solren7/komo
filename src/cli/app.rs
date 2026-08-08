@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 use super::{
     channel, doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair,
-    policy, resume, service, skill, upgrade, wechat, workday,
+    policy, resume, service, skill, upgrade, wechat, wiki, workday,
 };
 
 #[derive(Parser)]
@@ -70,6 +70,11 @@ enum Commands {
         /// Apply the cycle (mutate the store). Without it, this is a dry run.
         #[arg(long)]
         apply: bool,
+    },
+    /// Build and inspect the note-vault search index (`[wiki]` in config.toml)
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
     },
     /// Inspect and govern skills
     Skills {
@@ -303,6 +308,30 @@ enum RunAction {
         #[arg(long, conflicts_with = "before")]
         keep: Option<usize>,
     },
+}
+
+#[derive(Subcommand)]
+enum WikiAction {
+    /// Index the vault. Incremental by default: files whose mtime is unchanged
+    /// are skipped without being read or embedded.
+    Index {
+        /// Re-embed every file, ignoring what is already indexed. Needed after
+        /// changing the embedding model — vectors from different models are not
+        /// comparable.
+        #[arg(long)]
+        rebuild: bool,
+    },
+    /// Query the index the way the `wiki_search` tool does — same embedding,
+    /// same score floor — to see what a turn would get back
+    Search {
+        /// What to look for
+        query: String,
+        /// Passages to show
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Show what is indexed: backend, model, file and chunk counts
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -570,6 +599,11 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,
+        Some(Commands::Wiki { action }) => match action {
+            WikiAction::Index { rebuild } => wiki::index(&config, rebuild).await,
+            WikiAction::Search { query, limit } => wiki::search(&config, &query, limit).await,
+            WikiAction::Status => wiki::status(&config).await,
+        },
         Some(Commands::Skills { action }) => match action {
             SkillsAction::List => skill::list(),
             SkillsAction::Install { source } => skill::install(&source).await,

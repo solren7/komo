@@ -18,6 +18,7 @@ mod service;
 mod skill;
 mod upgrade;
 mod wechat;
+mod wiki;
 pub(crate) mod wiring;
 mod workday;
 

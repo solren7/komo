@@ -133,6 +133,9 @@ pub struct RuntimeConfig {
     /// Embedding backend for cross-language memory recall; `None` = off, recall
     /// stays lexical-only.
     pub embedding: Option<EmbeddingConfig>,
+    /// Note-vault search (`[wiki]`); `None` = not configured, the `wiki_search`
+    /// tool is not registered.
+    pub wiki: Option<WikiConfig>,
     /// The permission policy plus its load diagnostics.
     pub policy: PolicyReport,
     /// Extra skill directories from `KOMO_SKILLS_PATH` (colon-separated),
@@ -184,6 +187,27 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Ollama base URL.
     pub url: String,
+}
+
+/// Resolved `[wiki]` note-vault search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiConfig {
+    /// Root of the note vault, `~` expanded. The switch for the whole feature:
+    /// no vault, no wiki.
+    pub vault: PathBuf,
+    /// Backend selector, validated by `komo-wiki` (`edge` or `server`). Kept as
+    /// a string here so `komo-config` does not depend on the vector crate.
+    pub backend: String,
+    /// Where the embedded backend keeps its files (`~/.komo/wiki`). Disposable.
+    pub data_dir: PathBuf,
+    /// Qdrant endpoint, used only by the `server` backend.
+    pub url: String,
+    /// Collection name, shared by both backends so an index is portable.
+    pub collection: String,
+    /// Embedding backend for the vault. Falls back to `[memory]`'s when `[wiki]`
+    /// declares no model, so the common case configures one model, and a vault
+    /// that wants a bigger one can say so without touching recall.
+    pub embedding: EmbeddingConfig,
 }
 
 /// One ingress channel's resolved state.
@@ -751,6 +775,11 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     };
 
     let db_url = |file: &str| format!("turso:{}", home.join(file).display());
+    // Resolved before the struct literal because `wiki` falls back to the
+    // `[memory]` backend when it declares no model of its own.
+    let embedding = resolve_embedding(file.memory);
+    let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &home, &mut issues);
+
     let runtime = RuntimeConfig {
         db_url: db_url("state.db"),
         kanban_db_url: db_url("kanban.db"),
@@ -772,7 +801,8 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .or(file.briefing_workdays_only)
             .unwrap_or(false),
         dream_schedule: resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
-        embedding: resolve_embedding(file.memory),
+        embedding,
+        wiki,
         policy,
         skills_path,
         readable_roots,
@@ -897,6 +927,107 @@ fn resolve_embedding(memory: Option<crate::sources::MemoryFileConfig>) -> Option
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| DEFAULT_EMBEDDING_URL.to_string()),
+    })
+}
+
+/// Default Qdrant gRPC endpoint (the server's own default bind).
+const DEFAULT_QDRANT_URL: &str = "http://127.0.0.1:6334";
+/// Default collection name, shared by both backends.
+const DEFAULT_WIKI_COLLECTION: &str = "komo_wiki";
+
+/// Expand a leading `~/` against the **real** home, not `KOMO_HOME`: a vault is
+/// the operator's own directory and does not move when komo's home is relocated.
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+/// Resolve the `[wiki]` table.
+///
+/// `vault` is the switch: no `[wiki]`, or no vault path, means the feature is
+/// off and `wiki_search` is never registered — the same shape as `[memory]`'s
+/// `embedding_model`.
+///
+/// A vault with no embedding backend anywhere is a *warning*, not a fatal:
+/// booting without note search is survivable, and a fatal here would take the
+/// whole gateway down over an optional feature. It returns `None` so nothing
+/// downstream sees a half-configured wiki.
+fn resolve_wiki(
+    wiki: Option<crate::sources::WikiFileConfig>,
+    memory_embedding: Option<&EmbeddingConfig>,
+    home: &std::path::Path,
+    issues: &mut Vec<ConfigIssue>,
+) -> Option<WikiConfig> {
+    let wiki = wiki?;
+    let vault = wiki
+        .vault
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+
+    let own_model = wiki
+        .embedding_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let own_url = wiki
+        .embedding_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+
+    let embedding = match (own_model, memory_embedding) {
+        // An explicit `[wiki] embedding_model` wins; its url falls back to
+        // `[memory]`'s so pointing both at one Ollama host stays a one-liner.
+        (Some(model), inherited) => EmbeddingConfig {
+            model: model.to_string(),
+            url: own_url
+                .map(str::to_string)
+                .or_else(|| inherited.map(|e| e.url.clone()))
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_URL.to_string()),
+        },
+        (None, Some(inherited)) => inherited.clone(),
+        (None, None) => {
+            issues.push(ConfigIssue {
+                path: "wiki",
+                severity: IssueSeverity::Warning,
+                message: "[wiki] declares a vault but no embedding model, and \
+                          [memory] has none to inherit — note search is off"
+                    .to_string(),
+            });
+            return None;
+        }
+    };
+
+    Some(WikiConfig {
+        vault: expand_home(vault),
+        backend: wiki
+            .backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .unwrap_or("edge")
+            .to_string(),
+        data_dir: home.join("wiki"),
+        url: wiki
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or(DEFAULT_QDRANT_URL)
+            .to_string(),
+        collection: wiki
+            .collection
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or(DEFAULT_WIKI_COLLECTION)
+            .to_string(),
+        embedding,
     })
 }
 

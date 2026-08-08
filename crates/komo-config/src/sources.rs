@@ -290,6 +290,8 @@ pub struct FileConfig {
     /// External MCP servers (`[mcp.servers.<name>]`) whose tools are mounted
     /// into the catalog at startup.
     pub mcp: Option<McpFileConfig>,
+    /// Note-vault search (`[wiki]`).
+    pub wiki: Option<WikiFileConfig>,
 }
 
 /// `[mcp]` namespace: external Model Context Protocol servers.
@@ -375,6 +377,27 @@ pub struct MemoryFileConfig {
     /// model — an English-only one reintroduces the very gap this closes.
     pub embedding_model: Option<String>,
     /// Ollama base URL (default `http://127.0.0.1:11434`).
+    pub embedding_url: Option<String>,
+}
+
+/// `[wiki]` table: vector search over the operator's note vault. Absent, or
+/// present without `vault`, means the feature is off.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct WikiFileConfig {
+    /// Vault root, e.g. `~/02-note/01-note`. The switch for the whole feature.
+    pub vault: Option<String>,
+    /// `edge` (in-process, default) or `server` (a Qdrant instance).
+    pub backend: Option<String>,
+    /// Qdrant gRPC endpoint, `server` backend only.
+    pub url: Option<String>,
+    /// Collection name; shared by both backends so an index stays portable.
+    pub collection: Option<String>,
+    /// Embedding model for the vault. Absent = inherit `[memory]`'s, which keeps
+    /// one model resident instead of two. Set it when the vault warrants a
+    /// bigger model than recall does.
+    pub embedding_model: Option<String>,
+    /// Embedding base URL; absent = inherit `[memory]`'s.
     pub embedding_url: Option<String>,
 }
 

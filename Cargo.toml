@@ -22,6 +22,9 @@ komo-tools = { path = "crates/komo-tools" }
 komo-mcp = { path = "crates/komo-mcp" }
 # The agent: tool loop, gateway, sweeps, and the provider client it drives.
 komo-agent = { path = "crates/komo-agent" }
+# Note-vault vector search. Its own crate so its ~130 vector dependencies stay
+# off every other crate's compile path — only this wiring layer sees them.
+komo-wiki = { path = "crates/komo-wiki" }
 clap = { version = "4.6.4", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
@@ -134,6 +137,7 @@ members = [
     "crates/komo-services",
     "crates/komo-tools",
     "crates/komo-agent",
+    "crates/komo-wiki",
 ]
 resolver = "3"
 
@@ -175,3 +179,14 @@ reqwest = { version = "0.13", default-features = false, features = [
 # stock struct drops the whole message) + payload snippet in the ws error log.
 [patch.crates-io]
 open-lark = { path = "vendor/open-lark" }
+
+# Vendored qdrant-edge 0.8.0 with `parking_lot/deadlock_detection` removed from
+# its dependency features. That feature is mutually exclusive with `send_guard`,
+# which turso_sdk_kit requires, and cargo unifies features across the graph — so
+# stock qdrant-edge and komo's own database layer cannot compile together.
+# Neither crate exposes a switch for it (qdrant-edge has no `[features]` table
+# at all), so patching the manifest is the only seam.
+#
+# Source is otherwise untouched: qdrant-edge never calls the `parking_lot`
+# deadlock API — every mention of "deadlock" in it is a comment.
+qdrant-edge = { path = "vendor/qdrant-edge" }

@@ -42,6 +42,7 @@ use komo_tools::time::TimeTool;
 use komo_tools::todo::TodoTool;
 use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
+use komo_tools::wiki_search::WikiSearchTool;
 use komo_tools::write::WriteTool;
 use std::sync::Arc;
 
@@ -328,6 +329,25 @@ pub async fn build(
     // `delegate` is passed in rather than built here because the sub-agent it
     // runs needs a tool set of its own — built by this same closure with
     // `delegate: None`, which is the structural guard against recursion.
+    // Note-vault search, only when `[wiki]` names a vault. Opened once here
+    // rather than inside the (synchronous) tool closure, and best-effort: a wiki
+    // that will not open — stale path, unreachable Qdrant — costs this one tool,
+    // never the agent, exactly like the memory embedding backend above.
+    let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> =
+        match &config.runtime.wiki {
+            Some(wiki) => match wiki_index_and_embedder(wiki).await {
+                Ok((index, embedder)) => {
+                    tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
+                    Some(Arc::new(WikiSearchTool::new(index, embedder)))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "wiki_search unavailable");
+                    None
+                }
+            },
+            None => None,
+        };
+
     let build_full_tools =
         |approver: Arc<dyn Approver>, delegate: Option<Arc<DelegateTool>>| -> ToolExecutor {
             let mut tools = ToolExecutor::new(
@@ -347,6 +367,11 @@ pub async fn build(
             tools.register(Arc::new(ShellTool::new(workspace.clone())));
             tools.register(Arc::new(WebFetchTool::new()));
             tools.register(Arc::new(WebSearchTool::new()));
+            // Note-vault search, present only when `[wiki]` named a usable vault
+            // (opened once above — this closure is synchronous).
+            if let Some(tool) = wiki_tool.clone() {
+                tools.register(tool);
+            }
             // komo's own tracing log, so a failed tool call can be diagnosed
             // from the `tool` span in the same conversation that hit it.
             tools.register(Arc::new(LogsTool));
@@ -665,4 +690,31 @@ impl Approver for UnattendedDeny {
              `unattended = true` 的 [policy] 允许规则才会放行；请改用不需要审批的做法。",
         )
     }
+}
+
+/// Open the configured note-vault index and its embedding backend.
+///
+/// Kept apart from `build` so the failure is one `Result` the caller can log and
+/// move past: note search is an optional surface, and a vault that will not open
+/// must not stop an agent turn from running.
+async fn wiki_index_and_embedder(
+    wiki: &komo_config::WikiConfig,
+) -> anyhow::Result<(
+    Arc<dyn komo_core::domain::wiki::WikiIndex>,
+    Arc<dyn komo_core::domain::embedding::EmbeddingClient>,
+)> {
+    let index = komo_wiki::build_index(&komo_wiki::WikiSettings {
+        backend: komo_wiki::WikiBackend::parse(&wiki.backend)?,
+        data_dir: wiki.data_dir.clone(),
+        url: wiki.url.clone(),
+        collection: wiki.collection.clone(),
+        // Credentials come from the environment, never config.toml.
+        api_key: std::env::var("QDRANT_API_KEY").ok(),
+    })
+    .await?;
+    let embedder = komo_infra::embedding::OllamaEmbedder::new(
+        wiki.embedding.url.clone(),
+        wiki.embedding.model.clone(),
+    )?;
+    Ok((index, Arc::new(embedder)))
 }

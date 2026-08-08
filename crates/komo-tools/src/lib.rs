@@ -33,4 +33,5 @@ pub mod time;
 pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
+pub mod wiki_search;
 pub mod write;

@@ -12,3 +12,5 @@ toml = { workspace = true }
 # `KOMO_*` environment overrides, the highest-precedence config source.
 envy = { workspace = true }
 uuid = { workspace = true }
+# Expands a `~/` vault path against the real home (not KOMO_HOME).
+dirs = { workspace = true }

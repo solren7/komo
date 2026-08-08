@@ -85,11 +85,17 @@ fn unsupported(action: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 mod launchd {
-    use std::path::PathBuf;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     const LABEL: &str = "com.komo.gateway";
     const LEGACY_LABEL: &str = "com.shion.gateway";
+    const BUNDLE_INFO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/macos/Info.plist"
+    ));
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
     /// Render the LaunchAgent plist. Pure so the XML is unit-testable.
     /// `exe` is the absolute komo binary path; `log_dir` holds stdout/stderr logs;
@@ -106,6 +112,10 @@ mod launchd {
 <dict>
     <key>Label</key>
     <string>{LABEL}</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>{LABEL}</string>
+    </array>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -145,6 +155,101 @@ mod launchd {
 
     fn plist_path() -> anyhow::Result<PathBuf> {
         plist_path_for(LABEL)
+    }
+
+    fn gateway_app_path_for(home: &Path) -> PathBuf {
+        home.join("Applications").join("Komo Gateway.app")
+    }
+
+    fn gateway_exe_path(app: &Path) -> PathBuf {
+        app.join("Contents").join("MacOS").join("komo-gateway")
+    }
+
+    fn has_gateway_identity(app: &Path) -> bool {
+        Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=2"])
+            .arg(app)
+            .output()
+            .map(|out| {
+                let details = String::from_utf8_lossy(&out.stderr);
+                out.status.success()
+                    && details.contains("Identifier=com.komo.gateway")
+                    && details.contains("Info.plist entries=")
+            })
+            .unwrap_or(false)
+    }
+
+    fn remove_bundle(path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn install_gateway_app(source: &Path, destination: &Path) -> anyhow::Result<()> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("gateway app path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        let uid = String::from_utf8_lossy(&Command::new("/usr/bin/id").arg("-u").output()?.stdout)
+            .trim()
+            .parse::<u32>()?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o022 != 0
+        {
+            anyhow::bail!(
+                "gateway app directory must be owned by the current user and not group/other-writable: {}",
+                parent.display()
+            );
+        }
+
+        let staging = parent.join(format!(".Komo Gateway.{}.tmp.app", uuid::Uuid::now_v7()));
+        let result = (|| -> anyhow::Result<()> {
+            let contents = staging.join("Contents");
+            let macos = contents.join("MacOS");
+            std::fs::create_dir_all(&macos)?;
+            std::fs::copy(source, macos.join("komo-gateway"))?;
+            std::fs::write(contents.join("Info.plist"), BUNDLE_INFO)?;
+
+            let out = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&staging)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "failed to sign gateway app: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+
+            if !has_gateway_identity(&staging) {
+                anyhow::bail!("signed gateway app has no com.komo.gateway identity");
+            }
+
+            remove_bundle(destination)?;
+            std::fs::rename(&staging, destination)?;
+
+            let out = Command::new(LSREGISTER)
+                .arg("-f")
+                .arg(destination)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "failed to register gateway app: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = remove_bundle(&staging);
+        }
+        result
     }
 
     /// `gui/<uid>` launchd domain for the current user.
@@ -227,9 +332,14 @@ mod launchd {
         }
 
         let exe = std::env::current_exe()?;
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
         let komo_home = komo_config::ensure_komo_home();
         let log_dir = komo_home.join("logs");
         std::fs::create_dir_all(&log_dir)?;
+        let gateway_app = gateway_app_path_for(&home);
+        let gateway_exe = gateway_exe_path(&gateway_app);
+        install_gateway_app(&exe, &gateway_app)?;
 
         let path = plist_path()?;
         if let Some(parent) = path.parent() {
@@ -238,7 +348,7 @@ mod launchd {
         std::fs::write(
             &path,
             render_plist(
-                &exe.display().to_string(),
+                &gateway_exe.display().to_string(),
                 &log_dir.display().to_string(),
                 &komo_home.display().to_string(),
             ),
@@ -323,6 +433,7 @@ mod launchd {
                 "/Users/me/.komo",
             );
             assert!(plist.contains("<string>com.komo.gateway</string>"));
+            assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
             assert!(plist.contains("<string>/usr/local/bin/komo</string>"));
             assert!(plist.contains("<string>gateway</string>"));
             assert!(plist.contains("<key>KeepAlive</key>"));
@@ -336,6 +447,25 @@ mod launchd {
             let plist = render_plist("/odd<&>path/komo", "/logs", "/work");
             assert!(plist.contains("/odd&lt;&amp;&gt;path/komo"));
             assert!(!plist.contains("/odd<&>path"));
+        }
+
+        #[test]
+        fn managed_gateway_executable_lives_in_an_app_bundle() {
+            let app = gateway_app_path_for(Path::new("/Users/me"));
+            assert_eq!(
+                gateway_exe_path(&app),
+                PathBuf::from(
+                    "/Users/me/Applications/Komo Gateway.app/Contents/MacOS/komo-gateway"
+                )
+            );
+        }
+
+        #[test]
+        fn gateway_bundle_declares_its_identity_and_local_network_usage() {
+            let plist = String::from_utf8_lossy(BUNDLE_INFO);
+            assert!(plist.contains("<string>com.komo.gateway</string>"));
+            assert!(plist.contains("<key>CFBundleExecutable</key>"));
+            assert!(plist.contains("<key>NSLocalNetworkUsageDescription</key>"));
         }
     }
 }

@@ -64,7 +64,15 @@ impl Tool for WikiSearchTool {
          the user refers to something they wrote down, asks what they concluded \
          or decided previously, or when their own notes would answer better than \
          general knowledge. Matches across languages — a Chinese question finds \
-         an English note."
+         an English note.\n\
+         This answers \"what did I write about X\", never \"what is in the \
+         vault\". An inventory question has no passage that matches it: the \
+         vault's own index, dashboard and README-style files outrank every real \
+         note, so searching returns a table of contents in fragments and the \
+         answer silently omits whatever those files forgot to list. To report \
+         coverage, `read` the vault's index/dashboard file whole (the vault root \
+         usually names one) and list the directories — do not assemble it from \
+         search hits."
     }
 
     fn parameters_schema(&self) -> Value {

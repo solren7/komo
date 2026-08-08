@@ -149,12 +149,12 @@ enum ChannelAction {
     },
     /// Check credentials and connectivity without sending a message
     Probe {
-        /// Channel: feishu | telegram | wechat | homeassistant | api
+        /// Channel: feishu | telegram | wechat | api
         channel: String,
     },
     /// Interactively configure an ingress channel and its credentials
     Setup {
-        /// Channel: feishu | telegram | wechat | homeassistant
+        /// Channel: feishu | telegram | wechat
         channel: String,
     },
     /// WeChat (微信) channel operator commands

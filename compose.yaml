@@ -60,8 +60,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # The gateway needs no published port for Telegram, Feishu, WeChat, or
-    # Home Assistant. To expose Komo's HTTP API, first configure:
+    # The gateway needs no published port for Telegram, Feishu, or WeChat.
+    # To expose Komo's HTTP API, first configure:
     #
     #   [channels.api]
     #   enabled = true

@@ -75,7 +75,7 @@ The gateway hosts chat/event ingress and scheduled maintenance:
 - one-shot and recurring reminder delivery
 - task due notifications
 - optional daily briefing
-- Feishu, Telegram, WeChat, and Home Assistant channels when configured
+- Feishu, Telegram, and WeChat channels when configured
 
 ```bash
 komo gateway start              # macOS only: install + start under launchd
@@ -160,11 +160,6 @@ home_chat = "oc_xxx"
 enabled = true
 allow_from = ["wxid_xxx"]
 
-[channels.homeassistant]
-enabled = true
-watch_domains = ["binary_sensor", "lock"]
-cooldown_seconds = 30
-
 # Permission policy: auto-allow / hard-deny side-effecting actions instead of
 # prompting for each one. Deny beats allow; anything unmatched falls back to
 # `default_normal` (ask). Read-only actions (web fetches, file reads) are
@@ -224,7 +219,7 @@ Use `komo channel list` to see resolved configuration and the channels loaded by
 the running gateway; add `--json` for scripts. `komo channel probe <channel>`
 validates a configured provider without sending a message, and `komo channel
 setup <channel>` interactively writes credentials and the corresponding channel
-table for Feishu, Telegram, WeChat, or Home Assistant. The API channel remains
+table for Feishu, Telegram, or WeChat. The API channel remains
 loopback-only by default and must be exposed manually in `config.toml`.
 
 WeChat is QR-based: run `komo channel wechat login` on the host, or send `/wechat login`
@@ -269,7 +264,7 @@ src/
 │   ├── llm.rs · codex.rs · rig_tool.rs       # rig backend + Codex OAuth provider
 │   ├── persistence/       # toasty/Turso: state.db + kanban.db
 │   ├── memory/            # memory.db (+ legacy markdown import)
-│   ├── messaging/         # feishu · telegram · wechat · homeassistant · api · notifiers
+│   ├── messaging/         # feishu · telegram · wechat · api · notifiers
 │   └── skills.rs · skill_install.rs · gateway_client.rs · rendezvous.rs · workday.rs
 ├── tools/                 # built-in tools (shell, file, web, task, memory, skill, …)
 ├── cli/                   # subcommands; wiring.rs assembles the AgentRuntime

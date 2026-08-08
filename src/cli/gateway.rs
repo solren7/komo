@@ -28,7 +28,6 @@ use crate::{
         api::ApiChannel,
         feishu::{FeishuChannel, FeishuSender},
         home_notifier::{HomeNotifier, TextSender},
-        homeassistant::HomeAssistantChannel,
         macos_notifier::MacosNotifier,
         telegram::{TelegramChannel, TelegramSender},
         wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
@@ -326,17 +325,9 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         )));
         channels.push("wechat");
     }
-    // Whether an interactive chat channel exists — gates the shutdown notice
-    // (HA is event-only, so an HA-only gateway must not pop a macOS notice).
+    // Whether an interactive chat channel exists — gates the shutdown notice.
+    // Only chat channels are pushed above; the api channel below is not one.
     let has_chat_channel = !channels.is_empty();
-
-    // Home Assistant event ingress: forwards filtered `state_changed` events to
-    // the agent. No pairing — it is a trusted local integration keyed by
-    // HASS_TOKEN, not a chat with arbitrary senders.
-    if let Some(cfg) = rt.homeassistant_channel.ready() {
-        gateway = gateway.add_channel(Box::new(HomeAssistantChannel::new(cfg)));
-        channels.push("homeassistant");
-    }
 
     // HTTP API channel: serves the local dashboard UI and any OpenAI-compatible
     // client. It calls the handler directly (synchronous request/response), so

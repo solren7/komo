@@ -155,7 +155,6 @@ pub struct RuntimeConfig {
     pub feishu: ChannelState<FeishuConfig>,
     pub telegram: ChannelState<TelegramConfig>,
     pub wechat: ChannelState<WeChatConfig>,
-    pub homeassistant_channel: ChannelState<HomeAssistantChannelConfig>,
     /// The HTTP api channel is always on (the CLI reaches a running gateway
     /// through it), so this is never `Disabled` — only `Ready` (loopback or
     /// external) or `Misconfigured` (external without a key).
@@ -217,9 +216,7 @@ pub enum ChannelState<T> {
     /// Enabled and fully configured.
     Ready(T),
     /// Enabled but unusable; the message names what is missing. Resolution
-    /// also records a [`ConfigIssue`] — fatal for the chat channels (so
-    /// `validate_gateway` fails), a warning for homeassistant (the gateway
-    /// boots and the channel stays offline).
+    /// also records a fatal [`ConfigIssue`], so `validate_gateway` fails.
     Misconfigured(String),
 }
 
@@ -477,21 +474,10 @@ pub struct WeChatConfig {
     pub home_chat: Option<String>,
 }
 
-/// Resolved Home Assistant settings (shared by the tool and the channel).
+/// Resolved Home Assistant settings for the `homeassistant` tool.
 pub struct HomeAssistantConfig {
     pub base_url: String,
     pub token: String,
-}
-
-/// Resolved Home Assistant channel settings (behavior + shared credentials).
-pub struct HomeAssistantChannelConfig {
-    pub base_url: String,
-    pub token: String,
-    pub watch_domains: Vec<String>,
-    pub watch_entities: Vec<String>,
-    pub ignore_entities: Vec<String>,
-    pub watch_all: bool,
-    pub cooldown_seconds: u64,
 }
 
 /// Resolved HTTP API channel settings.
@@ -644,7 +630,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     // surprising prefixes in the Workspace allow-list.
     let readable_roots = resolve_readable_roots(file.readable_roots, &mut issues);
 
-    // The homeassistant tool credentials, shared with the HA event channel.
+    // The homeassistant tool credentials.
     let homeassistant_tool = secrets
         .hass_token
         .clone()
@@ -708,35 +694,6 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             allow_from: cfg.allow_from,
             home_chat: cfg.home_chat,
         }),
-    };
-    let homeassistant_channel = match channels.homeassistant.filter(|c| c.enabled) {
-        None => ChannelState::Disabled,
-        Some(cfg) => match &homeassistant_tool {
-            Some(creds) => ChannelState::Ready(HomeAssistantChannelConfig {
-                base_url: creds.base_url.clone(),
-                token: creds.token.clone(),
-                watch_domains: cfg.watch_domains,
-                watch_entities: cfg.watch_entities,
-                ignore_entities: cfg.ignore_entities,
-                watch_all: cfg.watch_all,
-                cooldown_seconds: cfg.cooldown_seconds.unwrap_or(30),
-            }),
-            // A warning, not fatal: HA is a local convenience integration whose
-            // credential lives outside config.toml, so an enabled-but-tokenless
-            // channel must not crash-loop the whole gateway (same principle as
-            // the missing model API key). The channel just stays offline.
-            None => {
-                let message = "[channels.homeassistant] is enabled but HASS_TOKEN is not set \
-                 (put it in ~/.komo/.env); the channel stays offline"
-                    .to_string();
-                issues.push(ConfigIssue {
-                    path: "channels.homeassistant",
-                    severity: IssueSeverity::Warning,
-                    message: message.clone(),
-                });
-                ChannelState::Misconfigured(message)
-            }
-        },
     };
     let api_file = channels.api.unwrap_or_default();
     // Shared by both branches (external and loopback-only).
@@ -811,7 +768,6 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         feishu,
         telegram,
         wechat,
-        homeassistant_channel,
         api,
     };
     let report = ConfigReport {
@@ -1242,8 +1198,8 @@ fn build_rule(r: PolicyRuleFileConfig) -> Option<komo_core::domain::policy::Rule
 mod tests {
     use super::super::ConfigSnapshot;
     use super::super::sources::{
-        ApiFileConfig, ChannelsFileConfig, FileConfig, HomeAssistantChannelFileConfig,
-        McpFileConfig, McpServerFileConfig, Secrets, TelegramFileConfig,
+        ApiFileConfig, ChannelsFileConfig, FileConfig, McpFileConfig, McpServerFileConfig, Secrets,
+        TelegramFileConfig,
     };
     use super::*;
     use std::path::PathBuf;
@@ -1428,33 +1384,6 @@ mod tests {
         // The gateway fails fast; a chat turn doesn't need the channel.
         assert!(snap.validate_gateway().is_err());
         assert!(snap.validate_agent().is_ok());
-    }
-
-    #[test]
-    fn homeassistant_without_token_warns_but_does_not_block_startup() {
-        let mut s = with_deepseek_key(sources());
-        s.file.channels = Some(ChannelsFileConfig {
-            homeassistant: Some(HomeAssistantChannelFileConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let snap = ConfigSnapshot::from_sources(s);
-        let ChannelState::Misconfigured(msg) = &snap.runtime.homeassistant_channel else {
-            panic!("enabled without HASS_TOKEN must be misconfigured");
-        };
-        assert!(msg.contains("HASS_TOKEN"));
-        // Degraded, not dead: the gateway boots with the HA channel offline.
-        let issue = snap
-            .report
-            .issues
-            .iter()
-            .find(|i| i.path == "channels.homeassistant")
-            .expect("missing token is reported");
-        assert_eq!(issue.severity, IssueSeverity::Warning);
-        assert!(snap.report.fatal().is_none());
-        assert!(snap.validate_gateway().is_ok());
     }
 
     #[test]

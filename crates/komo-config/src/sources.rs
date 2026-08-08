@@ -325,7 +325,7 @@ pub struct McpServerFileConfig {
     /// Which of the server's tools to mount. **Required** unless `all_tools`:
     /// a server can advertise dozens, every mounted schema is re-sent on every
     /// round, and a catalog that doubles hurts the model's tool selection.
-    /// Closed by default, like `[channels.homeassistant]`'s event filters.
+    /// Closed by default.
     pub tools: Vec<String>,
     /// Mount everything the server advertises, ignoring `tools`. The escape
     /// hatch for a small server where enumerating is just noise.
@@ -446,29 +446,7 @@ pub struct ChannelsFileConfig {
     pub feishu: Option<FeishuFileConfig>,
     pub telegram: Option<TelegramFileConfig>,
     pub wechat: Option<WeChatFileConfig>,
-    pub homeassistant: Option<HomeAssistantChannelFileConfig>,
     pub api: Option<ApiFileConfig>,
-}
-
-/// `[channels.homeassistant]` table: HA as an event-ingress channel. The URL
-/// and token are *not* here — they come from `HASS_URL` / `HASS_TOKEN` (shared
-/// with the `homeassistant` tool). This table only carries event-filter
-/// behavior. Event forwarding is closed by default: with no `watch_*` set and
-/// `watch_all = false`, every event is dropped.
-#[derive(Debug, Deserialize, Default)]
-#[serde(default)]
-pub struct HomeAssistantChannelFileConfig {
-    pub enabled: bool,
-    /// Forward state changes for entities in these domains (e.g. "binary_sensor").
-    pub watch_domains: Vec<String>,
-    /// Forward state changes for these specific entity ids.
-    pub watch_entities: Vec<String>,
-    /// Never forward these entity ids (takes precedence over watch_*).
-    pub ignore_entities: Vec<String>,
-    /// Forward *every* entity's state change (ignore the watch lists).
-    pub watch_all: bool,
-    /// Per-entity minimum seconds between forwarded events (default 30).
-    pub cooldown_seconds: Option<u64>,
 }
 
 /// `[channels.feishu]` table. App credentials never live here — they are

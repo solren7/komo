@@ -156,8 +156,9 @@ chat channel (the QR arrives as a photo). Credentials persist in \
 ~/.komo/wechat/credentials.json; WeChat is DM-only (the bot cannot join \
 groups).\n\
 - Home Assistant: set HASS_TOKEN (and optionally HASS_URL) in ~/.komo/.env to \
-enable the `homeassistant` tool; `[channels.homeassistant]` additionally \
-forwards device events to you.\n\
+enable the `homeassistant` tool. It queries and controls HA on demand; to \
+react to device events, write an HA automation with save_automation rather \
+than expecting events to be pushed here.\n\
 - Unknown senders must pair before you respond: their first message gets a \
 pairing code, which the operator approves with `komo pair approve <code>` on \
 the host. Pre-trusted ids go in the channel's `allow_from` list.\n\

@@ -76,7 +76,6 @@ pub async fn probe(_config: &ConfigSnapshot, name: &str) -> anyhow::Result<()> {
         "feishu" => probe_feishu(_config).await,
         "telegram" => probe_telegram(_config).await,
         "wechat" => probe_wechat(_config),
-        "homeassistant" => probe_homeassistant(_config).await,
         "api" => probe_api().await,
         _ => unreachable!("normalize_name accepts only built-in channels"),
     }
@@ -95,7 +94,6 @@ pub async fn setup(config: &ConfigSnapshot, name: &str) -> anyhow::Result<()> {
         "feishu" => setup_feishu(config),
         "telegram" => setup_telegram(config),
         "wechat" => setup_wechat(config).await,
-        "homeassistant" => setup_homeassistant(config),
         "api" => unreachable!("api is handled before the interactive-terminal check"),
         _ => unreachable!("normalize_name accepts only built-in channels"),
     }
@@ -104,10 +102,8 @@ pub async fn setup(config: &ConfigSnapshot, name: &str) -> anyhow::Result<()> {
 fn normalize_name(name: &str) -> anyhow::Result<String> {
     let value = name.trim().to_ascii_lowercase();
     match value.as_str() {
-        "feishu" | "telegram" | "wechat" | "homeassistant" | "api" => Ok(value),
-        _ => anyhow::bail!(
-            "unknown channel `{name}` (expected feishu | telegram | wechat | homeassistant | api)"
-        ),
+        "feishu" | "telegram" | "wechat" | "api" => Ok(value),
+        _ => anyhow::bail!("unknown channel `{name}` (expected feishu | telegram | wechat | api)"),
     }
 }
 
@@ -169,22 +165,6 @@ fn prompt_secret(label: &str) -> anyhow::Result<String> {
         eprintln!("warning: secret input is visible on this platform");
         prompt(label, true)
     }
-}
-
-fn confirm(label: &str) -> anyhow::Result<bool> {
-    let answer = prompt(label, false)?;
-    Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
-}
-
-fn csv(value: String) -> toml::Value {
-    toml::Value::Array(
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(|item| toml::Value::String(item.to_string()))
-            .collect(),
-    )
 }
 
 fn report_setup(config_path: &std::path::Path, env_path: Option<&std::path::Path>) {
@@ -253,51 +233,6 @@ async fn setup_wechat(config: &ConfigSnapshot) -> anyhow::Result<()> {
         [("enabled", toml::Value::Boolean(true))],
     )?;
     report_setup(&config_path, None);
-    Ok(())
-}
-
-fn setup_homeassistant(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    println!("Home Assistant setup — enter a long-lived access token.");
-    let token = prompt_secret("HASS_TOKEN: ")?;
-    let url = prompt(
-        "HASS_URL (blank = http://homeassistant.local:8123): ",
-        false,
-    )?;
-    let watch_all = confirm("Forward every state change? [y/N]: ")?;
-    let domains = if watch_all {
-        String::new()
-    } else {
-        prompt("Watch domains (comma-separated; blank = none): ", false)?
-    };
-    let entities = if watch_all {
-        String::new()
-    } else {
-        prompt("Watch entities (comma-separated; blank = none): ", false)?
-    };
-    if !watch_all && domains.trim().is_empty() && entities.trim().is_empty() {
-        eprintln!("note: no watches selected, so Home Assistant will not forward events yet");
-    }
-    let base_url = if url.is_empty() {
-        "http://homeassistant.local:8123"
-    } else {
-        url.as_str()
-    };
-    let env_values = [("HASS_TOKEN", token.as_str()), ("HASS_URL", base_url)];
-    let channel_values = [
-        ("enabled", toml::Value::Boolean(true)),
-        ("watch_all", toml::Value::Boolean(watch_all)),
-        ("watch_domains", csv(domains)),
-        ("watch_entities", csv(entities)),
-    ];
-    komo_config::validate_channel_config(
-        &config.runtime.home,
-        "homeassistant",
-        channel_values.clone(),
-    )?;
-    let env_path = komo_config::write_env_values(&config.runtime.home, &env_values)?;
-    let config_path =
-        komo_config::write_channel_config(&config.runtime.home, "homeassistant", channel_values)?;
-    report_setup(&config_path, Some(&env_path));
     Ok(())
 }
 
@@ -389,23 +324,6 @@ fn probe_wechat(config: &ConfigSnapshot) -> anyhow::Result<()> {
     );
 }
 
-async fn probe_homeassistant(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    let channel = require_ready("homeassistant", &config.runtime.homeassistant_channel)?;
-    let response = http_client()?
-        .get(format!("{}/api/", channel.base_url.trim_end_matches('/')))
-        .bearer_auth(&channel.token)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "Home Assistant authentication failed ({})",
-            response.status()
-        );
-    }
-    println!("✓ homeassistant credentials accepted");
-    Ok(())
-}
-
 async fn probe_api() -> anyhow::Result<()> {
     let client = GatewayClient::try_connect()
         .await
@@ -435,12 +353,6 @@ pub fn summaries(
             "wechat",
             "chat",
             wechat_status(&rt.wechat),
-            gateway_channels,
-        ),
-        summary(
-            "homeassistant",
-            "event",
-            state_status(&rt.homeassistant_channel),
             gateway_channels,
         ),
         summary("api", "control", api_status(&rt.api), gateway_channels),

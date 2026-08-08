@@ -226,7 +226,6 @@ fn channel_health(config: &ConfigSnapshot) {
     }
     line("feishu", &rt.feishu);
     line("telegram", &rt.telegram);
-    line("homeassistant", &rt.homeassistant_channel);
     // The api channel is always on (it's how the CLI reaches a running gateway);
     // `enabled` only widens it from loopback-only to externally reachable.
     match &rt.api {
@@ -258,7 +257,7 @@ fn channel_health(config: &ConfigSnapshot) {
         ChannelState::Misconfigured(e) => println!("  {BAD} {:<14} {e}", "wechat"),
     }
 
-    // The homeassistant *tool* (agent controls HA) is independent of the channel.
+    // The homeassistant tool (agent queries/controls HA on demand).
     let ha_tool = if rt.homeassistant_tool.is_some() {
         format!("{OK} HASS_TOKEN set")
     } else {

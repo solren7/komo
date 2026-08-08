@@ -49,12 +49,6 @@ provider = "deepseek"
 # [channels.wechat]              # DM-only; provision with `komo channel wechat login`
 # enabled = true
 
-# [channels.homeassistant]       # HA event ingress (HASS_TOKEN in .env)
-# enabled = true
-# watch_domains = ["binary_sensor", "lock"]
-# watch_entities = []
-# cooldown_seconds = 30
-
 # [channels.api]                 # widen the loopback HTTP API (needs API_SERVER_KEY)
 # enabled = true
 # bind = "0.0.0.0"
@@ -76,7 +70,7 @@ DEEPSEEK_API_KEY=
 # FEISHU_APP_ID=
 # FEISHU_APP_SECRET=
 
-# Home Assistant (shared by the tool and the event channel)
+# Home Assistant (enables the `homeassistant` tool)
 # HASS_TOKEN=
 # HASS_URL=http://homeassistant.local:8123
 

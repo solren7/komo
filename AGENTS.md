@@ -131,9 +131,8 @@ is re-sent every round).
 
 Resolution happens **once** in `crates/komo-config` into a `ConfigSnapshot`; problems
 become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
-`validate_gateway`. Two deliberate warnings, not fatals: missing model API key
-(boots with `UnconfiguredLlm` that errors per call) and HA channel without
-`HASS_TOKEN` (channel offline, others unaffected). **Never re-read config.toml
+`validate_gateway`. One deliberate warning, not a fatal: a missing model API key
+(boots with `UnconfiguredLlm` that errors per call). **Never re-read config.toml
 or call `std::env::var` in callers** — the only exception is `KOMO_HOME`.
 
 Operator-authored prompt files (`agent/system_prompt.rs`, main agent only):
@@ -145,7 +144,7 @@ other agents share it), plus project `AGENTS.md` else `CLAUDE.md` else
 is what keeps a `CLAUDE.md`→`AGENTS.md` symlink from being injected twice. All of
 them are head-capped and re-read on mtime change (no restart needed).
 
-Channels (`[channels.feishu|telegram|wechat|homeassistant]`): behavior keys in
+Channels (`[channels.feishu|telegram|wechat]`): behavior keys in
 the table, credentials in `.env`. `allow_from` pre-trusts senders; everyone
 else must pair (`komo pair approve <code>`; codes stored salted-hashed,
 rate-limited, expire in 1h). WeChat is QR-login (creds in
@@ -363,9 +362,12 @@ call the same functions, which is what keeps validation from forking.
   feishu first > macOS notification).
 - `infra/messaging/` — channels: feishu (ws long connection on a dedicated
   thread), telegram (long polling, Markdown with plain-text fallback), wechat
-  (iLink, DM-only, shared `WeChatBot` instance, in-memory reply tokens),
-  homeassistant (event ingress, closed-by-default filters, no pairing,
-  approvals denied). Session ids: `{platform}:{chat_id}`.
+  (iLink, DM-only, shared `WeChatBot` instance, in-memory reply tokens).
+  Session ids: `{platform}:{chat_id}`. Home Assistant is **not** a channel —
+  it is reachable only through the `homeassistant` tool (agent pulls on
+  demand); recurring device reactions belong in an HA automation written via
+  the tool's `save_automation`, not in an event stream that costs an LLM turn
+  per sensor tick.
 - `cli/wiring.rs` — shared `AgentRuntime` construction (chat vs gateway differ
   only in `Approver`); register new tools here.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +

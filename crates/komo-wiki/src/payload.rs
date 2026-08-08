@@ -22,6 +22,14 @@ pub const F_MODEL: &str = "embedding_model";
 /// migration, which is the hybrid-search path.
 pub const VECTOR_NAME: &str = "dense";
 
+/// Name of the sparse (BM25) vector field.
+///
+/// Kept beside `dense` in the same points: a vault is full of proper nouns —
+/// order ids, service names, verbatim error strings — that dense retrieval only
+/// approximates while exact term matching nails them. The two arms are fused at
+/// query time rather than either one being authoritative.
+pub const SPARSE_VECTOR_NAME: &str = "sparse";
+
 /// Namespace for chunk-id → point-id derivation. A fixed random UUID, as UUIDv5
 /// requires; it never changes, or every point id would change with it.
 const CHUNK_NAMESPACE: Uuid = Uuid::from_u128(0x6b6f_6d6f_7769_6b69_0000_0000_0000_0001);

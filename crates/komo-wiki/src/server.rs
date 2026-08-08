@@ -85,7 +85,9 @@ impl ServerIndex {
     }
 
     /// Page through every point's payload.
-    async fn scan(&self) -> anyhow::Result<Vec<(qdrant_client::qdrant::PointId, serde_json::Value)>> {
+    async fn scan(
+        &self,
+    ) -> anyhow::Result<Vec<(qdrant_client::qdrant::PointId, serde_json::Value)>> {
         if !self.client.collection_exists(&self.collection).await? {
             return Ok(Vec::new());
         }
@@ -152,9 +154,18 @@ impl WikiIndex for ServerIndex {
         Ok(())
     }
 
+    /// Dense-only.
+    ///
+    /// `query_text` is ignored: the BM25 tokenizer that gives the embedded
+    /// backend its lexical arm lives in `qdrant-edge`, and `qdrant-client`
+    /// offers no equivalent — computing sparse vectors for this backend would
+    /// mean reimplementing the tokenizer and keeping the two in step, which
+    /// would silently diverge. A shared-index deployment that wants hybrid
+    /// should configure the server's own BM25 instead.
     async fn search(
         &self,
         query: &[f32],
+        _query_text: &str,
         limit: usize,
         min_score: f32,
     ) -> anyhow::Result<Vec<WikiHit>> {
@@ -281,11 +292,7 @@ impl WikiIndex for ServerIndex {
             .scan()
             .await?
             .iter()
-            .find_map(|(_, v)| {
-                v.get(F_MODEL)
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
+            .find_map(|(_, v)| v.get(F_MODEL).and_then(|m| m.as_str()).map(str::to_string))
             .unwrap_or_default();
         Ok(Some((dim, model)))
     }

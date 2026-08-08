@@ -152,7 +152,10 @@ pub async fn index(config: &ConfigSnapshot, rebuild: bool) -> anyhow::Result<()>
         index.delete_paths(&removed).await?;
     }
     if changed.is_empty() && removed.is_empty() {
-        println!("\nnothing to do — index is current ({} chunks)", index.count().await?);
+        println!(
+            "\nnothing to do — index is current ({} chunks)",
+            index.count().await?
+        );
         return Ok(());
     }
     // A changed file's old chunks must go before the new ones land: a note that
@@ -253,7 +256,7 @@ pub async fn search(config: &ConfigSnapshot, query: &str, limit: usize) -> anyho
     // Same over-fetch-then-cap as the tool, so this keeps predicting what a turn
     // actually gets back.
     let candidates = index
-        .search(&vector, limit * DIVERSIFY_OVERFETCH, SEARCH_FLOOR)
+        .search(&vector, query, limit * DIVERSIFY_OVERFETCH, SEARCH_FLOOR)
         .await?;
     let hits = diversify(candidates, limit, MAX_CHUNKS_PER_FILE);
     if hits.is_empty() {
@@ -288,7 +291,10 @@ pub async fn status(config: &ConfigSnapshot) -> anyhow::Result<()> {
     if WikiBackend::parse(&cfg.backend)? == WikiBackend::Server {
         println!("url        {}", cfg.url);
     } else {
-        println!("data       {}", cfg.data_dir.join(&cfg.collection).display());
+        println!(
+            "data       {}",
+            cfg.data_dir.join(&cfg.collection).display()
+        );
     }
     println!("collection {}", cfg.collection);
     println!("model      {} @ {}", cfg.embedding.model, cfg.embedding.url);

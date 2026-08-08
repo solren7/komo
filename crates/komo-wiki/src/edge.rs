@@ -19,25 +19,75 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex};
+use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex, reciprocal_rank_fusion};
+use qdrant_edge::bm25_embed::{EdgeBm25, EdgeBm25Config};
 use qdrant_edge::{
-    Distance, EdgeConfig, EdgeShard, EdgeVectorParams, NamedQuery, Payload, PointId,
-    PointInsertOperations, PointOperations, QueryEnum, ScrollRequest, SearchRequestBuilder,
-    UpdateOperation, VectorInternal, VectorStructInternal, VectorStructPersisted, WithPayloadInterface,
-    WithVector,
+    Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, Modifier,
+    NamedQuery, Payload, PointId, PointInsertOperations, PointOperations, QueryEnum, ScrollRequest,
+    SearchRequestBuilder, TokenizerType, UpdateOperation, VectorInternal, VectorPersisted,
+    VectorStructPersisted, WithPayloadInterface, WithVector,
 };
 
-use crate::payload::{self, F_MODEL, F_MTIME, F_PATH, VECTOR_NAME, point_id, to_payload};
+use crate::payload::{
+    self, F_MODEL, F_MTIME, F_PATH, SPARSE_VECTOR_NAME, VECTOR_NAME, point_id, to_payload,
+};
 
 /// Page size for full scans. The request default is 10, which would turn one
 /// `indexed()` call into hundreds of round trips.
 const SCROLL_PAGE: usize = 1024;
+
+/// Run one arm of a search. Blocking — callers wrap it in `spawn_blocking`.
+fn run_query(
+    shard: &EdgeShard,
+    query: QueryEnum,
+    limit: usize,
+    min_score: Option<f32>,
+) -> qdrant_edge::OperationResult<Vec<qdrant_edge::ScoredPoint>> {
+    let mut request =
+        SearchRequestBuilder::new(query, limit).with_payload(WithPayloadInterface::Bool(true));
+    if let Some(min_score) = min_score {
+        request = request.score_threshold(min_score);
+    }
+    shard.search(request.build())
+}
+
+/// Scored points → hits, dropping any whose payload will not decode. A
+/// malformed point costs its own result, never the query.
+fn to_hits(points: Vec<qdrant_edge::ScoredPoint>) -> Vec<WikiHit> {
+    points
+        .into_iter()
+        .filter_map(|point| {
+            let value = serde_json::to_value(point.payload.as_ref()?).ok()?;
+            Some(WikiHit {
+                chunk: payload::from_payload(&value)?,
+                score: point.score,
+            })
+        })
+        .collect()
+}
 
 pub struct EdgeIndex {
     path: PathBuf,
     /// `None` until the first upsert establishes the vector width — see the
     /// module docs.
     shard: Arc<RwLock<Option<Arc<EdgeShard>>>>,
+    /// Lexical arm. Stateless — it turns text into term frequencies; the IDF
+    /// half of BM25 is applied by the index itself via [`Modifier::Idf`], which
+    /// is why indexing needs only one pass over the vault.
+    bm25: EdgeBm25,
+}
+
+/// BM25 tuned for a note vault.
+///
+/// `Multilingual` is the load-bearing choice: the default `Word` tokenizer
+/// splits on ASCII word boundaries and would treat a whole Chinese sentence as
+/// one token, making the lexical arm useless on most of this vault. Multilingual
+/// routes CJK through jieba.
+fn bm25_config() -> EdgeBm25Config {
+    EdgeBm25Config {
+        tokenizer: TokenizerType::Multilingual,
+        ..Default::default()
+    }
 }
 
 impl EdgeIndex {
@@ -55,7 +105,21 @@ impl EdgeIndex {
         Ok(Self {
             path,
             shard: Arc::new(RwLock::new(existing)),
+            bm25: EdgeBm25::new(bm25_config())
+                .map_err(|e| anyhow!("building the BM25 tokenizer: {e}"))?,
         })
+    }
+
+    /// Does the open shard carry a sparse column?
+    ///
+    /// An index built before hybrid search has dense vectors only, and querying
+    /// a vector name it does not have is an error. Checking lets an old index
+    /// keep working as dense-only until it is rebuilt.
+    fn has_sparse(shard: &EdgeShard) -> bool {
+        shard
+            .config()
+            .sparse_vectors
+            .contains_key(SPARSE_VECTOR_NAME)
     }
 
     fn snapshot(&self) -> Option<Arc<EdgeShard>> {
@@ -113,7 +177,18 @@ impl EdgeIndex {
                     hnsw_config: None,
                 },
             )]),
-            sparse_vectors: HashMap::new(),
+            sparse_vectors: HashMap::from([(
+                SPARSE_VECTOR_NAME.to_string(),
+                EdgeSparseVectorParams {
+                    full_scan_threshold: None,
+                    on_disk: None,
+                    // The index applies IDF at query time from its own document
+                    // frequencies, so writes carry only term frequencies and one
+                    // indexing pass is enough.
+                    modifier: Some(Modifier::Idf),
+                    datatype: None,
+                },
+            )]),
             hnsw_config: Default::default(),
             quantization_config: None,
             optimizers: Default::default(),
@@ -186,12 +261,22 @@ impl WikiIndex for EdgeIndex {
             .iter()
             .filter(|c| !c.embedding.is_empty())
             .map(|c| {
-                let vector = VectorStructPersisted::from(VectorStructInternal::Named(
-                    HashMap::from([(
-                        VECTOR_NAME.to_string(),
-                        VectorInternal::from(c.embedding.clone()),
-                    )]),
-                ));
+                let mut named: HashMap<String, VectorPersisted> = HashMap::from([(
+                    VECTOR_NAME.to_string(),
+                    VectorPersisted::Dense(c.embedding.clone()),
+                )]);
+                // Indexed over the same text that was embedded (heading trail +
+                // body), so both arms see one document.
+                let sparse = self
+                    .bm25
+                    .embed_document(&format!("{}\n{}", c.heading_path, c.text));
+                if !sparse.indices.is_empty() {
+                    named.insert(
+                        SPARSE_VECTOR_NAME.to_string(),
+                        VectorPersisted::Sparse(sparse),
+                    );
+                }
+                let vector = VectorStructPersisted::Named(named);
                 let payload = match to_payload(c) {
                     serde_json::Value::Object(map) => Payload(map.into_iter().collect()),
                     _ => unreachable!("to_payload always builds an object"),
@@ -218,6 +303,7 @@ impl WikiIndex for EdgeIndex {
     async fn search(
         &self,
         query: &[f32],
+        query_text: &str,
         limit: usize,
         min_score: f32,
     ) -> anyhow::Result<Vec<WikiHit>> {
@@ -227,33 +313,50 @@ impl WikiIndex for EdgeIndex {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let query = query.to_vec();
-        let hits = tokio::task::spawn_blocking(move || {
-            let request = SearchRequestBuilder::new(
+        // A query of pure stopwords (or one against a pre-hybrid index) yields
+        // no terms; the dense arm then carries the search alone.
+        let sparse_query = Self::has_sparse(&shard)
+            .then(|| self.bm25.embed_query(query_text))
+            .filter(|sparse| !sparse.indices.is_empty());
+
+        let dense_query = query.to_vec();
+        let (dense, sparse) = tokio::task::spawn_blocking(move || {
+            let dense = run_query(
+                &shard,
                 QueryEnum::Nearest(NamedQuery {
-                    query: VectorInternal::from(query),
+                    query: VectorInternal::Dense(dense_query),
                     using: Some(VECTOR_NAME.into()),
                 }),
                 limit,
-            )
-            .with_payload(WithPayloadInterface::Bool(true))
-            .score_threshold(min_score)
-            .build();
-            shard.search(request)
+                Some(min_score),
+            )?;
+            let sparse = match sparse_query {
+                // No floor on the lexical arm: BM25 scores are unbounded and
+                // corpus-dependent, so a cosine threshold would be meaningless
+                // here — `limit` is what bounds it.
+                Some(sparse_query) => run_query(
+                    &shard,
+                    QueryEnum::Nearest(NamedQuery {
+                        query: VectorInternal::Sparse(sparse_query),
+                        using: Some(SPARSE_VECTOR_NAME.into()),
+                    }),
+                    limit,
+                    None,
+                )?,
+                None => Vec::new(),
+            };
+            Ok::<_, qdrant_edge::OperationError>((dense, sparse))
         })
         .await?
         .map_err(|e| anyhow!("searching wiki index: {e}"))?;
 
-        Ok(hits
-            .into_iter()
-            .filter_map(|hit| {
-                let value = serde_json::to_value(hit.payload.as_ref()?).ok()?;
-                Some(WikiHit {
-                    chunk: payload::from_payload(&value)?,
-                    score: hit.score,
-                })
-            })
-            .collect())
+        let dense = to_hits(dense);
+        // Dense-only: return cosine scores unchanged, so a vault without a
+        // lexical arm behaves exactly as it did before hybrid existed.
+        if sparse.is_empty() {
+            return Ok(dense.into_iter().take(limit).collect());
+        }
+        Ok(reciprocal_rank_fusion(vec![dense, to_hits(sparse)], limit))
     }
 
     async fn indexed(&self) -> anyhow::Result<HashMap<String, IndexedFile>> {
@@ -269,10 +372,9 @@ impl WikiIndex for EdgeIndex {
             ) else {
                 continue;
             };
-            let entry = out.entry(path.to_string()).or_insert(IndexedFile {
-                mtime,
-                chunks: 0,
-            });
+            let entry = out
+                .entry(path.to_string())
+                .or_insert(IndexedFile { mtime, chunks: 0 });
             entry.chunks += 1;
             // A file's chunks all carry the same mtime; if a partial re-index
             // left a mix, the oldest is the honest answer — it forces a
@@ -396,7 +498,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = index(&dir);
         assert_eq!(index.count().await.unwrap(), 0);
-        assert!(index.search(&[1.0, 0.0], 5, 0.0).await.unwrap().is_empty());
+        assert!(
+            index
+                .search(&[1.0, 0.0], "q", 5, 0.0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(index.indexed().await.unwrap().is_empty());
         assert!(index.vector_spec().await.unwrap().is_none());
         index.delete_paths(&["a.md".into()]).await.unwrap();
@@ -417,7 +525,7 @@ mod tests {
         assert_eq!(index.count().await.unwrap(), 2);
         assert_eq!(index.vector_spec().await.unwrap().unwrap().0, 2);
 
-        let hits = index.search(&[1.0, 0.0], 1, 0.0).await.unwrap();
+        let hits = index.search(&[1.0, 0.0], "q", 1, 0.0).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.path, "a.md");
         assert!(hits[0].score > 0.9, "score was {}", hits[0].score);
@@ -437,8 +545,17 @@ mod tests {
             .await
             .unwrap();
         // Orthogonal query: dot product 0.
-        assert!(index.search(&[0.0, 1.0], 5, 0.5).await.unwrap().is_empty());
-        assert_eq!(index.search(&[0.0, 1.0], 5, -1.0).await.unwrap().len(), 1);
+        assert!(
+            index
+                .search(&[0.0, 1.0], "q", 5, 0.5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index.search(&[0.0, 1.0], "q", 5, -1.0).await.unwrap().len(),
+            1
+        );
     }
 
     /// Re-indexing an unchanged file must not duplicate its points — this is
@@ -447,7 +564,10 @@ mod tests {
     async fn upsert_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(&dir);
-        let chunks = [chunk("a.md", 0, vec![1.0, 0.0]), chunk("a.md", 1, vec![0.0, 1.0])];
+        let chunks = [
+            chunk("a.md", 0, vec![1.0, 0.0]),
+            chunk("a.md", 1, vec![0.0, 1.0]),
+        ];
         index.upsert(&chunks).await.unwrap();
         index.upsert(&chunks).await.unwrap();
         assert_eq!(index.count().await.unwrap(), 2);
@@ -476,6 +596,78 @@ mod tests {
         index.delete_paths(&["a.md".into()]).await.unwrap();
         assert_eq!(index.count().await.unwrap(), 1);
         assert!(index.indexed().await.unwrap().contains_key("b.md"));
+    }
+
+    fn chunk_with_text(path: &str, text: &str, embedding: Vec<f32>) -> WikiChunk {
+        let mut c = chunk(path, 0, embedding);
+        c.text = text.to_string();
+        c.heading_path = path.to_string();
+        c
+    }
+
+    /// The entire reason hybrid exists: an exact token the dense arm cannot
+    /// reach. The query vector points *away* from the note holding the id, so
+    /// only the lexical arm can surface it.
+    #[tokio::test]
+    async fn lexical_arm_finds_an_exact_id_the_dense_arm_points_away_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(&dir);
+        index
+            .upsert(&[
+                chunk_with_text(
+                    "orders.md",
+                    "订单 WMB38554 在 complete 步骤连续提交失败",
+                    vec![1.0, 0.0],
+                ),
+                chunk_with_text(
+                    "unrelated.md",
+                    "今天的天气很好，适合出门散步",
+                    vec![0.0, 1.0],
+                ),
+            ])
+            .await
+            .unwrap();
+
+        // Vector points at `unrelated.md`; the text names the id in `orders.md`.
+        let hits = index
+            .search(&[0.0, 1.0], "WMB38554", 5, -1.0)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.chunk.path.as_str()).collect();
+        assert!(
+            paths.contains(&"orders.md"),
+            "lexical arm did not surface the exact id: {paths:?}"
+        );
+    }
+
+    /// CJK must tokenize, or the lexical arm is dead weight on this vault —
+    /// the default `Word` tokenizer would treat a whole sentence as one token.
+    #[tokio::test]
+    async fn chinese_text_produces_lexical_terms() {
+        let bm25 = EdgeBm25::new(bm25_config()).unwrap();
+        let sparse = bm25.embed_document("订单创建失败的排查记录与链路还原");
+        assert!(
+            sparse.indices.len() > 1,
+            "expected several CJK terms, got {}",
+            sparse.indices.len()
+        );
+    }
+
+    /// A pre-hybrid index has no sparse column; querying one that does not exist
+    /// is an error, so search must fall back to dense instead of failing.
+    #[tokio::test]
+    async fn dense_only_search_still_works_and_keeps_cosine_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(&dir);
+        index
+            .upsert(&[chunk("a.md", 0, vec![1.0, 0.0])])
+            .await
+            .unwrap();
+        // A query with no usable terms leaves the lexical arm empty.
+        let hits = index.search(&[1.0, 0.0], "", 5, 0.0).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        // Cosine, not an RRF value (which would be ~0.016).
+        assert!(hits[0].score > 0.9, "score was {}", hits[0].score);
     }
 
     /// Changing embedding model changes vector width, and the store cannot take

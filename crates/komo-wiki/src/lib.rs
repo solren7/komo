@@ -125,6 +125,9 @@ mod tests {
     #[test]
     fn unknown_backend_is_an_error() {
         let err = WikiBackend::parse("qdrent").unwrap_err().to_string();
-        assert!(err.contains("qdrent"), "error should name the bad value: {err}");
+        assert!(
+            err.contains("qdrent"),
+            "error should name the bad value: {err}"
+        );
     }
 }

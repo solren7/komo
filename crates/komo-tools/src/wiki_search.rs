@@ -113,7 +113,7 @@ impl Tool for WikiSearchTool {
         // the whole page, which costs the reader coverage of other notes.
         let candidates = self
             .index
-            .search(&vector, limit * DIVERSIFY_OVERFETCH, SCORE_FLOOR)
+            .search(&vector, query, limit * DIVERSIFY_OVERFETCH, SCORE_FLOOR)
             .await
             .map_err(ToolError::Failed)?;
         let hits = diversify(candidates, limit, MAX_CHUNKS_PER_FILE);
@@ -149,7 +149,13 @@ mod tests {
         async fn upsert(&self, _: &[WikiChunk]) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn search(&self, _: &[f32], limit: usize, _: f32) -> anyhow::Result<Vec<WikiHit>> {
+        async fn search(
+            &self,
+            _: &[f32],
+            _: &str,
+            limit: usize,
+            _: f32,
+        ) -> anyhow::Result<Vec<WikiHit>> {
             Ok(self.0.iter().take(limit).cloned().collect())
         }
         async fn indexed(&self) -> anyhow::Result<HashMap<String, IndexedFile>> {
@@ -224,7 +230,11 @@ mod tests {
                 Decision::deny()
             }
         }
-        ToolContext::new(SessionContext::detached("cli:test"), None, Arc::new(DenyAll))
+        ToolContext::new(
+            SessionContext::detached("cli:test"),
+            None,
+            Arc::new(DenyAll),
+        )
     }
 
     #[tokio::test]

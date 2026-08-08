@@ -333,20 +333,19 @@ pub async fn build(
     // rather than inside the (synchronous) tool closure, and best-effort: a wiki
     // that will not open — stale path, unreachable Qdrant — costs this one tool,
     // never the agent, exactly like the memory embedding backend above.
-    let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> =
-        match &config.runtime.wiki {
-            Some(wiki) => match wiki_index_and_embedder(wiki).await {
-                Ok((index, embedder)) => {
-                    tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
-                    Some(Arc::new(WikiSearchTool::new(index, embedder)))
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "wiki_search unavailable");
-                    None
-                }
-            },
-            None => None,
-        };
+    let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
+        Some(wiki) => match wiki_index_and_embedder(wiki).await {
+            Ok((index, embedder)) => {
+                tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
+                Some(Arc::new(WikiSearchTool::new(index, embedder)))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "wiki_search unavailable");
+                None
+            }
+        },
+        None => None,
+    };
 
     let build_full_tools =
         |approver: Arc<dyn Approver>, delegate: Option<Arc<DelegateTool>>| -> ToolExecutor {

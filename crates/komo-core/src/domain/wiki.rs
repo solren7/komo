@@ -63,6 +63,57 @@ pub struct WikiHit {
     pub score: f32,
 }
 
+/// Rank constant for [`reciprocal_rank_fusion`]. 60 is the value from the
+/// original RRF paper and the de-facto default; it damps the top ranks enough
+/// that one run cannot dominate on its first hit alone.
+pub const RRF_K: f32 = 60.0;
+
+/// Merge several ranked result lists into one by Reciprocal Rank Fusion.
+///
+/// RRF scores by *rank*, not by score, which is exactly what mixing dense and
+/// lexical retrieval needs: a cosine similarity (0..1, clustered near 0.65 in
+/// practice) and a BM25 score (unbounded, scaled by corpus statistics) share no
+/// units, so any weighted sum of the two would be arbitrary. Ranks are
+/// comparable by construction.
+///
+/// A chunk found by both runs accumulates both contributions, so agreement
+/// between lexical and semantic retrieval is what floats a result to the top.
+///
+/// The returned `score` is the fused RRF value (roughly 0.008–0.033), **not** a
+/// similarity — callers that display it must not present it as one.
+pub fn reciprocal_rank_fusion(runs: Vec<Vec<WikiHit>>, limit: usize) -> Vec<WikiHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut fused: HashMap<String, (f32, WikiHit)> = HashMap::new();
+    for run in runs {
+        for (rank, hit) in run.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+            fused
+                .entry(hit.chunk.id.clone())
+                .and_modify(|(score, _)| *score += contribution)
+                .or_insert((contribution, hit));
+        }
+    }
+    let mut out: Vec<WikiHit> = fused
+        .into_values()
+        .map(|(score, mut hit)| {
+            hit.score = score;
+            hit
+        })
+        .collect();
+    // Ties broken by id so the order is deterministic — `fused` is a HashMap,
+    // whose iteration order is not.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
+    });
+    out.truncate(limit);
+    out
+}
+
 /// How many chunks one note may contribute to a result set.
 ///
 /// Two, not one: a long note's sections are genuinely separate answers (a
@@ -125,14 +176,25 @@ pub trait WikiIndex: Send + Sync {
     /// Insert or replace `chunks` by id.
     async fn upsert(&self, chunks: &[WikiChunk]) -> anyhow::Result<()>;
 
-    /// Top `limit` chunks by cosine similarity against `query`.
+    /// Top `limit` chunks for a query.
     ///
-    /// `min_score` drops weak hits before they reach the model — an unrelated
-    /// query against a vault always has a nearest neighbour, and returning it
-    /// anyway is how a search tool starts fabricating relevance.
+    /// `query` is the embedded query vector. `query_text` is the same query as
+    /// the user wrote it, passed so a backend with lexical retrieval can run it
+    /// as well and fuse the two — a vault is full of proper nouns (order ids,
+    /// service names, error strings) that dense retrieval approximates and exact
+    /// matching nails. A backend without lexical search ignores it.
+    ///
+    /// `min_score` applies to the **dense** arm only, as a cosine floor: an
+    /// unrelated query always has a nearest neighbour, and returning it anyway is
+    /// how a search tool starts fabricating relevance. It cannot gate a lexical
+    /// arm, whose scores are on another scale entirely.
+    ///
+    /// The `score` on each hit is therefore not comparable across backends or
+    /// across hybrid/dense modes — see [`reciprocal_rank_fusion`].
     async fn search(
         &self,
         query: &[f32],
+        query_text: &str,
         limit: usize,
         min_score: f32,
     ) -> anyhow::Result<Vec<WikiHit>>;
@@ -181,6 +243,47 @@ mod tests {
         }
     }
 
+    /// Agreement between the two arms is the whole point: a chunk both runs
+    /// found must outrank one that only the top of a single run found.
+    #[test]
+    fn a_chunk_found_by_both_runs_outranks_either_run_leader() {
+        let dense = vec![hit("only_dense.md", 0, 0.9), hit("both.md", 0, 0.8)];
+        let lexical = vec![hit("only_lexical.md", 0, 12.0), hit("both.md", 0, 9.0)];
+        let out = reciprocal_rank_fusion(vec![dense, lexical], 3);
+        assert_eq!(out[0].chunk.path, "both.md", "{out:?}");
+    }
+
+    /// RRF must not care that BM25 scores are an order of magnitude larger than
+    /// cosine ones — it ranks, it does not add.
+    #[test]
+    fn fusion_ignores_the_scale_of_input_scores() {
+        let small = vec![hit("a.md", 0, 0.01)];
+        let huge = vec![hit("b.md", 0, 900.0)];
+        let out = reciprocal_rank_fusion(vec![small, huge], 2);
+        assert_eq!(out.len(), 2);
+        // Both were rank 0 in their run, so both get the same contribution.
+        assert!((out[0].score - out[1].score).abs() < 1e-6, "{out:?}");
+    }
+
+    #[test]
+    fn fusion_of_one_run_preserves_its_order() {
+        let run = vec![
+            hit("a.md", 0, 0.9),
+            hit("b.md", 0, 0.8),
+            hit("c.md", 0, 0.7),
+        ];
+        let out = reciprocal_rank_fusion(vec![run], 10);
+        let paths: Vec<&str> = out.iter().map(|h| h.chunk.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn fusion_of_nothing_is_nothing() {
+        assert!(reciprocal_rank_fusion(vec![], 5).is_empty());
+        assert!(reciprocal_rank_fusion(vec![vec![]], 5).is_empty());
+        assert!(reciprocal_rank_fusion(vec![vec![hit("a.md", 0, 0.9)]], 0).is_empty());
+    }
+
     /// The observed failure: one long note held three of ten slots.
     #[test]
     fn one_file_cannot_take_every_slot() {
@@ -227,8 +330,15 @@ mod tests {
     /// never an empty result.
     #[test]
     fn a_single_file_vault_still_returns_hits() {
-        let hits = vec![hit("only.md", 0, 0.9), hit("only.md", 1, 0.8), hit("only.md", 2, 0.7)];
-        assert_eq!(diversify(hits, 10, MAX_CHUNKS_PER_FILE).len(), MAX_CHUNKS_PER_FILE);
+        let hits = vec![
+            hit("only.md", 0, 0.9),
+            hit("only.md", 1, 0.8),
+            hit("only.md", 2, 0.7),
+        ];
+        assert_eq!(
+            diversify(hits, 10, MAX_CHUNKS_PER_FILE).len(),
+            MAX_CHUNKS_PER_FILE
+        );
     }
 
     #[test]

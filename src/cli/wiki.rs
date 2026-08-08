@@ -18,7 +18,9 @@ use anyhow::Context;
 use komo_config::ConfigSnapshot;
 use komo_config::WikiConfig;
 use komo_core::domain::embedding::EmbeddingClient;
-use komo_core::domain::wiki::{WikiChunk, WikiIndex};
+use komo_core::domain::wiki::{
+    DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiChunk, WikiIndex, diversify,
+};
 use komo_infra::embedding::OllamaEmbedder;
 use komo_services::wiki_chunking::{ChunkSpec, chunk_markdown};
 use komo_wiki::{WikiBackend, WikiSettings, build_index};
@@ -248,7 +250,12 @@ pub async fn search(config: &ConfigSnapshot, query: &str, limit: usize) -> anyho
         .filter(|v| !v.is_empty())
         .context("embedding backend returned no vector")?;
 
-    let hits = index.search(&vector, limit, SEARCH_FLOOR).await?;
+    // Same over-fetch-then-cap as the tool, so this keeps predicting what a turn
+    // actually gets back.
+    let candidates = index
+        .search(&vector, limit * DIVERSIFY_OVERFETCH, SEARCH_FLOOR)
+        .await?;
+    let hits = diversify(candidates, limit, MAX_CHUNKS_PER_FILE);
     if hits.is_empty() {
         println!("no matches above {SEARCH_FLOOR:.2}");
         return Ok(());

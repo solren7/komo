@@ -16,7 +16,7 @@ use komo_core::domain::{
     context::ToolContext,
     embedding::EmbeddingClient,
     tool::{Tool, ToolError, ToolOutput, parse_args},
-    wiki::WikiIndex,
+    wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -109,11 +109,14 @@ impl Tool for WikiSearchTool {
             )));
         };
 
-        let hits = self
+        // Over-fetch, then cap per file: ranking alone lets one long note take
+        // the whole page, which costs the reader coverage of other notes.
+        let candidates = self
             .index
-            .search(&vector, limit, SCORE_FLOOR)
+            .search(&vector, limit * DIVERSIFY_OVERFETCH, SCORE_FLOOR)
             .await
             .map_err(ToolError::Failed)?;
+        let hits = diversify(candidates, limit, MAX_CHUNKS_PER_FILE);
 
         if hits.is_empty() {
             return Ok(ToolOutput::text(format!(
@@ -181,6 +184,13 @@ mod tests {
         }
     }
 
+    fn hit_at(path: &str, ordinal: usize, score: f32) -> WikiHit {
+        let mut h = hit(path, score);
+        h.chunk.ordinal = ordinal;
+        h.chunk.id = WikiChunk::make_id(path, ordinal);
+        h
+    }
+
     fn hit(path: &str, score: f32) -> WikiHit {
         WikiHit {
             chunk: WikiChunk {
@@ -238,6 +248,35 @@ mod tests {
             .unwrap();
         assert!(out.text.contains("No passages"), "{}", out.text);
         assert!(out.text.contains("komo wiki index"), "{}", out.text);
+    }
+
+    /// The observed failure this guards: one long note filled most of the page,
+    /// crowding out other files.
+    #[tokio::test]
+    async fn one_file_cannot_crowd_out_the_rest() {
+        let mut hits = vec![
+            hit_at("long.md", 0, 0.90),
+            hit_at("long.md", 1, 0.89),
+            hit_at("long.md", 2, 0.88),
+            hit_at("long.md", 3, 0.87),
+        ];
+        hits.push(hit_at("other.md", 0, 0.86));
+        hits.push(hit_at("third.md", 0, 0.85));
+
+        let out = tool(hits, true)
+            .call(serde_json::json!({"query": "x", "limit": 4}), &ctx())
+            .await
+            .unwrap();
+        // Count result headers, not bare paths — a path also appears in the
+        // heading trail of its own result.
+        assert_eq!(
+            out.text.matches("── long.md").count(),
+            MAX_CHUNKS_PER_FILE,
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("other.md"), "{}", out.text);
+        assert!(out.text.contains("third.md"), "{}", out.text);
     }
 
     #[tokio::test]

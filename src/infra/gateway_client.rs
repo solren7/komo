@@ -372,6 +372,49 @@ impl GatewayClient {
         .await
     }
 
+    pub async fn wiki_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<komo_core::operator_view::WikiHitView>> {
+        self.post_field(
+            "/api/wiki/search",
+            json!({ "query": query, "limit": limit }),
+            "hits",
+        )
+        .await
+    }
+
+    pub async fn wiki_status(&self) -> anyhow::Result<komo_core::operator_view::WikiStatusView> {
+        self.get_field("/api/wiki/status", "status").await
+    }
+
+    /// Index the vault server-side.
+    ///
+    /// Uses `streaming_http` rather than `http` for one reason: a full vault
+    /// rebuild takes minutes and would blow past `REQUEST_TIMEOUT`. That client
+    /// exists precisely for calls whose duration the server, not the client,
+    /// should bound. Progress goes to the gateway log (`komo logs -f`).
+    pub async fn wiki_index(
+        &self,
+        rebuild: bool,
+    ) -> anyhow::Result<komo_core::operator_view::WikiIndexView> {
+        let mut map: Map<String, Value> = self
+            .streaming_http
+            .post(self.url("/api/wiki/index"))
+            .bearer_auth(&self.key)
+            .json(&json!({ "rebuild": rebuild }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let val = map
+            .remove("outcome")
+            .context("gateway reply had no `outcome`")?;
+        Ok(serde_json::from_value(val)?)
+    }
+
     /// Delete empty sessions server-side; returns the count removed.
     pub async fn clean_sessions(&self) -> anyhow::Result<usize> {
         self.post_field("/api/sessions/clean", json!({}), "removed")

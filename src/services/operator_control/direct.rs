@@ -10,6 +10,7 @@ use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use komo_services::cron_actions;
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::sync::OnceCell;
 
 use crate::domain::{
@@ -35,6 +36,9 @@ pub(super) struct DirectOperatorAdapter {
     kanban: OnceCell<Arc<KanbanDb>>,
     memory: OnceCell<Arc<MemoryDb>>,
     cron: OnceCell<Arc<CronDb>>,
+    /// Opened on first use, like the dbs: a CLI command that never touches the
+    /// vault should not pay for loading its index.
+    wiki: OnceCell<Arc<super::actions::WikiOps>>,
 }
 
 impl DirectOperatorAdapter {
@@ -45,6 +49,7 @@ impl DirectOperatorAdapter {
             kanban: OnceCell::new(),
             memory: OnceCell::new(),
             cron: OnceCell::new(),
+            wiki: OnceCell::new(),
         }
     }
 
@@ -73,6 +78,47 @@ impl DirectOperatorAdapter {
     pub(super) async fn cron(&self) -> anyhow::Result<&Arc<CronDb>> {
         self.cron
             .get_or_try_init(|| async { Ok(Arc::new(CronDb::connect(&self.urls.cron).await?)) })
+            .await
+    }
+
+    /// Open the note-vault index in this process.
+    ///
+    /// Only reachable when no gateway is running — if one is, it holds the
+    /// index and the gateway adapter answers instead.
+    async fn wiki_ops(&self) -> anyhow::Result<&Arc<super::actions::WikiOps>> {
+        self.wiki
+            .get_or_try_init(|| async {
+                let cfg = self
+                    .urls
+                    .wiki
+                    .as_ref()
+                    .context("no [wiki] configured in ~/.komo/config.toml")?;
+                let index = komo_wiki::build_index(&komo_wiki::WikiSettings {
+                    backend: komo_wiki::WikiBackend::parse(&cfg.backend)?,
+                    data_dir: cfg.data_dir.clone(),
+                    url: cfg.url.clone(),
+                    collection: cfg.collection.clone(),
+                    api_key: std::env::var("QDRANT_API_KEY").ok(),
+                })
+                .await?;
+                let embedder = komo_infra::embedding::OllamaEmbedder::new(
+                    cfg.embedding.url.clone(),
+                    cfg.embedding.model.clone(),
+                )?;
+                Ok(Arc::new(super::actions::WikiOps {
+                    index,
+                    embedder: Arc::new(embedder),
+                    vault: cfg.vault.clone(),
+                    model: cfg.embedding.model.clone(),
+                    backend: cfg.backend.clone(),
+                    collection: cfg.collection.clone(),
+                    location: if cfg.backend == "server" {
+                        cfg.url.clone()
+                    } else {
+                        cfg.data_dir.join(&cfg.collection).display().to_string()
+                    },
+                }))
+            })
             .await
     }
 
@@ -130,6 +176,12 @@ impl DirectOperatorAdapter {
             OperatorQuery::HomeOverride => OperatorQueryResult::HomeOverride(
                 HomeRepository::get(self.db().await?.as_ref()).await?,
             ),
+            OperatorQuery::WikiSearch { query, limit } => {
+                OperatorQueryResult::WikiHits(self.wiki_ops().await?.search(&query, limit).await?)
+            }
+            OperatorQuery::WikiStatus => {
+                OperatorQueryResult::WikiStatus(self.wiki_ops().await?.status().await?)
+            }
             OperatorQuery::CronJobs => {
                 OperatorQueryResult::CronJobs(self.cron().await?.list().await?)
             }
@@ -141,6 +193,9 @@ impl DirectOperatorAdapter {
         command: OperatorCommand,
     ) -> anyhow::Result<OperatorCommandResult> {
         Ok(match command {
+            OperatorCommand::WikiIndex { rebuild } => {
+                OperatorCommandResult::WikiIndexed(self.wiki_ops().await?.index(rebuild).await?)
+            }
             OperatorCommand::MemoryTransition { id, action } => {
                 match actions::apply_memory_transition(
                     self.memory().await?.as_ref(),

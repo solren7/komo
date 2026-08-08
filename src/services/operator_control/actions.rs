@@ -6,6 +6,7 @@
 //! transport — the api handlers and the direct adapter both call these, so the
 //! business result can't fork between the two paths.
 
+use anyhow::Context;
 use komo_core::domain::session::is_subagent_session;
 use komo_services::cron_actions;
 /// Re-exported so every operator-control caller keeps naming one place for
@@ -31,7 +32,32 @@ use crate::domain::task::{Task, TaskRepository};
 use super::now;
 use super::request::{
     DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, SkillInvocation,
+    WikiHitView, WikiIndexView, WikiStatusView,
 };
+use komo_core::domain::embedding::EmbeddingClient;
+use komo_core::domain::wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify};
+use komo_services::wiki_indexing::index_vault;
+use std::path::PathBuf;
+
+/// Cosine floor for a wiki hit, kept equal to the `wiki_search` tool's own so
+/// `komo wiki search` predicts what a turn would get rather than approximating it.
+const WIKI_SCORE_FLOOR: f32 = 0.45;
+
+/// Everything the operator surface needs to serve the note vault.
+///
+/// Held here rather than opened per request because the gateway already has the
+/// index open — that exclusive handle is exactly why these commands cannot run
+/// in the CLI's own process while the gateway is up.
+pub struct WikiOps {
+    pub index: Arc<dyn WikiIndex>,
+    pub embedder: Arc<dyn EmbeddingClient>,
+    pub vault: PathBuf,
+    pub model: String,
+    pub backend: String,
+    pub collection: String,
+    /// Human-facing location: the data directory, or the server URL.
+    pub location: String,
+}
 
 /// The operator use-case implementation over the gateway's repositories: one
 /// bundle the HTTP api channel delegates to, so its transport state stops
@@ -49,6 +75,116 @@ pub struct OperatorActions {
     pub pairings: Arc<dyn PairingRepository>,
     pub home: Arc<dyn HomeRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
+    /// `None` when `[wiki]` is unconfigured — wiki operations then fail with
+    /// that as the reason rather than looking like an empty vault.
+    pub wiki: Option<WikiOps>,
+}
+
+impl OperatorActions {
+    fn wiki(&self) -> anyhow::Result<&WikiOps> {
+        self.wiki.as_ref().context(
+            "no [wiki] configured. Add a vault path to ~/.komo/config.toml:\n\n\
+             [wiki]\n\
+             vault = \"~/02-note/01-note\"\n",
+        )
+    }
+
+    pub async fn wiki_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<WikiHitView>> {
+        self.wiki()?.search(query, limit).await
+    }
+
+    pub async fn wiki_status(&self) -> anyhow::Result<WikiStatusView> {
+        self.wiki()?.status().await
+    }
+
+    pub async fn wiki_index(&self, rebuild: bool) -> anyhow::Result<WikiIndexView> {
+        self.wiki()?.index(rebuild).await
+    }
+}
+
+impl WikiOps {
+    pub async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<WikiHitView>> {
+        let wiki = self;
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vectors = wiki.embedder.embed(&[query.to_string()]).await?;
+        let vector = vectors
+            .into_iter()
+            .next()
+            .filter(|v| !v.is_empty())
+            .context("the embedding backend returned no vector")?;
+        // Same over-fetch-then-cap as the tool, so this predicts what a turn gets.
+        let candidates = wiki
+            .index
+            .search(
+                &vector,
+                query,
+                limit * DIVERSIFY_OVERFETCH,
+                WIKI_SCORE_FLOOR,
+            )
+            .await?;
+        Ok(diversify(candidates, limit, MAX_CHUNKS_PER_FILE)
+            .into_iter()
+            .map(|hit| WikiHitView {
+                path: hit.chunk.path,
+                heading_path: hit.chunk.heading_path,
+                text: hit.chunk.text,
+                score: hit.score,
+            })
+            .collect())
+    }
+
+    pub async fn status(&self) -> anyhow::Result<WikiStatusView> {
+        let wiki = self;
+        let indexed = wiki.index.indexed().await?;
+        let spec = wiki.index.vector_spec().await?;
+        Ok(WikiStatusView {
+            vault: wiki.vault.display().to_string(),
+            backend: wiki.backend.clone(),
+            collection: wiki.collection.clone(),
+            location: wiki.location.clone(),
+            model: wiki.model.clone(),
+            files: indexed.len(),
+            chunks: wiki.index.count().await?,
+            dims: spec.as_ref().map(|(dims, _)| *dims),
+            indexed_by: spec
+                .map(|(_, model)| model)
+                .filter(|model| !model.is_empty()),
+        })
+    }
+
+    /// Minutes-long by nature. Progress goes to the tracing log rather than back
+    /// over the wire: the operator protocol is request/response, and adding a
+    /// streaming channel for one command would not pay for itself — `komo logs
+    /// -f` already shows it.
+    pub async fn index(&self, rebuild: bool) -> anyhow::Result<WikiIndexView> {
+        let wiki = self;
+        tracing::info!(vault = %wiki.vault.display(), rebuild, "wiki index: starting");
+        let outcome = index_vault(
+            wiki.index.as_ref(),
+            wiki.embedder.as_ref(),
+            &wiki.vault,
+            &wiki.model,
+            rebuild,
+            |progress| tracing::info!(chunks = progress.chunks_written, "wiki index: embedding"),
+        )
+        .await?;
+        tracing::info!(
+            chunks = outcome.chunks_total,
+            written = outcome.chunks_written,
+            "wiki index: done"
+        );
+        Ok(WikiIndexView {
+            files_seen: outcome.files_seen,
+            files_changed: outcome.files_changed,
+            files_removed: outcome.files_removed,
+            chunks_written: outcome.chunks_written,
+            chunks_total: outcome.chunks_total,
+            skipped: outcome.skipped,
+        })
+    }
 }
 
 impl OperatorActions {

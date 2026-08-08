@@ -114,3 +114,46 @@ impl DreamReport {
         !self.has_actions()
     }
 }
+
+/// One note-vault search hit, without its vector (4 KB nobody reads).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiHitView {
+    /// Vault-relative path.
+    pub path: String,
+    /// Heading trail within the note.
+    pub heading_path: String,
+    pub text: String,
+    /// Ranking score. **Not** a similarity when hybrid retrieval is on — it is
+    /// then a fused rank value, so it is only comparable within one result set.
+    pub score: f32,
+}
+
+/// What `komo wiki status` reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiStatusView {
+    pub vault: String,
+    pub backend: String,
+    pub collection: String,
+    /// Where the embedded backend keeps its files, or the server URL.
+    pub location: String,
+    /// Embedding model from config.
+    pub model: String,
+    pub files: usize,
+    pub chunks: usize,
+    /// Vector width and the model that wrote it, once anything is indexed.
+    /// A model here that differs from `model` means the index is stale.
+    pub dims: Option<usize>,
+    pub indexed_by: Option<String>,
+}
+
+/// What one indexing run did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiIndexView {
+    pub files_seen: usize,
+    pub files_changed: usize,
+    pub files_removed: usize,
+    pub chunks_written: usize,
+    pub chunks_total: usize,
+    /// Notes that could not be read, with the reason.
+    pub skipped: Vec<String>,
+}

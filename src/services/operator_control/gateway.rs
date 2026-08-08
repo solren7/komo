@@ -48,6 +48,12 @@ impl GatewayOperatorAdapter {
             OperatorQuery::CronJobs => {
                 OperatorQueryResult::CronJobs(self.client.cron_jobs().await?)
             }
+            OperatorQuery::WikiSearch { query, limit } => {
+                OperatorQueryResult::WikiHits(self.client.wiki_search(&query, limit).await?)
+            }
+            OperatorQuery::WikiStatus => {
+                OperatorQueryResult::WikiStatus(self.client.wiki_status().await?)
+            }
         })
     }
 
@@ -56,6 +62,9 @@ impl GatewayOperatorAdapter {
         command: OperatorCommand,
     ) -> anyhow::Result<OperatorCommandResult> {
         Ok(match command {
+            OperatorCommand::WikiIndex { rebuild } => {
+                OperatorCommandResult::WikiIndexed(self.client.wiki_index(rebuild).await?)
+            }
             OperatorCommand::MemoryTransition { id, action } => {
                 self.client.memory_transition(&id, action.route()).await?;
                 OperatorCommandResult::MemoryTransitioned

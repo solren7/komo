@@ -599,11 +599,14 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,
-        Some(Commands::Wiki { action }) => match action {
-            WikiAction::Index { rebuild } => wiki::index(&config, rebuild).await,
-            WikiAction::Search { query, limit } => wiki::search(&config, &query, limit).await,
-            WikiAction::Status => wiki::status(&config).await,
-        },
+        Some(Commands::Wiki { action }) => {
+            let control = operator(&config).await?;
+            match action {
+                WikiAction::Index { rebuild } => wiki::index(&control, rebuild).await,
+                WikiAction::Search { query, limit } => wiki::search(&control, &query, limit).await,
+                WikiAction::Status => wiki::status(&control).await,
+            }
+        }
         Some(Commands::Skills { action }) => match action {
             SkillsAction::List => skill::list(),
             SkillsAction::Install { source } => skill::install(&source).await,

@@ -82,6 +82,9 @@ pub struct Wiring {
     /// hourly on its own, and this is deliberately not a cron schedule: expiring
     /// a scratch file does not need to happen on the minute.
     pub output_store: Arc<ToolOutputStore>,
+    /// Note-vault handles, shared with the operator surface so `komo wiki` works
+    /// while the gateway holds the index open.
+    pub wiki: Option<crate::services::operator_control::actions::WikiOps>,
 }
 
 /// Construct the memory embedding backend, or `None` when it is unconfigured
@@ -333,10 +336,27 @@ pub async fn build(
     // rather than inside the (synchronous) tool closure, and best-effort: a wiki
     // that will not open — stale path, unreachable Qdrant — costs this one tool,
     // never the agent, exactly like the memory embedding backend above.
+    let mut wiki_ops: Option<crate::services::operator_control::actions::WikiOps> = None;
     let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
         Some(wiki) => match wiki_index_and_embedder(wiki).await {
             Ok((index, embedder)) => {
                 tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
+                // The same open index backs `komo wiki` over the operator
+                // channel — the gateway holds the only handle, so the CLI has to
+                // borrow it rather than open its own.
+                wiki_ops = Some(crate::services::operator_control::actions::WikiOps {
+                    index: index.clone(),
+                    embedder: embedder.clone(),
+                    vault: wiki.vault.clone(),
+                    model: wiki.embedding.model.clone(),
+                    backend: wiki.backend.clone(),
+                    collection: wiki.collection.clone(),
+                    location: if wiki.backend == "server" {
+                        wiki.url.clone()
+                    } else {
+                        wiki.data_dir.join(&wiki.collection).display().to_string()
+                    },
+                });
                 Some(Arc::new(WikiSearchTool::new(index, embedder)))
             }
             Err(error) => {
@@ -665,6 +685,7 @@ pub async fn build(
         briefing_runtime,
         cron_runtime,
         output_store,
+        wiki: wiki_ops,
     })
 }
 

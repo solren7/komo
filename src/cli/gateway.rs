@@ -83,7 +83,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
     let approvals = Arc::new(ApprovalState::new());
     let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
-    let wired = wiring::build(
+    let mut wired = wiring::build(
         config,
         db.clone(),
         kanban.clone(),
@@ -367,6 +367,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             pairings: pairings.clone(),
             home: db.clone(),
             cron_jobs: cron_jobs.clone(),
+            wiki: wired.wiki.take(),
         });
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
             api,

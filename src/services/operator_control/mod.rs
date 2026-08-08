@@ -37,6 +37,10 @@ pub struct StoreUrls {
     pub kanban: String,
     pub memory: String,
     pub cron: String,
+    /// Note-vault config, when `[wiki]` declares a vault. Carried here so the
+    /// direct adapter can open the index itself when no gateway is running —
+    /// the same reason the db urls are here.
+    pub wiki: Option<komo_config::WikiConfig>,
 }
 
 impl StoreUrls {
@@ -46,6 +50,7 @@ impl StoreUrls {
             kanban: runtime.kanban_db_url.clone(),
             memory: runtime.memory_db_url.clone(),
             cron: runtime.cron_db_url.clone(),
+            wiki: runtime.wiki.clone(),
         }
     }
 }
@@ -192,6 +197,8 @@ mod tests {
             kanban: format!("turso:{}", dir.join("kanban.db").display()),
             memory: format!("turso:{}", dir.join("memory.db").display()),
             cron: format!("turso:{}", dir.join("cron.db").display()),
+            // These tests exercise the db-backed operations only.
+            wiki: None,
         }
     }
 

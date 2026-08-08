@@ -18,6 +18,7 @@ use crate::domain::{
 // them here so `operator_control::{SessionSummary, …}` paths are unchanged.
 pub use komo_core::operator_view::{
     DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
+    WikiHitView, WikiIndexView, WikiStatusView,
 };
 
 /// A read-only operator request. One `query` call per CLI render — the CLI
@@ -44,6 +45,11 @@ pub enum OperatorQuery {
     SkillAudit { name: String },
     /// The `/sethome` runtime override (`None` when unset).
     HomeOverride,
+    /// Note-vault search. Routed like every other operator read so it works
+    /// while the gateway holds the index open.
+    WikiSearch { query: String, limit: usize },
+    /// What the note-vault index currently holds.
+    WikiStatus,
     /// Every scheduled cron job (enabled or not), by name.
     CronJobs,
 }
@@ -63,6 +69,8 @@ pub enum OperatorQueryResult {
     SkillAudit(Vec<SkillInvocation>),
     HomeOverride(Option<String>),
     CronJobs(Vec<CronJob>),
+    WikiHits(Vec<WikiHitView>),
+    WikiStatus(WikiStatusView),
 }
 
 /// A state-changing operator action (host-operator writes; the gateway serves
@@ -86,6 +94,9 @@ pub enum OperatorCommand {
     DreamApply,
     /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
     MemoryRepairScopes,
+    /// Index the note vault. Minutes-long: the gateway adapter gives this
+    /// command its own, far longer timeout than every other operator call.
+    WikiIndex { rebuild: bool },
     /// Create a scheduled cron job (validated; duplicate names refused).
     CronAdd { spec: CronJobSpec },
     /// Delete a cron job by name.
@@ -105,6 +116,7 @@ pub enum OperatorCommandResult {
     /// The transition applied (an unknown id is an `Err`, identical on both
     /// transports).
     MemoryTransitioned,
+    WikiIndexed(WikiIndexView),
     RunsPruned {
         removed: usize,
     },

@@ -326,6 +326,9 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
         .route("/api/memories/repair-scopes", post(memory_repair_scopes))
+        .route("/api/wiki/search", post(wiki_search))
+        .route("/api/wiki/status", get(wiki_status))
+        .route("/api/wiki/index", post(wiki_index))
         .route("/api/cron/add", post(cron_add))
         .route("/api/cron/{name}/remove", post(cron_remove))
         .route("/api/cron/{name}/enable", post(cron_enable))
@@ -1230,6 +1233,52 @@ async fn prune_runs(
 ) -> Result<Response, ApiError> {
     let removed = state.actions.prune_runs(params.cutoff).await?;
     Ok(Json(json!({ "removed": removed })).into_response())
+}
+
+#[derive(Deserialize)]
+struct WikiSearchBody {
+    query: String,
+    #[serde(default = "default_wiki_limit")]
+    limit: usize,
+}
+
+fn default_wiki_limit() -> usize {
+    5
+}
+
+/// Note-vault search (backs `komo wiki search`). Routed through the gateway
+/// because it holds the index open — the CLI cannot open it concurrently.
+async fn wiki_search(
+    State(state): State<AppState>,
+    Json(body): Json<WikiSearchBody>,
+) -> Result<Response, ApiError> {
+    let hits = state.actions.wiki_search(&body.query, body.limit).await?;
+    Ok(Json(json!({ "hits": hits })).into_response())
+}
+
+/// What the note-vault index holds (backs `komo wiki status`).
+async fn wiki_status(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let status = state.actions.wiki_status().await?;
+    Ok(Json(json!({ "status": status })).into_response())
+}
+
+#[derive(Deserialize)]
+struct WikiIndexBody {
+    #[serde(default)]
+    rebuild: bool,
+}
+
+/// Index the vault (backs `komo wiki index`).
+///
+/// Runs to completion inside the request — minutes for a full rebuild. The
+/// client calls this on its no-timeout HTTP client for exactly that reason;
+/// progress is visible in the gateway log rather than in the response.
+async fn wiki_index(
+    State(state): State<AppState>,
+    Json(body): Json<WikiIndexBody>,
+) -> Result<Response, ApiError> {
+    let outcome = state.actions.wiki_index(body.rebuild).await?;
+    Ok(Json(json!({ "outcome": outcome })).into_response())
 }
 
 /// Delete every session with no messages (backs `komo session clean`).
